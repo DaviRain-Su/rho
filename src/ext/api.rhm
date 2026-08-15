@@ -2,10 +2,47 @@
 
 // ExtensionAPI: the `rho` object handed to each extension's init(rho).
 
+import:
+  lib("racket/base.rkt") as rkt
+
 export:
   PiAPI
 
-class PiAPI(registry, out):
+def main_thread = rkt.#{current-thread}()
+
+// Reads one line of user input. On the main thread stdin is free (command
+// handlers run between prompts); on a turn thread the REPL forwards typed
+// lines to our mailbox, so we take the next one from there.
+fun read_reply() :: String:
+  if rkt.#{current-thread}() == main_thread
+  | match rkt.#{read-line}()
+    | s :: ReadableString: to_string(s).trim()
+    | ~else: ""
+  | to_string(rkt.#{thread-receive}()).trim()
+
+class UI(out):
+  method input(prompt :: String) :: String:
+    out.write_string("\u001B[36m? " +& prompt +& "\u001B[0m ")
+    out.flush()
+    read_reply()
+
+  method confirm(prompt :: String) :: Boolean:
+    let ans = input(prompt +& " [y/N]")
+    ans.starts_with("y") || ans.starts_with("Y")
+
+  // Returns the chosen element of options, or #false.
+  method select(prompt :: String, options :: List):
+    out.write_string("\u001B[36m? " +& prompt +& "\u001B[0m\n")
+    for (i in 0 .. options.length()):
+      out.write_string("  " +& (i + 1) +& ". " +& options[i] +& "\n")
+    out.flush()
+    let ans = input("choose (number)")
+    match String.maybe_to_int(ans)
+    | n :: Int:
+        if n >= 1 && n <= options.length() | options[n - 1] | #false
+    | ~else: #false
+
+class PiAPI(registry, out, get_session, extra_flags :: List):
 
   method register_tool(~name: name :: String,
                        ~description: description :: String,
@@ -26,6 +63,35 @@ class PiAPI(registry, out):
   // Mutable key-value store owned by the kernel; survives /reload.
   property state:
     registry.state
+
+  property ui :: UI:
+    UI(out)
+
+  property session:
+    get_session()
+
+  // Append a custom entry to the session tree (persisted, ignored by the
+  // model context).
+  method append_entry(data):
+    get_session().append("custom", data)
+
+  // Read an extension CLI flag. Unrecognized "--name" / "--name=value"
+  // arguments are collected at startup; returns value string, #true for a
+  // bare flag, or #false when absent.
+  method flag(name :: String):
+    let bare = "--" +& name
+    let prefix = bare +& "="
+    for values(found = #false) (a in extra_flags):
+      cond
+      | found: found
+      | a == bare: #true
+      | a.starts_with(prefix): a.substring(prefix.length() ..)
+      | ~else: #false
+
+  // pi-compatible alias: declare + read in one call.
+  method register_flag(~name: name :: String,
+                       ~description: _description :: String = ""):
+    flag(name)
 
   method notify(msg :: String):
     out.write_string("\u001B[36m[rho]\u001B[0m " +& msg +& "\n")

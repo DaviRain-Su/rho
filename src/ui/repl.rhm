@@ -1,9 +1,16 @@
 #lang rhombus
 
-// Line-oriented REPL (not a fullscreen TUI). Readline gives history/editing.
+// Line-oriented REPL with background turns.
+//
+// While a turn is running in a background thread, the main thread keeps
+// reading stdin: plain lines become steering messages (delivered to the turn
+// thread's mailbox and injected at the next tool-batch boundary), "/follow
+// <msg>" queues a follow-up turn, and Ctrl-C breaks the turn thread.
 
 import:
   lib("readline/readline.rkt") as rl
+  lib("racket/base.rkt") as rkt
+  lib("racket/port.rkt") as rktport
 
 export:
   run_repl
@@ -23,17 +30,97 @@ fun run_repl(~banner: banner :: String,
              ~handle_command: handle_command,
              ~handle_input: handle_input):
   let out = Port.Output.current()
+  let stdin = rkt.#{current-input-port}()
+  def mutable followups :: List = []
   out.write_string(banner)
   out.flush()
-  recur loop():
-    let line = rl.readline("\u276F ")
+
+  fun note(s :: String):
+    out.write_string(color("33", s) +& "\n")
+    out.flush()
+
+  // Watch a running turn; forward typed lines as steering.
+  fun monitor(t):
+    let dead = rkt.#{thread-dead-evt}(t)
+    let r:
+      try:
+        rkt.sync(dead, rktport.#{read-line-evt}(stdin, #'any))
+        ~catch e :: Exn.Break:
+          rkt.#{break-thread}(t)
+          rkt.#{thread-wait}(t)
+          #'interrupted
     cond
+    | r == #'interrupted:
+        note("[turn interrupted]")
+    | r is_a ReadableString:
+        let line = to_string(r).trim()
+        cond
+        | line == "": monitor(t)
+        | line == "/quit" || line == "/exit":
+            rkt.#{break-thread}(t)
+            rkt.#{thread-wait}(t)
+            note("[turn interrupted]")
+        | line.starts_with("/follow"):
+            let msg = line.substring(7..).trim()
+            if msg == ""
+            | note("[usage: /follow <message>]")
+            | followups := followups.add(msg)
+              note("[follow-up queued: runs after this turn]")
+            monitor(t)
+        | line.starts_with("/"):
+            note("[commands can't run during a turn; plain text steers, /follow <msg> queues]")
+            monitor(t)
+        | ~else:
+            rkt.#{thread-send}(t, line)
+            note("[steering queued: injected after the current tool batch]")
+            monitor(t)
+    | r == Port.eof:
+        rkt.#{thread-wait}(t)
+    | ~else: #void  // turn thread finished
+
+  fun start_turn(input :: String):
+    let t:
+      rkt.thread(fun ():
+                   try:
+                     handle_input(input)
+                     ~catch:
+                     | e :: Exn.Break:
+                         out.write_string("\n" +& color("33", "[interrupted]") +& "\n")
+                     | e :: Exn.Fail:
+                         out.write_string("\n" +& color("31", "error: ") +& e.message +& "\n"))
+    monitor(t)
+    out.flush()
+    // deliver queued follow-ups as fresh turns
+    match followups
+    | []: #void
+    | [next, & rest]:
+        followups := rest
+        note("[follow-up] " +& next)
+        start_turn(next)
+
+  recur loop():
+    let line:
+      try:
+        rl.readline("\u276F ")
+        ~catch e :: Exn.Break:
+          out.write_string("\n")
+          #'break
+    cond
+    | line == #'break:
+        loop()
     | line == Port.eof:
         out.write_string("\nbye\n")
     | ~else:
         let line = to_string(line).trim()
         cond
         | line == "":
+            loop()
+        | line.starts_with("/follow"):
+            // at the prompt a follow-up is just a normal turn
+            rl.#{add-history}(line)
+            let msg = line.substring(7..).trim()
+            when msg != ""
+            | start_turn(msg)
             loop()
         | line.starts_with("/"):
             rl.#{add-history}(line)
@@ -52,12 +139,5 @@ fun run_repl(~banner: banner :: String,
             | loop()
         | ~else:
             rl.#{add-history}(line)
-            try:
-              handle_input(line)
-              ~catch:
-              | e :: Exn.Break:
-                  out.write_string("\n" +& color("33", "[interrupted]") +& "\n")
-              | e :: Exn.Fail:
-                  out.write_string("\n" +& color("31", "error: ") +& e.message +& "\n")
-            out.flush()
+            start_turn(line)
             loop()

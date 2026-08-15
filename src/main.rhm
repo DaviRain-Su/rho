@@ -77,6 +77,9 @@ fun parse_args() :: Map:
             let path = a.substring(1..)
             let inlined = "\n\n``` " +& path +& "\n" +& filesystem.read_string(path) +& "\n```"
             parse(more, acc ++ { "message": acc["message"].add(inlined) })
+        | a.starts_with("--"):
+            // unknown long flags are kept for extensions (rho.flag("name"))
+            parse(more, acc ++ { "extra": acc.get("extra", []).add(a) })
         | a.length() > 0 && a.substring(0..1) == "-":
             println("warning: ignoring argument " +& a)
             parse(more, acc)
@@ -135,7 +138,7 @@ def mutable session:
                 ~fork: opts.get("fork", #false),
                 ~no_session: opts.get("no_session", #false),
                 ~name: opts.get("name", #false))
-def api = PiAPI(registry, out)
+def api = PiAPI(registry, out, fun (): session, opts.get("extra", []))
 
 fun context_section() :: String:
   if opts.get("no_context", #false)
@@ -519,7 +522,10 @@ fun handle_input(input :: String):
                        out.flush(),
            ~on_tool_result: fun (name, r):
                               out.write_string(color("2", "  \u21B3 " +& first_line(r)) +& "\n")
-                              out.flush())
+                              out.flush(),
+           ~on_steer: fun (s):
+                        out.write_string(color("33", "\u21AA steering: " +& s) +& "\n")
+                        out.flush())
   out.write_string("\n")
   auto_compact()
 

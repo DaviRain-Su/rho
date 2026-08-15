@@ -4,6 +4,7 @@
 
 import:
   json
+  lib("racket/base.rkt") as rkt
   "../ai/openai.rhm"
   "../ai/anthropic.rhm"
   "../ai/types.rhm" open
@@ -42,10 +43,29 @@ fun do_call_provider(config, messages, tools, on_text):
                          ~on_text: on_text,
                          ~thinking: config.thinking)
 
+// Drain steering messages (sent to the current thread's mailbox by the REPL
+// while a turn runs) into the session. Returns #true if any arrived.
+fun drain_steering(session, registry, on_steer):
+  recur go(any = #false):
+    match rkt.#{thread-try-receive}()
+    | #false: any
+    | v:
+        let s = to_string(v)
+        session.append_message(user_message(s))
+        registry.emit("user_message", { "content": s, "steering": #true })
+        on_steer(s)
+        go(#true)
+
 // Executes one full user turn. UI callbacks:
 //   on_text(delta)                     streaming assistant text
 //   on_tool(name, args_map)            before a tool runs
 //   on_tool_result(name, result_str)   after a tool ran
+//   on_steer(msg)                      a queued steering message was injected
+//
+// Events emitted: agent_start/agent_end (whole turn), turn_start/turn_end
+// (each model round), before_request (may return {"messages": [...]} to
+// inject transient context), tool_call (may block), tool_execution_start/
+// tool_execution_end, tool_result, user_message.
 fun run_turn(~config: config,
              ~registry: registry,
              ~session: session,
@@ -53,41 +73,56 @@ fun run_turn(~config: config,
              ~input: input :: String,
              ~on_text: on_text = fun (s): #void,
              ~on_tool: on_tool = fun (name, args): #void,
-             ~on_tool_result: on_tool_result = fun (name, r): #void):
+             ~on_tool_result: on_tool_result = fun (name, r): #void,
+             ~on_steer: on_steer = fun (s): #void):
   session.append_message(user_message(input))
   registry.emit("user_message", { "content": input })
+  registry.emit("agent_start", { "input": input })
   recur step(n = 0):
     when n >= MAX_STEPS
     | error("agent loop exceeded " +& MAX_STEPS +& " steps")
-    let messages = [system_message(system_prompt)] ++ session.messages()
+    registry.emit("turn_start", { "step": n })
+    let injected:
+      match registry.emit("before_request", { "step": n })
+      | m :: Map:
+          let ms = m.get("messages", [])
+          if ms is_a List | ms | []
+      | ~else: []
+    let messages = [system_message(system_prompt)] ++ injected ++ session.messages()
     let assistant = call_provider(config, messages, registry.tools_wire(), on_text)
     session.append_message(assistant)
     let tool_calls = tool_calls_of(assistant)
-    when tool_calls != []
-    | for (tc in tool_calls):
-        let name = tc["name"]
-        let args = try:
-                     json.from_string(tc["arguments"])
-                     ~catch _: {}
-        let args = (if args is_a Map | args | {})
-        on_tool(name, args)
-        let verdict = registry.emit("tool_call", { "toolName": name, "input": args })
-        let result:
-          cond
-          | verdict is_a Map && verdict.get("block", #false):
-              "blocked: " +& verdict.get("reason", "blocked by extension")
-          | ~else:
-              let tool = registry.find_tool(name)
-              cond
-              | !tool: "error: unknown tool: " +& name
-              | ~else:
-                  try:
-                    to_string(tool.fn(args))
-                    ~catch e :: Exn.Fail:
-                      "error: " +& e.message
-        registry.emit("tool_result", { "toolName": name, "result": result })
-        on_tool_result(name, result)
-        session.append_message(tool_message(tc["id"], result))
-      step(n + 1)
-  registry.emit("turn_end", {})
+    for (tc in tool_calls):
+      let name = tc["name"]
+      let args = try:
+                   json.from_string(tc["arguments"])
+                   ~catch _: {}
+      let args = (if args is_a Map | args | {})
+      on_tool(name, args)
+      let verdict = registry.emit("tool_call", { "toolName": name, "input": args })
+      registry.emit("tool_execution_start", { "toolName": name, "input": args })
+      let result:
+        cond
+        | verdict is_a Map && verdict.get("block", #false):
+            "blocked: " +& verdict.get("reason", "blocked by extension")
+        | ~else:
+            let tool = registry.find_tool(name)
+            cond
+            | !tool: "error: unknown tool: " +& name
+            | ~else:
+                try:
+                  to_string(tool.fn(args))
+                  ~catch e :: Exn.Fail:
+                    "error: " +& e.message
+      registry.emit("tool_execution_end", { "toolName": name, "result": result })
+      registry.emit("tool_result", { "toolName": name, "result": result })
+      on_tool_result(name, result)
+      session.append_message(tool_message(tc["id"], result))
+    registry.emit("turn_end", { "step": n,
+                                "content": assistant.get("content", ""),
+                                "tool_count": tool_calls.length() })
+    let steered = drain_steering(session, registry, on_steer)
+    when tool_calls != [] || steered
+    | step(n + 1)
+  registry.emit("agent_end", {})
   #void

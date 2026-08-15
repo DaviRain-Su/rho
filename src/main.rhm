@@ -210,13 +210,21 @@ fun system_prompt() :: String:
     +& skills.xml_section(discover_skills())
 
 // ---- tool filters ----
+// pi defaults: read/bash/edit/write on; grep/find/ls opt-in via --tools
+def optin_tools :: List = ["grep", "find", "ls"]
+
 fun apply_tool_filters():
   cond
   | opts.get("no_tools", #false):
       registry.set_tool_filter(~allow: [])
   | ~else:
-      registry.set_tool_filter(~allow: opts.get("tools", #false),
-                               ~deny: opts.get("exclude_tools", []))
+      let allow = opts.get("tools", #false)
+      let default_deny:
+        if allow is_a List
+        | []          // explicit allowlist: user decides
+        | optin_tools
+      registry.set_tool_filter(~allow: allow,
+                               ~deny: opts.get("exclude_tools", []) ++ default_deny)
 
 // ---- built-in commands ----
 fun show_help(_args):
@@ -876,6 +884,11 @@ fun tui_arg_complete(cmd :: String, prefix :: String):
   | ~else: #false
 
 fun run_tui_mode():
+  // live bash output: show the latest line on the TUI status row
+  set_stream_handler(fun (line):
+                       let l = to_string(line)
+                       let shown = (if l.length() > 60 | l.substring(0 .. 60) +& "\u2026" | l)
+                       tui.set_activity("bash: " +& shown))
   // route notify/command prints into the TUI transcript
   let (pin, pout) = rkt.#{make-pipe}()
   out := pout

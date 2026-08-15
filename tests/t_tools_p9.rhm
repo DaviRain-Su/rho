@@ -1,0 +1,84 @@
+#lang rhombus
+
+// P9 behaviors: multi-edit, head/tail truncation, bash temp-file spill.
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/registry.rhm" open
+  "../src/tools/core.rhm" open
+
+def registry = make_registry()
+install_core_tools(registry)
+
+fun tool(name :: String):
+  registry.tools[name].fn
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-t-~a.txt"))
+
+// --- multi-edit ---
+filesystem.write_string(tmp, "alpha\nbeta\ngamma\ndelta\n", ~exists: #'truncate)
+def r1 = tool("edit_file")({ "path": tmp,
+                             "edits": [{ "old_string": "alpha", "new_string": "ALPHA" },
+                                       { "old_string": "gamma", "new_string": "GAMMA" }] })
+check("multi-edit applies", filesystem.read_string(tmp) == "ALPHA\nbeta\nGAMMA\ndelta\n")
+check("multi-edit reports count", to_string(r1).contains("2 edits"))
+
+// overlapping edits rejected
+def r2 = tool("edit_file")({ "path": tmp,
+                             "edits": [{ "old_string": "beta\nGAMMA", "new_string": "x" },
+                                       { "old_string": "GAMMA\ndelta", "new_string": "y" }] })
+check("overlap rejected", to_string(r2).contains("overlap"))
+check("overlap left file intact", filesystem.read_string(tmp) == "ALPHA\nbeta\nGAMMA\ndelta\n")
+
+// duplicate old_string rejected
+filesystem.write_string(tmp, "dup\ndup\n", ~exists: #'truncate)
+def r3 = tool("edit_file")({ "path": tmp, "old_string": "dup", "new_string": "x" })
+check("ambiguous edit rejected", to_string(r3).contains("2 times"))
+
+// single-edit form still works
+def r4 = tool("edit_file")({ "path": tmp, "old_string": "dup\ndup", "new_string": "one" })
+check("single edit works", filesystem.read_string(tmp) == "one\n")
+
+// --- read head truncation ---
+def big = String.join((for List (i in 0 .. 3000): "line " +& i), "\n")
+filesystem.write_string(tmp, big, ~exists: #'truncate)
+def r5 = to_string(tool("read_file")({ "path": tmp }))
+check("read truncated at 2000 lines",
+      r5.contains("2000| ") && !r5.contains("2001| ") && r5.contains("truncated"))
+check("read truncation continue hint", r5.contains("offset=2001"))
+def r6 = to_string(tool("read_file")({ "path": tmp, "offset": 2500 }))
+check("read offset window", r6.contains("2500| line 2499") && !r6.contains("truncated"))
+
+// --- bash tail truncation + spill file ---
+def r7 = to_string(tool("bash")({ "command": "seq 1 3000" }))
+check("bash tail-truncated", r7.contains("truncated") && r7.contains("3000")
+        && !r7.contains("\n999\n"))
+def spill:
+  let idx = r7.find("full output: ")
+  if idx is_a Int
+  | let rest = r7.substring(idx + 13 ..)
+    let close = rest.find("]")
+    rest.substring(0 .. close)
+  | #false
+check("bash spill file exists", spill is_a String && filesystem.file_exists(spill))
+check("bash spill has full output",
+      spill is_a String && filesystem.read_string(spill).contains("\n999\n"))
+
+// small output untouched
+def r8 = to_string(tool("bash")({ "command": "echo hi" }))
+check("bash small output plain", r8 == "hi\n" || r8 == "hi")
+
+// timeout kills group
+def r9 = to_string(tool("bash")({ "command": "sleep 30", "timeout": 1 }))
+check("bash timeout", r9.contains("timed out"))
+
+if failures == 0
+| println("ALL PASS")
+| error("t_tools_p9 failed: " +& failures)

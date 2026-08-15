@@ -1,19 +1,70 @@
 #lang rhombus
 
 // Built-in tools: read_file, write_file, edit_file, bash, grep, find, ls.
+//
+// Truncation follows pi: two independent limits, 2000 lines / 50KB,
+// whichever is hit first; whole lines only. Reads truncate from the head,
+// bash output from the tail (errors and final results matter most), and the
+// full bash output is spilled to a temp file referenced in the result.
 
 import:
   rhombus/subprocess
   rhombus/thread open
+  lib("racket/base.rkt") as rkt
+  lib("racket/file.rkt") as rktfile
+  lib("racket/system.rkt") as rktsys
 
 export:
   install_core_tools
+  set_stream_handler
 
-def MAX_OUTPUT = 32 * 1024
+def MAX_LINES = 2000
+def MAX_BYTES = 50 * 1024
 
-fun truncate(s :: String) :: String:
-  if s.length() > MAX_OUTPUT
-  | s.substring(0 .. MAX_OUTPUT) +& "\n... [output truncated]"
+fun byte_len(s :: String) :: Int:
+  rkt.#{string-utf-8-length}(s)
+
+fun fmt_size(n :: Int) :: String:
+  cond
+  | n < 1024: n +& "B"
+  | n < 1024 * 1024: (math.exact(math.round(n / 102.4)) / 10.0) +& "KB"
+  | ~else: (math.exact(math.round(n / (104857.6))) / 10.0) +& "MB"
+
+// Keep the first whole lines within both limits.
+// Returns values(kept_lines :: List, truncated? :: Boolean)
+fun head_lines(lines :: List, max_lines :: Int, max_bytes :: Int):
+  recur go(i = 0, used = 0, acc :: List = []):
+    cond
+    | i >= lines.length(): values(acc, #false)
+    | i >= max_lines: values(acc, #true)
+    | ~else:
+        let l = to_string(lines[i])
+        let cost = byte_len(l) + (if i > 0 | 1 | 0)
+        if used + cost > max_bytes
+        | values(acc, #true)
+        | go(i + 1, used + cost, acc.add(l))
+
+// Keep the last whole lines within both limits.
+fun tail_lines(lines :: List, max_lines :: Int, max_bytes :: Int):
+  recur go(i = lines.length() - 1, used = 0, acc :: List = []):
+    cond
+    | i < 0: values(acc, #false)
+    | acc.length() >= max_lines: values(acc, #true)
+    | ~else:
+        let l = to_string(lines[i])
+        let cost = byte_len(l) + (if acc == [] | 0 | 1)
+        if used + cost > max_bytes
+        | values(acc, #true)
+        | go(i - 1, used + cost, acc.insert(0, l))
+
+// Head truncation for tool output that reads top-down (read, grep, ls).
+fun truncate_head(s :: String, ~max_lines: max_lines = MAX_LINES) :: String:
+  let lines = s.split("\n", ~trim: #false)
+  let values(kept, truncated) = head_lines(lines, max_lines, MAX_BYTES)
+  if truncated
+  | String.join(kept, "\n")
+      +& "\n... [truncated: showing " +& kept.length() +& " of "
+      +& lines.length() +& " lines (" +& fmt_size(byte_len(s)) +& " total)]"
   | s
 
 fun tool_read_file(args :: Map):
@@ -24,12 +75,22 @@ fun tool_read_file(args :: Map):
   | ~else:
       let content = filesystem.read_string(path)
       let lines = content.split("\n", ~trim: #false)
-      let offset = args.get("offset", 1)
-      let limit = args.get("limit", 2000)
-      let numbered:
+      let offset = math.max(1, args.get("offset", 1))
+      let limit = args.get("limit", MAX_LINES)
+      let window:
         for List (i in offset .. math.min(offset + limit, lines.length() + 1)):
           i +& "| " +& lines[i - 1]
-      truncate(String.join(numbered, "\n"))
+      let values(kept, _) = head_lines(window, math.min(limit, MAX_LINES), MAX_BYTES)
+      let last_shown = offset + kept.length() - 1
+      cond
+      | window == []:
+          "error: offset " +& offset +& " is past the end (" +& lines.length() +& " lines)"
+      | last_shown < lines.length():
+          String.join(kept, "\n")
+            +& "\n... [truncated: lines " +& offset +& "-" +& last_shown
+            +& " of " +& lines.length()
+            +& "; continue with offset=" +& (last_shown + 1) +& "]"
+      | ~else: String.join(kept, "\n")
 
 fun tool_write_file(args :: Map):
   let path = args.get("path", "")
@@ -40,43 +101,113 @@ fun tool_write_file(args :: Map):
   filesystem.write_string(path, content, ~exists: #'truncate)
   "wrote " +& content.length() +& " chars to " +& path
 
-fun tool_edit_file(args :: Map):
-  let path = args.get("path", "")
-  let old_str = args.get("old_string", "")
-  let new_str = args.get("new_string", "")
+// Apply one exact replacement spec against `content`; returns
+// values(start, end, replacement) or an error string.
+fun locate_edit(content :: String, path :: String, old_str :: String):
   cond
-  | !filesystem.file_exists(path):
-      "error: file not found: " +& path
-  | old_str == "":
-      "error: old_string must not be empty"
+  | old_str == "": "error: old_string must not be empty"
   | ~else:
-      let content = filesystem.read_string(path)
       let pieces = content.split(old_str, ~trim: #false)
       cond
       | pieces.length() == 1:
-          "error: old_string not found in " +& path
+          "error: old_string not found in " +& path +& ": "
+            +& old_str.substring(0 .. math.min(80, old_str.length()))
       | pieces.length() > 2:
           "error: old_string occurs " +& (pieces.length() - 1)
             +& " times in " +& path +& "; make it unique"
       | ~else:
-          filesystem.write_string(path, String.join(pieces, new_str),
-                                  ~exists: #'truncate)
-          "edited " +& path
+          let start = to_string(pieces[0]).length()
+          [start, start + old_str.length()]
 
-fun shell_capture(cmd :: String, timeout :: Int) :: values(Any, String):
+// pi-style edit: one or many exact replacements, all matched against the
+// ORIGINAL file content; spans must be unique and non-overlapping.
+fun tool_edit_file(args :: Map):
+  let path = args.get("path", "")
+  cond
+  | !filesystem.file_exists(path):
+      "error: file not found: " +& path
+  | ~else:
+      let content = filesystem.read_string(path)
+      let specs:
+        match args.get("edits", #false)
+        | l :: List:
+            for List (e in l):
+              if e is_a Map
+              | [to_string(e.get("old_string", e.get("oldText", ""))),
+                 to_string(e.get("new_string", e.get("newText", "")))]
+              | ["", ""]
+        | ~else:
+            [[to_string(args.get("old_string", "")),
+              to_string(args.get("new_string", ""))]]
+      // locate every edit against the original content
+      let located:
+        for values(acc = []) (spec in specs):
+          match acc
+          | s :: String: s      // propagate first error
+          | l :: List:
+              let [old_str, new_str] = spec
+              match locate_edit(content, path, old_str)
+              | err :: String: err
+              | [start, endpos]: l ++ [[start, endpos, new_str]]
+      match located
+      | err :: String: err
+      | spans :: List:
+          let sorted = spans.sort(fun (a, b): a[0] < b[0])
+          let overlap:
+            for values(bad = #false) (i in 0 .. sorted.length() - 1):
+              bad || (sorted[i + 1][0] < sorted[i][1])
+          cond
+          | overlap: "error: edits overlap; make them disjoint"
+          | ~else:
+              let out:
+                for values(acc = ["", 0]) (span in sorted):
+                  let [built, pos] = acc
+                  let [start, endpos, new_str] = span
+                  [built +& content.substring(pos .. start) +& new_str, endpos]
+              let [built, pos] = out
+              filesystem.write_string(path, built +& content.substring(pos ..),
+                                      ~exists: #'truncate)
+              "edited " +& path
+                +& (if sorted.length() > 1 | " (" +& sorted.length() +& " edits)" | "")
+
+// Optional live-output hook (set by the TUI): called with each output line
+// while a bash command runs.
+def mutable stream_handler = #false
+fun set_stream_handler(h):
+  stream_handler := h
+
+fun kill_tree(sp):
+  // the subprocess runs in its own group: signal the whole group
+  try:
+    rktsys.system("kill -TERM -" +& sp.pid +& " 2>/dev/null")
+    ~catch _: #void
+  sp.kill()
+
+fun shell_capture(cmd :: String, timeout :: Int,
+                  ~stream: stream = #false) :: values(Any, String):
   let sp = subprocess.run_shell(cmd,
                                 ~in: Port.Input.open_string(""),
                                 ~out: #'pipe,
-                                ~err: #'out)
+                                ~err: #'out,
+                                ~group: #'new)
   let buf = Port.Output.open_string()
   let reader:
     thread:
-      sp.out.copy_to(buf)
+      recur go():
+        match sp.out.read_line(~mode: #'any)
+        | s :: String:
+            buf.write_string(s +& "\n")
+            when stream && stream_handler
+            | try:
+                stream_handler(s)
+                ~catch _: #void
+            go()
+        | ~else: #void
   let status:
     recur poll_loop(ticks = timeout * 10):
       cond
       | ticks <= 0:
-          sp.kill()
+          kill_tree(sp)
           #'timeout
       | ~else:
           match sp.poll()
@@ -85,16 +216,33 @@ fun shell_capture(cmd :: String, timeout :: Int) :: values(Any, String):
               poll_loop(ticks - 1)
           | code: code
   reader.wait()
-  values(status, truncate(buf.get_string().to_string()))
+  values(status, buf.get_string().to_string())
 
 fun tool_bash(args :: Map):
   let cmd = args.get("command", "")
   let timeout = args.get("timeout", 120)
-  let values(status, output) = shell_capture(cmd, timeout)
+  let values(status, output) = shell_capture(cmd, timeout, ~stream: #true)
+  let lines = output.split("\n", ~trim: #false)
+  // drop the trailing empty piece from a final newline
+  let lines:
+    if lines.length() > 0 && lines[lines.length() - 1] == ""
+    | lines.delete(lines.length() - 1)
+    | lines
+  let values(kept, truncated) = tail_lines(lines, MAX_LINES, MAX_BYTES)
+  let shown:
+    if truncated
+    | // spill the full output so the model (or user) can dig further
+      let tmp = to_string(rktfile.#{make-temporary-file}("rho-bash-~a.txt"))
+      filesystem.write_string(tmp, output, ~exists: #'truncate)
+      "... [truncated: showing last " +& kept.length() +& " of "
+        +& lines.length() +& " lines (" +& fmt_size(byte_len(output))
+        +& "); full output: " +& tmp +& "]\n"
+        +& String.join(kept, "\n")
+    | output
   match status
-  | #'timeout: "error: command timed out after " +& timeout +& "s\n" +& output
-  | 0: (if output == "" | "(no output)" | output)
-  | code: "exit code " +& code +& "\n" +& output
+  | #'timeout: "error: command timed out after " +& timeout +& "s\n" +& shown
+  | 0: (if shown == "" | "(no output)" | shown)
+  | code: "exit code " +& code +& "\n" +& shown
 
 fun shell_quote(s :: String) :: String:
   "'" +& String.join(s.split("'", ~trim: #false), "'\\''") +& "'"
@@ -111,9 +259,10 @@ fun tool_grep(args :: Map):
   cond
   | pat == "": "error: pattern must not be empty"
   | ~else:
+      let limit = args.get("limit", 100)
       let cmd:
         if have_rg
-        | "rg -n --no-heading --color never -M 400 "
+        | "rg -n --no-heading --color never -M 500 "
             +& (if ignore_case | "-i " | "")
             +& (if glob == "" | "" | "-g " +& shell_quote(glob) +& " ")
             +& "-e " +& shell_quote(pat) +& " " +& shell_quote(path)
@@ -123,10 +272,10 @@ fun tool_grep(args :: Map):
             +& "-e " +& shell_quote(pat) +& " " +& shell_quote(path)
       let values(status, output) = shell_capture(cmd, 60)
       match status
-      | 0: (if output == "" | "(no matches)" | output)
+      | 0: (if output == "" | "(no matches)" | truncate_head(output, ~max_lines: limit))
       | 1: "(no matches)"
       | #'timeout: "error: grep timed out"
-      | code: "exit code " +& code +& "\n" +& output
+      | code: "exit code " +& code +& "\n" +& truncate_head(output)
 
 fun tool_find(args :: Map):
   let pat = args.get("pattern", "*")
@@ -134,12 +283,12 @@ fun tool_find(args :: Map):
   let cmd:
     "find " +& shell_quote(path)
       +& " -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/compiled/*'"
-      +& " -name " +& shell_quote(pat) +& " | head -500"
+      +& " -name " +& shell_quote(pat) +& " | head -1000"
   let values(status, output) = shell_capture(cmd, 60)
   match status
-  | 0: (if output == "" | "(no matches)" | output)
+  | 0: (if output == "" | "(no matches)" | truncate_head(output, ~max_lines: 1000))
   | #'timeout: "error: find timed out"
-  | code: "exit code " +& code +& "\n" +& output
+  | code: "exit code " +& code +& "\n" +& truncate_head(output)
 
 fun tool_ls(args :: Map):
   let path = args.get("path", ".")
@@ -155,7 +304,7 @@ fun tool_ls(args :: Map):
           | p +& ""
       if entries == []
       | "(empty directory)"
-      | truncate(String.join(entries, "\n"))
+      | truncate_head(String.join(entries, "\n"), ~max_lines: 500)
 
 fun install_core_tools(registry):
   registry.register_tool(
@@ -181,18 +330,26 @@ fun install_core_tools(registry):
     ~fn: tool_write_file)
   registry.register_tool(
     ~name: "edit_file",
-    ~description: "Replace an exact string in a file. old_string must occur exactly once; include enough context to make it unique.",
+    ~description: "Replace exact strings in a file. Either pass old_string/new_string for a single edit, or edits (a list of {old_string, new_string}) for several edits in one call. Each old_string must occur exactly once in the original file and edits must not overlap; include enough context to make them unique.",
     ~schema: { "type": "object",
                "properties": {
                  "path": { "type": "string", "description": "Path to the file" },
-                 "old_string": { "type": "string", "description": "Exact text to replace" },
-                 "new_string": { "type": "string", "description": "Replacement text" }
+                 "old_string": { "type": "string", "description": "Exact text to replace (single-edit form)" },
+                 "new_string": { "type": "string", "description": "Replacement text (single-edit form)" },
+                 "edits": { "type": "array",
+                            "description": "Multiple edits applied together, each matched against the original file",
+                            "items": { "type": "object",
+                                       "properties": {
+                                         "old_string": { "type": "string" },
+                                         "new_string": { "type": "string" }
+                                       },
+                                       "required": ["old_string", "new_string"] } }
                },
-               "required": ["path", "old_string", "new_string"] },
+               "required": ["path"] },
     ~fn: tool_edit_file)
   registry.register_tool(
     ~name: "bash",
-    ~description: "Run a shell command and return its combined stdout/stderr output.",
+    ~description: "Run a shell command and return its combined stdout/stderr output. Long output is tail-truncated; the full output is saved to a temp file whose path appears in the result.",
     ~schema: { "type": "object",
                "properties": {
                  "command": { "type": "string", "description": "Shell command to run" },

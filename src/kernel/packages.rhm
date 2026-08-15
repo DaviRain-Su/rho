@@ -13,6 +13,7 @@ export:
   packages_dir
   install
   remove
+  update
   installed
   package_extension_dirs
   package_skill_dirs
@@ -63,6 +64,25 @@ fun install(spec :: String) :: String:
       if code == 0
       | "installed " +& name +& " -> " +& dest
       | "install failed (exit " +& code +& "):\n" +& buf.get_string()
+
+fun update(name :: String) :: String:
+  let dest = packages_dir() +& "/" +& name
+  cond
+  | name == "" || name.contains("/") || name.contains(".."):
+      "invalid package name: " +& name
+  | !filesystem.directory_exists(dest):
+      "not installed: " +& name
+  | ~else:
+      let sp = subprocess.run_shell("git -C '" +& dest +& "' pull --ff-only 2>&1",
+                                    ~in: Port.Input.open_string(""),
+                                    ~out: #'pipe)
+      let buf = Port.Output.open_string()
+      sp.out.copy_to(buf)
+      let code = sp.wait()
+      let msg = buf.get_string().to_string().trim()
+      if code == 0
+      | name +& ": " +& msg
+      | name +& ": update failed (exit " +& code +& "): " +& msg
 
 fun remove(name :: String) :: String:
   let dest = packages_dir() +& "/" +& name

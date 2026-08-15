@@ -27,7 +27,10 @@ fun discover_extensions(~extra_dirs: extra_dirs :: List = [],
   rhm_files(config.global_extensions_dir())
     ++ (for List:
           each d in extra_dirs
-          each f in rhm_files(d)
+          // an entry may be a single .rhm file (-e flag) or a directory
+          each f in (if d.ends_with(".rhm") && filesystem.file_exists(d)
+                     | [d]
+                     | rhm_files(d))
           f)
     ++ (if include_project
         | rhm_files(config.project_extensions_dir())

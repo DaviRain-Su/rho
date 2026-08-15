@@ -1,0 +1,68 @@
+#lang rhombus
+
+// P11: auth store resolution, prompt template arguments, skill/template
+// direct discovery.
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/config.rhm" open
+  "../src/kernel/prompts.rhm" as prompts
+  "../src/kernel/skills.rhm" as skills
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+// --- auth store (uses a throwaway provider name; cleaned up after) ---
+def prov = "rho-test-provider"
+auth_set(prov, "sk-test-123")
+check("auth_list contains provider", auth_list().contains(prov))
+
+def cfg = Config(prov, "m", { prov: { "kind": "openai", "api_key_env": "" } },
+                 #false, {})
+check("api_key from auth.json", cfg.api_key() == "sk-test-123")
+set_api_key_override("sk-override")
+check("api_key override wins", cfg.api_key() == "sk-override")
+check("auth_remove", auth_remove(prov) && !auth_list().contains(prov))
+
+// --- prompt template arguments ---
+fun tpl(body :: String) :: Map:
+  { "name": "t", "description": "", "argument_hint": "", "body": body }
+check("positional args",
+      prompts.expand(tpl("fix $1 in $2"), "bug main.rhm") == "fix bug in main.rhm")
+check("missing positional empty",
+      prompts.expand(tpl("a $1 b $2"), "only") == "a only b ")
+check("$@ all args",
+      prompts.expand(tpl("run: $@"), "x y z") == "run: x y z")
+check("$ARGUMENTS still works",
+      prompts.expand(tpl("go $ARGUMENTS"), "a b") == "go a b")
+check("no placeholders appends",
+      prompts.expand(tpl("hello"), "extra") == "hello\n\nextra")
+
+// --- direct skill / template discovery ---
+def tmpdir = to_string(rktfile.#{make-temporary-directory}("rho-t-~a"))
+filesystem.make_directory(tmpdir +& "/myskill", ~parents: #true)
+filesystem.write_string(tmpdir +& "/myskill/SKILL.md",
+                        "---\nname: my-skill\ndescription: test skill\n---\nbody",
+                        ~exists: #'truncate)
+def found = skills.discover(~cwd: "/nonexistent", ~standard: #false,
+                            ~direct: [tmpdir +& "/myskill"])
+check("direct skill discovered",
+      found.length() == 1 && found[0]["name"] == "my-skill")
+
+filesystem.write_string(tmpdir +& "/greet.md",
+                        "---\ndescription: greeting\n---\nHello $1!",
+                        ~exists: #'truncate)
+def tpls = prompts.discover(~cwd: "/nonexistent", ~standard: #false,
+                            ~direct: [tmpdir +& "/greet.md"])
+check("direct template discovered",
+      tpls.length() == 1 && tpls[0]["name"] == "greet")
+
+rktfile.#{delete-directory/files}(Path(tmpdir))
+
+if failures == 0
+| println("ALL PASS")
+| error("t_p11 failed: " +& failures)

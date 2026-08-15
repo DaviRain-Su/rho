@@ -6,6 +6,7 @@
 import:
   json
   rhombus/envvar
+  lib("racket/base.rkt") as rkt
 
 export:
   Config
@@ -15,6 +16,10 @@ export:
   set_sessions_dir
   global_extensions_dir
   project_extensions_dir
+  set_api_key_override
+  auth_list
+  auth_set
+  auth_remove
 
 fun home() :: String:
   envvar.getenv("HOME") || "/tmp"
@@ -39,6 +44,46 @@ fun global_extensions_dir() :: String:
 fun project_extensions_dir() :: String:
   ".rho/extensions"
 
+// ---- credential store: ~/.rho/auth.json (0600) ----
+// resolution order: --api-key override > auth.json entry > env var
+
+def mutable api_key_override = #false
+
+fun set_api_key_override(k :: String):
+  api_key_override := k
+
+fun auth_path() :: String:
+  config_dir() +& "/auth.json"
+
+fun read_auth() :: Map:
+  if filesystem.file_exists(auth_path())
+  | let parsed = try:
+                   json.from_string(filesystem.read_string(auth_path()))
+                   ~catch _: {}
+    if parsed is_a Map | parsed | {}
+  | {}
+
+fun write_auth(m :: Map):
+  when !filesystem.directory_exists(config_dir())
+  | filesystem.make_directory(config_dir(), ~parents: #true)
+  filesystem.write_string(auth_path(), json.to_string(m), ~exists: #'truncate)
+  try:
+    rkt.#{file-or-directory-permissions}(Path(auth_path()), 0o600)
+    ~catch _: #void
+
+fun auth_list() :: List:
+  read_auth().keys().sort()
+
+fun auth_set(provider :: String, key :: String):
+  write_auth(read_auth() ++ { provider: key })
+
+fun auth_remove(provider :: String) :: Boolean:
+  let m = read_auth()
+  if m.has_key(provider)
+  | write_auth(m.remove(provider))
+    #true
+  | #false
+
 class Config(mutable provider :: String,
              mutable model :: String,
              mutable providers :: Map,
@@ -51,10 +96,16 @@ class Config(mutable provider :: String,
   method base_url() :: String:
     profile().get("base_url", "")
   method api_key() :: String:
-    let env_name = profile().get("api_key_env", "")
-    if env_name == ""
-    | ""
-    | envvar.getenv(env_name) || ""
+    cond
+    | api_key_override is_a String: api_key_override
+    | ~else:
+        match read_auth().get(provider, #false)
+        | k :: String: k
+        | ~else:
+            let env_name = profile().get("api_key_env", "")
+            if env_name == ""
+            | ""
+            | envvar.getenv(env_name) || ""
   method kind() :: String:
     // "openai" (chat completions) or "anthropic" (messages API)
     profile().get("kind", "openai")

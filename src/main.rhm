@@ -15,6 +15,15 @@
 //   --append-system-prompt <t>  append to the system prompt
 //   --no-context-files          skip AGENTS.md / CLAUDE.md discovery
 //   --no-extensions             skip loading extensions
+//   --api-key <key>             override the provider API key
+//   --session-dir <dir>         session file directory
+//   -e, --extension <path>      load an extra extension file/dir (repeatable)
+//   --skill <path>              load an extra skill (repeatable, survives --no-skills)
+//   --prompt-template <path>    load an extra template (repeatable)
+//   --no-skills / --no-prompt-templates
+//   -a, --approve / -na, --no-approve   one-shot project trust override
+//   --export <in> [out]         export a session file to HTML and exit
+//   subcommands: rho install|remove|update|list
 //   @file arguments inline the file's content into the first message.
 //   In print mode, piped stdin is merged into the first message.
 
@@ -79,6 +88,25 @@ fun parse_args() :: Map:
     | ["--append-system-prompt", v, & more]: parse(more, acc ++ { "append_system_prompt": v })
     | ["--no-context-files", & more]: parse(more, acc ++ { "no_context": #true })
     | ["--session-dir", v, & more]: parse(more, acc ++ { "session_dir": v })
+    | ["--api-key", v, & more]: parse(more, acc ++ { "api_key": v })
+    | ["-e", v, & more]: parse(more, acc ++ { "extensions": acc.get("extensions", []).add(v) })
+    | ["--extension", v, & more]: parse(more, acc ++ { "extensions": acc.get("extensions", []).add(v) })
+    | ["--skill", v, & more]: parse(more, acc ++ { "skills": acc.get("skills", []).add(v) })
+    | ["--prompt-template", v, & more]:
+        parse(more, acc ++ { "prompt_templates": acc.get("prompt_templates", []).add(v) })
+    | ["--no-skills", & more]: parse(more, acc ++ { "no_skills": #true })
+    | ["--no-prompt-templates", & more]: parse(more, acc ++ { "no_prompts": #true })
+    | ["-a", & more]: parse(more, acc ++ { "approve": #true })
+    | ["--approve", & more]: parse(more, acc ++ { "approve": #true })
+    | ["-na", & more]: parse(more, acc ++ { "no_approve": #true })
+    | ["--no-approve", & more]: parse(more, acc ++ { "no_approve": #true })
+    | ["--export", v, & more]:
+        match more
+        | [o, & rest2]:
+            if !o.starts_with("-")
+            | parse(rest2, acc ++ { "export": v, "export_out": o })
+            | parse(more, acc ++ { "export": v })
+        | ~else: parse(more, acc ++ { "export": v })
     | ["--no-extensions", & more]: parse(more, acc ++ { "no_extensions": #true })
     | [a, & more]:
         cond
@@ -138,6 +166,10 @@ fun apply_settings():
 
 settings.reload(~include_project: trust.trust_status(cwd()) == #'trusted)
 apply_settings()
+
+match opts.get("api_key", #false)
+| k :: String: set_api_key_override(k)
+| ~else: #void
 
 fun read_stdin_line() :: String:
   match rkt.#{read-line}()
@@ -220,15 +252,20 @@ fun default_system_prompt() :: String:
     +& "which derives the JSON schema from the annotations (defaults become optional).\n"
     +& "Be concise. Prefer tools over guessing."
 
+// --skill / --prompt-template survive --no-skills / --no-prompt-templates
 fun discover_skills() :: List:
   skills.discover(~cwd: cwd(),
                   ~extra: packages.package_skill_dirs(),
-                  ~include_project: project_trusted)
+                  ~include_project: project_trusted,
+                  ~direct: opts.get("skills", []),
+                  ~standard: !opts.get("no_skills", #false))
 
 fun discover_prompts() :: List:
   prompts.discover(~cwd: cwd(),
                    ~extra: packages.package_prompt_dirs(),
-                   ~include_project: project_trusted)
+                   ~include_project: project_trusted,
+                   ~direct: opts.get("prompt_templates", []),
+                   ~standard: !opts.get("no_prompts", #false))
 
 fun system_prompt() :: String:
   context.resolve_system_prompt(~default_prompt: default_system_prompt(),
@@ -273,7 +310,9 @@ fun do_reload(notify = #true):
   apply_settings()
   let [ok, failed] = loader.load_extensions(registry, api,
                                             ~notify: fun (s): api.notify(s),
-                                            ~extra_dirs: packages.package_extension_dirs(),
+                                            ~extra_dirs:
+                                              packages.package_extension_dirs()
+                                                ++ opts.get("extensions", []),
                                             ~include_project: project_trusted)
   when notify
   | api.notify("extensions: " +& ok +& " loaded, " +& failed +& " failed")
@@ -639,6 +678,23 @@ fun export_html(target :: String):
       +& String.join(parts, "\n")
   filesystem.write_string(target, doc, ~exists: #'truncate)
 
+// --export <in> [out]: convert a session file to HTML and exit
+fun run_export_mode():
+  let src = to_string(opts["export"])
+  cond
+  | !filesystem.file_exists(src):
+      println("error: session file not found: " +& src)
+  | ~else:
+      session := start_session(~cwd: cwd(), ~resume: src)
+      let target:
+        match opts.get("export_out", #false)
+        | o :: String: o
+        | ~else:
+            (if src.ends_with(".jsonl") | src.substring(0 .. src.length() - 6) | src)
+              +& ".html"
+      export_html(target)
+      println("exported " +& target)
+
 fun html_escape(s :: String) :: String:
   let s = String.join(s.split("&"), "&amp;")
   let s = String.join(s.split("<"), "&lt;")
@@ -703,6 +759,38 @@ registry.register_command(
 registry.register_command(
   ~name: "quit", ~description: "exit",
   ~handler: fun (_args): #'quit)
+
+// ---- credentials: /login /logout (~/.rho/auth.json, chmod 600) ----
+registry.register_command(
+  ~name: "login",
+  ~description: "store an API key: /login <provider> [key] (key prompted if omitted)",
+  ~handler: fun (args):
+              let parts = args.trim().split(" ")
+              cond
+              | args.trim() == "":
+                  match auth_list()
+                  | []: api.notify("no stored credentials; /login <provider> [key]")
+                  | ps: api.notify("stored credentials: " +& String.join(ps, ", "))
+              | ~else:
+                  let prov = to_string(parts[0])
+                  let key:
+                    if parts.length() > 1
+                    | String.join(parts.rest, " ").trim()
+                    | api.ui.input("API key for " +& prov +& ":")
+                  if key == ""
+                  | api.notify("cancelled (empty key)")
+                  | auth_set(prov, key)
+                    api.notify("saved key for " +& prov +& " in ~/.rho/auth.json"))
+
+registry.register_command(
+  ~name: "logout",
+  ~description: "remove a stored API key: /logout <provider>",
+  ~handler: fun (args):
+              let prov = args.trim()
+              cond
+              | prov == "": api.notify("usage: /logout <provider>")
+              | auth_remove(prov): api.notify("removed key for " +& prov)
+              | ~else: api.notify("no stored key for " +& prov))
 
 fun auto_compact():
   when compaction.needs_compaction(session, config)
@@ -1040,6 +1128,8 @@ fun stdin_is_tty():
 // ---- project trust ----
 fun ensure_trust() :: Boolean:
   cond
+  | opts.get("approve", #false): #true       // -a: one-shot trust, not saved
+  | opts.get("no_approve", #false): #false   // -na: one-shot distrust
   | !filesystem.directory_exists(cwd() +& "/.rho"): #true
   | ~else:
       match trust.trust_status(cwd())
@@ -1141,6 +1231,16 @@ fun try_subcommand() :: Boolean:
   | ["remove", name]:
       println(packages.remove(to_string(name)))
       #true
+  | ["update"]:
+      match packages.installed()
+      | []: println("no packages installed")
+      | ps:
+          for (p in ps):
+            println(packages.update(to_string(p)))
+      #true
+  | ["update", name]:
+      println(packages.update(to_string(name)))
+      #true
   | ["list"]:
       match packages.installed()
       | []: println("no packages installed")
@@ -1153,6 +1253,8 @@ fun try_subcommand() :: Boolean:
 module main:
   modelsdev.refresh_async()
   cond
+  | opts.get("export", #false) is_a String:
+      run_export_mode()
   | opts.get("list_models", #false):
       // first run: wait for the catalog download so the list is complete
       when modelsdev.catalog() == {}

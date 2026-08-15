@@ -16,6 +16,13 @@
 ;; Drawing (term-draw!) takes rows of spans; a span is
 ;;   [fg-sym-or-#f bg-sym-or-#f style-sym-or-#f text-string]
 ;; plus an optional cursor position.
+;;
+;; We draw whole rows ourselves (goto + SGR + text + clear-to-eol) instead of
+;; using raart's per-cell buffer: the cell model assumes every character is
+;; one column wide, which breaks double-width CJK glyphs (later cell writes
+;; land inside a wide glyph and visually erase characters). Writing a row
+;; left-to-right lets the terminal handle glyph widths natively; a row-level
+;; diff keeps redraws cheap.
 
 (require racket/match
          racket/treelist
@@ -23,10 +30,7 @@
          racket/string
          racket/port
          lux/chaos
-         raart/lux-chaos
-         raart/draw
-         raart/buffer
-         (submod raart/buffer internal))
+         raart/lux-chaos)
 
 (provide term-start!
          term-stop!
@@ -37,9 +41,15 @@
          term-draw!)
 
 (define C #f)
-(define BUF #f)
+(define OP #f)                        ; terminal output port
 (define ROWS 24)
 (define COLS 80)
+;; last-drawn representation per screen row: #f (unknown), 'blank, or a
+;; list of (fg bg style text) lists — used to skip unchanged rows
+(define LAST (make-vector 512 #f))
+
+(define (reset-last!)
+  (vector-fill! LAST #f))
 
 ;; Rhombus lists are treelists; accept both.
 (define (->list v)
@@ -63,7 +73,10 @@
   (unless (and (= r ROWS) (= c COLS))
     (set! ROWS r)
     (set! COLS c)
-    (when BUF (buffer-resize! BUF ROWS COLS))))
+    (reset-last!)
+    (when OP
+      (write-string "\e[2J" OP)
+      (flush-output OP))))
 
 ;; Re-reads the tty size; returns #t when it changed.
 (define (term-poll-size!)
@@ -77,16 +90,24 @@
 (define (term-start!)
   (set! C (make-raart))
   (chaos-start! C)
+  (set! OP (current-output-port))
   (match (stty-size)
     [(list r c) (set! ROWS r) (set! COLS c)]
     [_ (void)])
-  (set! BUF (make-cached-buffer ROWS COLS)))
+  (reset-last!)
+  ;; disable autowrap: writing the bottom-right cell must not scroll the
+  ;; screen (rows are clipped at the right edge instead)
+  (write-string "\e[?7l\e[2J" OP)
+  (flush-output OP))
 
 (define (term-stop!)
   (when C
+    (when OP
+      (write-string "\e[?7h" OP)
+      (flush-output OP))
     (chaos-stop! C)
     (set! C #f)
-    (set! BUF #f)))
+    (set! OP #f)))
 
 (define (term-rows) ROWS)
 (define (term-cols) COLS)
@@ -109,28 +130,54 @@
     [(eof-object? e) 'eof]
     [else (treelist 'key (string->immutable-string (format "~a" e)))]))
 
-(define (span->art sp)
-  (match (->list sp)
-    [(list f b s txt)
-     (define base (text txt))
-     (define w1 (if s (style (if (string? s) (string->symbol s) s) base) base))
-     (define w2 (if f (fg (if (string? f) (string->symbol f) f) w1) w1))
-     (if b (bg (if (string? b) (string->symbol b) b) w2) w2)]))
+(define (->sym v)
+  (cond [(symbol? v) v]
+        [(string? v) (string->symbol v)]
+        [else #f]))
 
-(define (row->art spans)
-  (define l (->list spans))
-  (if (null? l)
-      (blank 0 1)
-      (happend* #:valign 'top (map span->art l))))
+(define (color-code c)
+  (case (->sym c)
+    [(black) 30] [(red) 31] [(green) 32] [(yellow) 33]
+    [(blue) 34] [(magenta) 35] [(cyan) 36] [(white) 37]
+    [(brblack) 90] [(brred) 91] [(brgreen) 92] [(bryellow) 93]
+    [(brblue) 94] [(brmagenta) 95] [(brcyan) 96] [(brwhite) 97]
+    [else #f]))
+
+(define (span-sgr f b s)
+  (define codes
+    (append (if (memq (->sym s) '(bold)) '(1) '())
+            (let ([fc (and f (color-code f))]) (if fc (list fc) '()))
+            (let ([bc (and b (color-code b))]) (if bc (list (+ bc 10)) '()))))
+  (if (null? codes)
+      "\e[0m"
+      (string-append "\e[0;" (string-join (map number->string codes) ";") "m")))
+
+(define (write-row! i spans)
+  (write-string (format "\e[~a;1H" (add1 i)) OP)
+  (for ([sp (in-list spans)])
+    (match sp
+      [(list f b s txt)
+       (write-string (span-sgr f b s) OP)
+       (write-string txt OP)]))
+  (write-string "\e[0m\e[K" OP))
 
 ;; rows-of-spans : (listof (listof span))
 ;; cursor : #f or (list row col), 0-based screen coordinates
 (define (term-draw! rows-of-spans cursor)
-  (define body (vappend* #:halign 'left (map row->art (->list rows-of-spans))))
-  (define matted (matte COLS ROWS #:halign 'left #:valign 'top body))
-  (define final
-    (if cursor
-        (let ([c (->list cursor)])
-          (place-cursor-after matted (car c) (cadr c)))
-        matted))
-  (draw BUF final))
+  (define rows (map (lambda (row) (map ->list (->list row)))
+                    (->list rows-of-spans)))
+  (write-string "\e[?25l" OP)
+  (for ([i (in-naturals)] [row (in-list rows)])
+    (when (and (< i ROWS) (not (equal? row (vector-ref LAST i))))
+      (vector-set! LAST i row)
+      (write-row! i row)))
+  ;; clear any rows below the provided content
+  (for ([i (in-range (length rows) ROWS)])
+    (unless (eq? (vector-ref LAST i) 'blank)
+      (vector-set! LAST i 'blank)
+      (write-string (format "\e[~a;1H\e[0m\e[K" (add1 i)) OP)))
+  (when cursor
+    (let ([c (->list cursor)])
+      (write-string (format "\e[~a;~aH" (add1 (car c)) (add1 (cadr c))) OP))
+    (write-string "\e[?25h" OP))
+  (flush-output OP))

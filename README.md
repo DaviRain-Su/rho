@@ -1,4 +1,4 @@
-# pi-rhm
+# rho (ρ)
 
 A [Pi](https://pi.dev)-style, hot-reloadable coding agent written in
 [Rhombus](https://rhombus-lang.org/). Minimal harness, everything else is an
@@ -7,7 +7,7 @@ same session.
 
 ```
 ❯ Create a tool named shout that uppercases text, activate it, then use it.
-● write_file .pi-rhm/extensions/shout.rhm
+● write_file .rho/extensions/shout.rhm
 ● reload_extensions {}
 ● shout {"text": "hello rhombus"}
   ↳ HELLO RHOMBUS!!!
@@ -22,13 +22,13 @@ same session.
 ## Setup
 
 ```bash
-raco pkg install --link --name pi-rhm /path/to/this/repo   # enables lib("pi-rhm/...") imports
+raco pkg install --link --name rho /path/to/this/repo   # enables lib("rho/...") imports
 racket src/main.rhm                                        # start the REPL
 ```
 
 Options: `-p/--provider NAME`, `-m/--model NAME`, `--resume SESSION.jsonl`.
 
-Built-in provider profiles (override or extend in `~/.pi-rhm/config.json`):
+Built-in provider profiles (override or extend in `~/.rho/config.json`):
 
 | Provider | Protocol | Key env var |
 |---|---|---|
@@ -46,16 +46,16 @@ plus any commands registered by extensions.
 
 ## Extensions
 
-Extensions are Rhombus modules exporting `init(pi)`, discovered from:
+Extensions are Rhombus modules exporting `init(rho)`, discovered from:
 
-- `~/.pi-rhm/extensions/*.rhm` (global)
-- `.pi-rhm/extensions/*.rhm` (project-local)
+- `~/.rho/extensions/*.rhm` (global)
+- `.rho/extensions/*.rhm` (project-local)
 
 ```
 #lang rhombus
 export: init
-fun init(pi):
-  pi.register_tool(
+fun init(rho):
+  rho.register_tool(
     ~name: "my_tool",
     ~description: "what it does",
     ~schema: { "type": "object",
@@ -66,13 +66,13 @@ fun init(pi):
 
 API surface:
 
-- `pi.register_tool(~name, ~description, ~schema, ~fn)` — tool callable by the model
-- `pi.register_command(~name, ~description, ~handler)` — `/command` in the REPL
-- `pi.on(event, fn)` — events: `session_start`, `user_message`, `tool_call`,
+- `rho.register_tool(~name, ~description, ~schema, ~fn)` — tool callable by the model
+- `rho.register_command(~name, ~description, ~handler)` — `/command` in the REPL
+- `rho.on(event, fn)` — events: `session_start`, `user_message`, `tool_call`,
   `tool_result`, `turn_end`; a `tool_call` handler may return
   `{"block": #true, "reason": ...}` to veto a tool execution
-- `pi.state` — mutable map owned by the kernel; survives `/reload`
-- `pi.notify(msg)` — print a status line
+- `rho.state` — mutable map owned by the kernel; survives `/reload`
+- `rho.notify(msg)` — print a status line
 
 ### The `tool` macro
 
@@ -82,10 +82,10 @@ do):
 
 ```
 #lang rhombus
-import: lib("pi-rhm/src/ext/tool.rhm") open
+import: lib("rho/src/ext/tool.rhm") open
 export: init
-fun init(pi):
-  tool pi greet(name :: String, times :: Int = 1) ~desc "Greet someone":
+fun init(rho):
+  tool rho greet(name :: String, times :: Int = 1) ~desc "Greet someone":
     String.join(for List (_ in 0..times): "Hello, " +& name +& "!", " ")
 ```
 
@@ -97,8 +97,8 @@ arguments raise a clear error. See `examples/extensions/`.
 Extensions are loaded through Racket's `dynamic-rerequire`, which tracks file
 modification times. `/reload` (or the `reload_extensions` tool, which the agent
 can call on itself) recompiles only changed modules, wipes all
-extension-contributed registry entries, and re-runs each `init(pi)`. Kernel
-state — the session, provider connections, and `pi.state` — survives reloads.
+extension-contributed registry entries, and re-runs each `init(rho)`. Kernel
+state — the session, provider connections, and `rho.state` — survives reloads.
 
 ## Layout
 
@@ -106,9 +106,9 @@ state — the session, provider connections, and `pi.state` — survives reloads
 src/
   main.rhm            CLI entry, built-in commands, system prompt
   kernel/
-    config.rhm        provider profiles, ~/.pi-rhm/config.json
+    config.rhm        provider profiles, ~/.rho/config.json
     registry.rhm      tools / commands / event handlers / state
-    session.rhm       append-only JSONL sessions (~/.pi-rhm/sessions/)
+    session.rhm       append-only JSONL sessions (~/.rho/sessions/)
     loop.rhm          agent loop: stream, execute tools, repeat
     reload.rkt        dynamic-rerequire + rhombus-dynamic-require shim
   ai/

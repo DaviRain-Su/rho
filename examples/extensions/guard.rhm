@@ -1,25 +1,25 @@
 #lang rhombus
 
 // Guard extension: blocks dangerous bash commands via the tool_call event.
-// Also counts blocked attempts in pi.state (survives /reload).
+// Also counts blocked attempts in rho.state (survives /reload).
 
 export:
   init
 
 def dangerous = ["rm -rf /", "rm -rf ~", "sudo ", "mkfs", "> /dev/sd"]
 
-fun init(pi):
-  pi.on("tool_call",
-        fun (ev :: Map):
-          let name = ev.get("toolName", "")
-          let cmd = ev.get("input", {}).get("command", "")
-          let hit:
-            name == "bash"
-              && (for any (pat in dangerous):
-                    cmd is_a String && cmd.contains(pat))
-          if hit
-          | pi.state["blocked_count"] := pi.state.get("blocked_count", 0) + 1
-            { "block": #true,
-              "reason": "guard extension blocked dangerous command ("
-                          +& pi.state["blocked_count"] +& " so far)" }
-          | #false)
+fun init(rho):
+  rho.on("tool_call",
+         fun (ev :: Map):
+           let name = ev.get("toolName", "")
+           let cmd = ev.get("input", {}).get("command", "")
+           let hit:
+             name == "bash"
+               && (for any (pat in dangerous):
+                     cmd is_a String && cmd.contains(pat))
+           if hit
+           | rho.state["blocked_count"] := rho.state.get("blocked_count", 0) + 1
+             { "block": #true,
+               "reason": "guard extension blocked dangerous command ("
+                           +& rho.state["blocked_count"] +& " so far)" }
+           | #false)

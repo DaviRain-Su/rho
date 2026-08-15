@@ -3,8 +3,19 @@ import:
   "../src/kernel/reload.rkt" as reload
 // simulate loader with a relative path from a different cwd
 import lib("racket/base.rkt") as rkt
+
+def dir = "/tmp/pi-tests/proj/.rho/extensions"
+when !filesystem.directory_exists(dir)
+| filesystem.make_directory(dir, ~parents: #true)
+filesystem.write_string(dir +& "/shout.rhm",
+                        @str{#lang rhombus
+                             export: init
+                             fun init(rho): #void
+                            },
+                        ~exists: #'truncate)
+
 rkt.#{current-directory}(rkt.#{string->path}("/tmp/pi-tests/proj"))
-def p = ".pi-rhm/extensions/shout.rhm"
-println(reload.rerequire_path(p))
+def p = ".rho/extensions/shout.rhm"
+println(reload.rerequire_path(p) != [])
 def init = reload.get_export(p, "init")
 println("got init: " +& to_string(init is_a Function))

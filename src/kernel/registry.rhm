@@ -52,7 +52,7 @@ class Registry(tools :: MutableMap,
       let r = try:
                 fn(data)
                 ~catch e :: Exn.Fail:
-                  println("[pi] handler error for " +& event +& ": " +& e.message)
+                  println("[rho] handler error for " +& event +& ": " +& e.message)
                   #false
       result || (r is_a Map && r)
 

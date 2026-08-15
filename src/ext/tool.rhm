@@ -3,10 +3,10 @@
 // `tool` definition macro for extensions: derives the JSON schema from
 // Rhombus-style annotations, so an extension can write
 //
-//   import: lib("pi-rhm/src/ext/tool.rhm") open
+//   import: lib("rho/src/ext/tool.rhm") open
 //   export: init
-//   fun init(pi):
-//     tool pi shout(text :: String) ~desc "Uppercase with !!!":
+//   fun init(rho):
+//     tool rho shout(text :: String) ~desc "Uppercase with !!!":
 //       String.upcase(text) +& "!!!"
 //
 // instead of hand-writing register_tool + schema. Parameters may have

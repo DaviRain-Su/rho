@@ -1,7 +1,7 @@
 #lang rhombus
 
 // Configuration: provider profiles + current selection.
-// Config file: ~/.pi-rhm/config.json (optional). Env vars supply API keys.
+// Config file: ~/.rho/config.json (optional). Env vars supply API keys.
 
 import:
   json
@@ -19,7 +19,7 @@ fun home() :: String:
   envvar.getenv("HOME") || "/tmp"
 
 fun config_dir() :: String:
-  home() +& "/.pi-rhm"
+  home() +& "/.rho"
 
 fun sessions_dir() :: String:
   config_dir() +& "/sessions"
@@ -28,7 +28,7 @@ fun global_extensions_dir() :: String:
   config_dir() +& "/extensions"
 
 fun project_extensions_dir() :: String:
-  ".pi-rhm/extensions"
+  ".rho/extensions"
 
 class Config(mutable provider :: String,
              mutable model :: String,

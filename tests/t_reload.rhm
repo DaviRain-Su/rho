@@ -18,28 +18,28 @@ when !filesystem.directory_exists(ext_dir)
 
 def v1 = @str{#lang rhombus
               export: init
-              fun init(pi):
-                pi.state["hits"] := pi.state.get("hits", 0)
-                pi.register_tool(
+              fun init(rho):
+                rho.state["hits"] := rho.state.get("hits", 0)
+                rho.register_tool(
                   ~name: "counter",
                   ~description: "count",
                   ~schema: {"type": "object", "properties": {}, "required": []},
                   ~fn: fun (args):
-                         pi.state["hits"] := pi.state["hits"] + 1
-                         "v1 count=" +& pi.state["hits"])
+                         rho.state["hits"] := rho.state["hits"] + 1
+                         "v1 count=" +& rho.state["hits"])
              }
 
 def v2 = @str{#lang rhombus
               export: init
-              fun init(pi):
-                pi.state["hits"] := pi.state.get("hits", 0)
-                pi.register_tool(
+              fun init(rho):
+                rho.state["hits"] := rho.state.get("hits", 0)
+                rho.register_tool(
                   ~name: "counter",
                   ~description: "count",
                   ~schema: {"type": "object", "properties": {}, "required": []},
                   ~fn: fun (args):
-                         pi.state["hits"] := pi.state["hits"] + 10
-                         "v2 count=" +& pi.state["hits"])
+                         rho.state["hits"] := rho.state["hits"] + 10
+                         "v2 count=" +& rho.state["hits"])
              }
 
 def reg = make_registry()

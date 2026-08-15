@@ -1,6 +1,6 @@
 #lang rhombus
 
-// ExtensionAPI: the `pi` object handed to each extension's init(pi).
+// ExtensionAPI: the `rho` object handed to each extension's init(rho).
 
 export:
   PiAPI
@@ -28,5 +28,5 @@ class PiAPI(registry, out):
     registry.state
 
   method notify(msg :: String):
-    out.write_string("\u001B[36m[pi]\u001B[0m " +& msg +& "\n")
+    out.write_string("\u001B[36m[rho]\u001B[0m " +& msg +& "\n")
     out.flush()

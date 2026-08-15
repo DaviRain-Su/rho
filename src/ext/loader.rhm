@@ -2,7 +2,7 @@
 
 // Extension discovery and (re)loading.
 //
-// Extensions are Rhombus modules exporting `init(pi)`. They are loaded via
+// Extensions are Rhombus modules exporting `init(rho)`. They are loaded via
 // dynamic-rerequire so that /reload picks up source changes; registry entries
 // contributed by extensions are wiped and rebuilt on each load pass.
 

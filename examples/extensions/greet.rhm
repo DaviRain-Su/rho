@@ -4,17 +4,17 @@
 // from the annotations, and `times` becomes optional because it has a default.
 
 import:
-  lib("pi-rhm/src/ext/tool.rhm") open
+  lib("rho/src/ext/tool.rhm") open
 
 export:
   init
 
-fun init(pi):
-  tool pi greet(name :: String, times :: Int = 1) ~desc "Greet someone by name":
+fun init(rho):
+  tool rho greet(name :: String, times :: Int = 1) ~desc "Greet someone by name":
     String.join(for List (_ in 0..times): "Hello, " +& name +& "!", " ")
 
-  pi.register_command(
+  rho.register_command(
     ~name: "greet",
     ~description: "greet from the example extension",
     ~handler: fun (args):
-                pi.notify("Hello" +& (if args == "" | "" | ", " +& args) +& "!"))
+                rho.notify("Hello" +& (if args == "" | "" | ", " +& args) +& "!"))

@@ -1,6 +1,6 @@
 #lang rhombus
 
-// pi-rhm: a Pi-style hot-reloadable coding agent in Rhombus.
+// rho: a Pi-style hot-reloadable coding agent in Rhombus.
 // Usage: racket src/main.rhm [-p provider] [-m model] [--resume session.jsonl]
 
 import:
@@ -50,18 +50,18 @@ fun agents_md() :: String:
   | ""
 
 fun system_prompt() :: String:
-  "You are pi-rhm, a coding agent written in Rhombus, running in a terminal.\n"
+  "You are rho, a coding agent written in Rhombus, running in a terminal.\n"
     +& "Working directory: " +& cwd() +& "\n"
     +& "Use the available tools to read, write, and edit files and to run shell commands.\n"
-    +& "You can extend yourself: write a Rhombus extension module exporting `init(pi)` into "
+    +& "You can extend yourself: write a Rhombus extension module exporting `init(rho)` into "
     +& project_extensions_dir() +& "/ or " +& global_extensions_dir() +& "/, "
     +& "then call the reload_extensions tool to activate it immediately.\n"
     +& "Extension template (Rhombus is indentation-sensitive; follow it exactly):\n"
     +& "```\n"
     +& "#lang rhombus\n"
     +& "export: init\n"
-    +& "fun init(pi):\n"
-    +& "  pi.register_tool(\n"
+    +& "fun init(rho):\n"
+    +& "  rho.register_tool(\n"
     +& "    ~name: \"my_tool\",\n"
     +& "    ~description: \"what it does\",\n"
     +& "    ~schema: { \"type\": \"object\",\n"
@@ -70,11 +70,11 @@ fun system_prompt() :: String:
     +& "    ~fn: fun (args):\n"
     +& "           \"result: \" +& args.get(\"x\", \"\"))\n"
     +& "```\n"
-    +& "Also available: pi.register_command(~name, ~description, ~handler), "
-    +& "pi.on(event, fn) for events (tool_call may return {\"block\": #true, \"reason\": ...}), "
-    +& "pi.state (a mutable map that survives reloads), pi.notify(msg).\n"
-    +& "Shorthand: `import: lib(\"pi-rhm/src/ext/tool.rhm\") open` provides a `tool` macro:\n"
-    +& "  tool pi greet(name :: String, times :: Int = 1) ~desc \"Greet\":\n"
+    +& "Also available: rho.register_command(~name, ~description, ~handler), "
+    +& "rho.on(event, fn) for events (tool_call may return {\"block\": #true, \"reason\": ...}), "
+    +& "rho.state (a mutable map that survives reloads), rho.notify(msg).\n"
+    +& "Shorthand: `import: lib(\"rho/src/ext/tool.rhm\") open` provides a `tool` macro:\n"
+    +& "  tool rho greet(name :: String, times :: Int = 1) ~desc \"Greet\":\n"
     +& "    \"Hello \" +& name\n"
     +& "which derives the JSON schema from the annotations (defaults become optional).\n"
     +& "Be concise. Prefer tools over guessing."
@@ -181,7 +181,7 @@ fun first_line(s :: String) :: String:
   | ~else: to_string(lines[0]) +& " \u2026"
 
 def banner:
-  color("1;35", "pi-rhm") +& " \u2014 hot-reloadable Rhombus coding agent\n"
+  color("1;35", "rho") +& " \u2014 hot-reloadable Rhombus coding agent\n"
     +& "provider=" +& config.provider +& " model=" +& config.model +& "\n"
     +& "session=" +& session.path +& "\n"
     +& "type /help for commands\n\n"

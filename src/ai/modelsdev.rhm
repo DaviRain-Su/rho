@@ -1,0 +1,136 @@
+#lang rhombus
+
+// models.dev catalog — the open model database pi-ai generates its registry
+// from. Fetched from https://models.dev/api.json, cached at
+// ~/.rho/models_dev.json, refreshed in the background when older than 7 days.
+//
+// A provider is *usable* when rho speaks its protocol (openai-compatible or
+// anthropic, inferred from the npm field) and *available* when one of its
+// API-key env vars is set.
+
+import:
+  json
+  net/http
+  rhombus/envvar
+  lib("racket/base.rkt") as rkt
+  "../kernel/config.rhm" as config
+
+export:
+  refresh_async
+  catalog
+  provider_profile
+  env_key_present
+  available_providers
+  lookup_model
+
+def url = "https://models.dev/api.json"
+
+fun cache_file() :: String:
+  config.config_dir() +& "/models_dev.json"
+
+def mutable mem = #false
+
+fun fetch_now() :: Boolean:
+  try:
+    let resp = http.get(url,
+                        ~timeouts: http.Timeouts(~lease: 10, ~connect: 10,
+                                                 ~request: 120))
+    let body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+    resp.close()
+    let parsed = json.from_string(body)
+    cond
+    | parsed is_a Map:
+        when !filesystem.directory_exists(config.config_dir())
+        | filesystem.make_directory(config.config_dir(), ~parents: #true)
+        filesystem.write_string(cache_file(), body, ~exists: #'truncate)
+        mem := parsed
+        #true
+    | ~else: #false
+    ~catch _:
+      #false
+
+fun stale() :: Boolean:
+  !filesystem.file_exists(cache_file())
+    || (rkt.#{current-seconds}()
+          - rkt.#{file-or-directory-modify-seconds}(cache_file())) > 7 * 24 * 3600
+
+// Kick off a background refresh; never blocks startup.
+fun refresh_async():
+  when stale()
+  | rkt.thread(fun (): fetch_now())
+    #void
+
+fun catalog() :: Map:
+  when mem == #false
+  | mem := (if filesystem.file_exists(cache_file())
+            | try:
+                json.from_string(filesystem.read_string(cache_file()))
+                ~catch _: {}
+            | {})
+  if mem is_a Map | mem | {}
+
+// rho provider profile for a models.dev entry, or #false when the protocol
+// is unsupported.
+fun provider_profile(p :: Map):
+  let npm = to_string(p.get("npm", ""))
+  let api = p.get("api", "")
+  let envs = p.get("env", [])
+  let env_name = (if envs is_a List && envs != [] | to_string(envs[0]) | "")
+  cond
+  | npm == "@ai-sdk/openai-compatible" && api is_a String && api != "":
+      { "kind": "openai", "base_url": api, "api_key_env": env_name }
+  | npm == "@ai-sdk/anthropic":
+      // our anthropic client appends /v1/messages itself
+      let base:
+        cond
+        | api is_a String && api != "":
+            if api.ends_with("/v1") | api.substring(0 .. api.length() - 3) | api
+        | ~else: "https://api.anthropic.com"
+      { "kind": "anthropic", "base_url": base, "api_key_env": env_name }
+  | npm == "@ai-sdk/openai":
+      { "kind": "openai", "base_url": "https://api.openai.com/v1",
+        "api_key_env": env_name }
+  | ~else: #false
+
+// First env var from the entry's list that is set and non-empty.
+fun env_key_present(p :: Map):
+  let envs = p.get("env", [])
+  for values(found = #false) (name in (if envs is_a List | envs | [])):
+    found || (block:
+                let n = to_string(name)
+                let v = envvar.getenv(n)
+                if v is_a String && v != "" | n | #false)
+
+// [id, profile, models] for every catalog provider that rho can use and
+// that has an API key configured.
+fun available_providers() :: List:
+  let cat = catalog()
+  for List:
+    each id in cat.keys().sort()
+    let p = cat[id]
+    skip_when !(p is_a Map)
+    let prof = provider_profile(p)
+    skip_when !prof
+    skip_when !env_key_present(p)
+    let models = p.get("models", {})
+    [to_string(id), prof, if models is_a Map | models | {}]
+
+// Search the whole catalog for a model id; returns info in models.rhm
+// format, or #false.
+fun lookup_model(short :: String):
+  let cat = catalog()
+  for values(found = #false) ((_id, p) in cat):
+    found || (block:
+                let models = (if p is_a Map | p.get("models", {}) | {})
+                let m = (if models is_a Map | models.get(short, #false) | #false)
+                if m is_a Map
+                | let cost = m.get("cost", {})
+                  let cost = (if cost is_a Map | cost | {})
+                  let limit = m.get("limit", {})
+                  let limit = (if limit is_a Map | limit | {})
+                  { "context_window": limit.get("context", 128000),
+                    "input_price": cost.get("input", 0.0),
+                    "output_price": cost.get("output", 0.0),
+                    "cache_read_price": cost.get("cache_read", 0.0),
+                    "thinking": m.get("reasoning", #false) == #true }
+                | #false)

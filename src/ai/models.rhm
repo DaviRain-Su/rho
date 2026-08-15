@@ -8,6 +8,7 @@
 import:
   json
   "../kernel/config.rhm"
+  "modelsdev.rhm" as modelsdev
 
 export:
   model_info
@@ -66,13 +67,20 @@ fun all_models() :: Map:
     m ++ { k: v }
 
 // Strips a provider prefix like "anthropic/claude-..." for lookup.
+// Falls back to the models.dev catalog when the model isn't in the local
+// registry, so any selected model gets real context/pricing data.
 fun model_info(name :: String) :: Map:
   let models = all_models()
   let short:
     let parts = name.split("/")
     to_string(parts[parts.length() - 1])
-  let entry = models.get(name, models.get(short, {}))
-  defaults ++ (if entry is_a Map | entry | {})
+  let entry = models.get(name, models.get(short, #false))
+  cond
+  | entry is_a Map: defaults ++ entry
+  | ~else:
+      match modelsdev.lookup_model(short)
+      | m :: Map: defaults ++ m
+      | ~else: defaults
 
 // usage: {"input": n, "output": n, "cache_read": n}; returns USD
 fun cost_of(name :: String, usage :: Map) :: Real:

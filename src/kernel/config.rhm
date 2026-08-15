@@ -32,11 +32,13 @@ fun project_extensions_dir() :: String:
 
 class Config(mutable provider :: String,
              mutable model :: String,
-             providers :: Map,
+             mutable providers :: Map,
              mutable thinking,
              settings :: Map):
   method profile() :: Map:
     providers.get(provider, {})
+  method register_provider(name :: String, prof :: Map):
+    providers := providers ++ { name: prof }
   method base_url() :: String:
     profile().get("base_url", "")
   method api_key() :: String:

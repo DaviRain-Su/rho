@@ -33,6 +33,8 @@ import:
   "kernel/packages.rhm" as packages
   "kernel/trust.rhm" as trust
   "ai/models.rhm" as models
+  "ai/modelsdev.rhm" as modelsdev
+  rhombus/envvar
   "tools/core.rhm" open
   "ext/api.rhm" open
   "ext/loader.rhm" as loader
@@ -239,26 +241,129 @@ registry.register_command(
 registry.register_command(
   ~name: "reload", ~description: "hot-reload extensions (picks up changed files)",
   ~handler: fun (_args): do_reload())
+// ---- model availability (pi-ai style: models.dev catalog + env API keys) ----
+
+// rho provider name -> models.dev catalog id for its model list
+def modelsdev_alias :: Map:
+  { "kimi": "moonshotai", "kimi-anthropic": "moonshotai" }
+
+fun env_ok(env_name :: String) :: Boolean:
+  env_name == ""
+    || (block:
+          let v = envvar.getenv(env_name)
+          v is_a String && v != "")
+
+// [provider_name, models_map] for every provider usable right now:
+// configured rho providers with their key set, plus models.dev providers
+// (supported protocol + env key present) not shadowed by a configured one.
+fun available_provider_groups() :: List:
+  let cat = modelsdev.catalog()
+  let configured:
+    for List:
+      each pname in config.providers.keys().sort()
+      let prof = config.providers[pname]
+      skip_when !env_ok(to_string(prof.get("api_key_env", "")))
+      let src = modelsdev_alias.get(pname, pname)
+      let mdls:
+        let p = cat.get(src, #false)
+        let ms = (if p is_a Map | p.get("models", {}) | {})
+        if ms is_a Map && ms.keys().length() > 0
+        | ms
+        | { to_string(prof.get("default_model", "")): {} }
+      [to_string(pname), mdls]
+  let dev_only:
+    for List:
+      each entry in modelsdev.available_providers()
+      let [id, _prof, mdls] = entry
+      skip_when config.providers.get(id, #false)
+      skip_when mdls.keys().length() == 0
+      [id, mdls]
+  configured ++ dev_only
+
+fun model_desc(m) :: String:
+  cond
+  | m is_a Map && m.keys().length() > 0:
+      let cost = m.get("cost", {})
+      let cost = (if cost is_a Map | cost | {})
+      let limit = m.get("limit", {})
+      let limit = (if limit is_a Map | limit | {})
+      "ctx " +& limit.get("context", "?")
+        +& " \u00B7 $" +& cost.get("input", 0) +& "/$" +& cost.get("output", 0)
+        +& (if m.get("reasoning", #false) == #true | " \u00B7 thinking" | "")
+  | ~else: ""
+
+// ["provider/model", description] pairs for menus and --list-models
+fun available_model_entries() :: List:
+  for List:
+    each group in available_provider_groups()
+    let [pname, mdls] = group
+    each mid in mdls.keys().sort()
+    skip_when to_string(mid) == ""
+    [pname +& "/" +& mid, model_desc(mdls.get(mid, #false))]
+
+// Switch model, optionally crossing providers ("provider/model").
+// Unknown models.dev providers with a supported protocol are registered
+// into the live config on the fly.
+fun set_model(arg :: String) :: String:
+  let slash:
+    for values(found = #false) (i in 0 .. arg.length()):
+      found || (arg[i] == Char"/" && i)
+  cond
+  | slash is_a Int:
+      let p = arg.substring(0 .. slash)
+      let m = arg.substring(slash + 1 ..)
+      cond
+      | config.providers.get(p, #false):
+          config.provider := p
+          config.model := m
+          "provider=" +& p +& " model=" +& m
+      | ~else:
+          let entry = modelsdev.catalog().get(p, #false)
+          let prof = (if entry is_a Map | modelsdev.provider_profile(entry) | #false)
+          cond
+          | prof is_a Map:
+              config.register_provider(p, prof)
+              config.provider := p
+              config.model := m
+              "provider=" +& p +& " model=" +& m
+          | ~else:
+              // the model id itself contains "/" (e.g. openrouter ids)
+              config.model := arg
+              "model set to " +& arg
+  | ~else:
+      config.model := arg
+      "model set to " +& arg
+
 registry.register_command(
-  ~name: "model", ~description: "show or set model: /model [name]",
+  ~name: "model", ~description: "switch model: /model [provider/model | name]",
   ~handler: fun (args):
               if args == ""
               | api.notify("provider=" +& config.provider +& " model=" +& config.model)
-              | config.model := args
-                api.notify("model set to " +& args))
+              | api.notify(set_model(args.trim())))
 registry.register_command(
   ~name: "provider", ~description: "switch provider: /provider [name]",
   ~handler: fun (args):
               cond
               | args == "":
+                  let avail:
+                    for List (g in available_provider_groups()): g[0]
                   api.notify("provider=" +& config.provider
-                               +& " (available: " +& String.join(config.providers.keys().sort(), ", ") +& ")")
+                               +& " (available: " +& String.join(avail, ", ") +& ")")
               | config.providers.has_key(args):
                   config.provider := args
                   config.model := config.profile().get("default_model", config.model)
                   api.notify("switched to " +& args +& " model=" +& config.model)
               | ~else:
-                  api.notify("unknown provider: " +& args))
+                  match modelsdev.catalog().get(args, #false)
+                  | entry :: Map:
+                      match modelsdev.provider_profile(entry)
+                      | prof :: Map:
+                          config.register_provider(args, prof)
+                          config.provider := args
+                          config.model := ""
+                          api.notify("switched to " +& args +& "; pick a model with /model")
+                      | ~else: api.notify("provider " +& args +& " uses an unsupported protocol")
+                  | ~else: api.notify("unknown provider: " +& args))
 // ---- usage accounting ----
 fun usage_totals() :: Map:
   for values(acc :: Map = { "input": 0, "output": 0, "cache_read": 0, "cost": 0.0 }) (m in session.messages()):
@@ -283,13 +388,15 @@ fun usage_line() :: String:
     +& " ctx-window=" +& info["context_window"]
 
 fun list_models():
-  let ms = models.all_models()
-  for (name in ms.keys().sort()):
-    let info = models.model_info(name)
-    println(name
-              +& "  ctx=" +& info["context_window"]
-              +& "  $" +& info["input_price"] +& "/$" +& info["output_price"] +& " per 1M"
-              +& (if info["thinking"] | "  [thinking]" | ""))
+  match available_model_entries()
+  | []:
+      println("no models available: set an API key (e.g. KIMI_API_KEY,")
+      println("ANTHROPIC_API_KEY, OPENAI_API_KEY ...) and rerun; the model")
+      println("catalog (models.dev) downloads in the background on first run")
+  | entries:
+      for (entry in entries):
+        let [full, desc] = entry
+        println(full +& (if desc == "" | "" | "  " +& desc))
 
 registry.register_command(
   ~name: "session", ~description: "show session file, entry count, token usage",
@@ -748,22 +855,23 @@ fun tui_commands() :: List:
           [t["name"], "(prompt) " +& t["description"]])
     ++ [["quit", "exit rho"], ["exit", "exit rho"]]
 
-// argument completions for /model and /provider
+// argument completions for /model and /provider (available = API key set)
 fun tui_arg_complete(cmd :: String, prefix :: String):
   cond
   | cmd == "model":
+      let lp = prefix.foldcase()
       for List:
-        each name in models.all_models().keys().sort()
-        let name = to_string(name)
-        skip_when !name.contains(prefix)
-        let info = models.model_info(name)
-        [name, name, "ctx " +& info.get("context_window", "?")]
+        each entry in available_model_entries()
+        let [full, desc] = entry
+        skip_when !full.foldcase().contains(lp)
+        [full, full, desc]
   | cmd == "provider":
+      let lp = prefix.foldcase()
       for List:
-        each name in config.providers.keys().sort()
-        let name = to_string(name)
-        skip_when !name.contains(prefix)
-        [name, name, to_string(config.providers[name].get("default_model", ""))]
+        each group in available_provider_groups()
+        let [pname, mdls] = group
+        skip_when !pname.foldcase().contains(lp)
+        [pname, pname, mdls.keys().length() +& " models"]
   | ~else: #false
 
 fun run_tui_mode():
@@ -900,8 +1008,16 @@ fun try_subcommand() :: Boolean:
   | ~else: #false
 
 module main:
+  modelsdev.refresh_async()
   cond
   | opts.get("list_models", #false):
+      // first run: wait for the catalog download so the list is complete
+      when modelsdev.catalog() == {}
+      | for values(done = #false) (_i in 0 .. 100):
+          done || (block:
+                     rkt.sleep(0.1)
+                     modelsdev.catalog() != {})
+        #void
       list_models()
   | try_subcommand():
       #void

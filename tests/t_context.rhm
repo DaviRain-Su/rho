@@ -1,0 +1,36 @@
+#lang rhombus
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/context.rhm" as context
+
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-ctx-~a", #'directory))
+def base = (if tmp.substring(tmp.length() - 1 ..) == "/" | tmp.substring(0 .. tmp.length() - 1) | tmp)
+def sub = base +& "/a/b"
+filesystem.make_directory(sub, ~parents: #true)
+filesystem.write_string(base +& "/AGENTS.md", "root agents", ~exists: #'truncate)
+filesystem.write_string(base +& "/a/CLAUDE.md", "claude fallback", ~exists: #'truncate)
+filesystem.write_string(sub +& "/AGENTS.md", "sub agents", ~exists: #'truncate)
+filesystem.write_string(sub +& "/AGENTS.override.md", "override wins", ~exists: #'truncate)
+
+def files = context.gather_context_files(~cwd: sub)
+def contents = (for List (e in files): e[1])
+println("files: " +& to_string(contents))
+// expect: ... "root agents", "claude fallback", "override wins" as last three
+def last3 = (for List (i in contents.length() - 3 .. contents.length()): contents[i])
+when last3 != ["root agents", "claude fallback", "override wins"]
+| error("context order wrong: " +& to_string(last3))
+
+// system prompt: default when no files
+def sp = context.resolve_system_prompt(~default_prompt: "DEF", ~cwd: sub)
+when sp != "DEF" | error("expected default prompt, got " +& sp)
+
+// SYSTEM.md override + APPEND
+filesystem.make_directory(sub +& "/.rho", ~parents: #true)
+filesystem.write_string(sub +& "/.rho/SYSTEM.md", "CUSTOM", ~exists: #'truncate)
+filesystem.write_string(sub +& "/.rho/APPEND_SYSTEM.md", "MORE", ~exists: #'truncate)
+def sp2 = context.resolve_system_prompt(~default_prompt: "DEF", ~cwd: sub,
+                                        ~append_text: "EXTRA")
+when sp2 != "CUSTOM\n\nMORE\n\nEXTRA" | error("bad system prompt: " +& sp2)
+
+println("t_context OK")

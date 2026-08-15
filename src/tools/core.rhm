@@ -1,6 +1,6 @@
 #lang rhombus
 
-// Built-in tools: read_file, write_file, edit_file, bash.
+// Built-in tools: read_file, write_file, edit_file, bash, grep, find, ls.
 
 import:
   rhombus/subprocess
@@ -63,9 +63,7 @@ fun tool_edit_file(args :: Map):
                                   ~exists: #'truncate)
           "edited " +& path
 
-fun tool_bash(args :: Map):
-  let cmd = args.get("command", "")
-  let timeout = args.get("timeout", 120)
+fun shell_capture(cmd :: String, timeout :: Int) :: values(Any, String):
   let sp = subprocess.run_shell(cmd,
                                 ~in: Port.Input.open_string(""),
                                 ~out: #'pipe,
@@ -87,11 +85,77 @@ fun tool_bash(args :: Map):
               poll_loop(ticks - 1)
           | code: code
   reader.wait()
-  let output = truncate(buf.get_string().to_string())
+  values(status, truncate(buf.get_string().to_string()))
+
+fun tool_bash(args :: Map):
+  let cmd = args.get("command", "")
+  let timeout = args.get("timeout", 120)
+  let values(status, output) = shell_capture(cmd, timeout)
   match status
   | #'timeout: "error: command timed out after " +& timeout +& "s\n" +& output
   | 0: (if output == "" | "(no output)" | output)
   | code: "exit code " +& code +& "\n" +& output
+
+fun shell_quote(s :: String) :: String:
+  "'" +& String.join(s.split("'", ~trim: #false), "'\\''") +& "'"
+
+def have_rg = (block:
+                 let values(status, _) = shell_capture("command -v rg", 10)
+                 status == 0)
+
+fun tool_grep(args :: Map):
+  let pat = args.get("pattern", "")
+  let path = args.get("path", ".")
+  let glob = args.get("glob", "")
+  let ignore_case = args.get("ignore_case", #false)
+  cond
+  | pat == "": "error: pattern must not be empty"
+  | ~else:
+      let cmd:
+        if have_rg
+        | "rg -n --no-heading --color never -M 400 "
+            +& (if ignore_case | "-i " | "")
+            +& (if glob == "" | "" | "-g " +& shell_quote(glob) +& " ")
+            +& "-e " +& shell_quote(pat) +& " " +& shell_quote(path)
+        | "grep -rn "
+            +& (if ignore_case | "-i " | "")
+            +& (if glob == "" | "" | "--include=" +& shell_quote(glob) +& " ")
+            +& "-e " +& shell_quote(pat) +& " " +& shell_quote(path)
+      let values(status, output) = shell_capture(cmd, 60)
+      match status
+      | 0: (if output == "" | "(no matches)" | output)
+      | 1: "(no matches)"
+      | #'timeout: "error: grep timed out"
+      | code: "exit code " +& code +& "\n" +& output
+
+fun tool_find(args :: Map):
+  let pat = args.get("pattern", "*")
+  let path = args.get("path", ".")
+  let cmd:
+    "find " +& shell_quote(path)
+      +& " -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/compiled/*'"
+      +& " -name " +& shell_quote(pat) +& " | head -500"
+  let values(status, output) = shell_capture(cmd, 60)
+  match status
+  | 0: (if output == "" | "(no matches)" | output)
+  | #'timeout: "error: find timed out"
+  | code: "exit code " +& code +& "\n" +& output
+
+fun tool_ls(args :: Map):
+  let path = args.get("path", ".")
+  cond
+  | !filesystem.directory_exists(path):
+      "error: not a directory: " +& path
+  | ~else:
+      let entries:
+        for List (p in filesystem.files(path).sort()):
+          let full = path +& "/" +& (p +& "")
+          if filesystem.directory_exists(full)
+          | (p +& "") +& "/"
+          | p +& ""
+      if entries == []
+      | "(empty directory)"
+      | truncate(String.join(entries, "\n"))
 
 fun install_core_tools(registry):
   registry.register_tool(
@@ -136,3 +200,34 @@ fun install_core_tools(registry):
                },
                "required": ["command"] },
     ~fn: tool_bash)
+  registry.register_tool(
+    ~name: "grep",
+    ~description: "Search file contents for a regex pattern. Returns matching lines with file:line prefixes.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "pattern": { "type": "string", "description": "Regex pattern to search for" },
+                 "path": { "type": "string", "description": "File or directory to search (default .)" },
+                 "glob": { "type": "string", "description": "Only search files matching this glob, e.g. *.rhm" },
+                 "ignore_case": { "type": "boolean", "description": "Case-insensitive search" }
+               },
+               "required": ["pattern"] },
+    ~fn: tool_grep)
+  registry.register_tool(
+    ~name: "find",
+    ~description: "Find files by name glob pattern under a directory (skips .git, node_modules, compiled).",
+    ~schema: { "type": "object",
+               "properties": {
+                 "pattern": { "type": "string", "description": "Filename glob, e.g. *.rhm" },
+                 "path": { "type": "string", "description": "Directory to search (default .)" }
+               },
+               "required": ["pattern"] },
+    ~fn: tool_find)
+  registry.register_tool(
+    ~name: "ls",
+    ~description: "List the entries of a directory. Directories are suffixed with /.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "path": { "type": "string", "description": "Directory to list (default .)" }
+               },
+               "required": ["path"] },
+    ~fn: tool_ls)

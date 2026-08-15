@@ -1,14 +1,32 @@
 #lang rhombus
 
 // rho: a Pi-style hot-reloadable coding agent in Rhombus.
-// Usage: racket src/main.rhm [-p provider] [-m model] [--resume session.jsonl]
+//
+// Usage: rho [options] [message ...]
+//   -p, --print                 run one turn, print the result, exit (headless)
+//   --mode <text|json>          output mode for headless runs (json = JSONL events)
+//   --provider <name>           provider profile from config
+//   -m, --model <name>          model name
+//   --resume <file>             resume a session file
+//   --tools <a,b>               only enable these tools
+//   --exclude-tools <a,b>       disable these tools
+//   --no-tools                  disable all tools
+//   --system-prompt <text>      replace the default system prompt
+//   --append-system-prompt <t>  append to the system prompt
+//   --no-context-files          skip AGENTS.md / CLAUDE.md discovery
+//   --no-extensions             skip loading extensions
+//   @file arguments inline the file's content into the first message.
+//   In print mode, piped stdin is merged into the first message.
 
 import:
   lib("racket/base.rkt") as rkt
+  lib("racket/port.rkt") as rktport
+  json
   "kernel/config.rhm" open
   "kernel/registry.rhm" open
   "kernel/session.rhm" open
   "kernel/loop.rhm" open
+  "kernel/context.rhm" as context
   "tools/core.rhm" open
   "ext/api.rhm" open
   "ext/loader.rhm" as loader
@@ -17,21 +35,45 @@ import:
 def out = Port.Output.current()
 
 // ---- command line ----
+fun split_list(v :: String) :: List:
+  for List (s in v.split(",")):
+    skip_when s.trim() == ""
+    s.trim()
+
 fun parse_args() :: Map:
   let args = [& rkt.#{vector->list}(rkt.#{current-command-line-arguments}())]
-  recur parse(rest = (for List (a in args): to_string(a)), acc :: Map = {}):
+  recur parse(rest = (for List (a in args): to_string(a)), acc :: Map = { "message": [] }):
     match rest
     | []: acc
-    | ["-p", v, & more]: parse(more, acc ++ { "provider": v })
+    | ["-p", & more]: parse(more, acc ++ { "print": #true })
+    | ["--print", & more]: parse(more, acc ++ { "print": #true })
+    | ["--mode", v, & more]: parse(more, acc ++ { "mode": v })
     | ["--provider", v, & more]: parse(more, acc ++ { "provider": v })
     | ["-m", v, & more]: parse(more, acc ++ { "model": v })
     | ["--model", v, & more]: parse(more, acc ++ { "model": v })
     | ["--resume", v, & more]: parse(more, acc ++ { "resume": v })
+    | ["--tools", v, & more]: parse(more, acc ++ { "tools": split_list(v) })
+    | ["--exclude-tools", v, & more]: parse(more, acc ++ { "exclude_tools": split_list(v) })
+    | ["--no-tools", & more]: parse(more, acc ++ { "no_tools": #true })
+    | ["--system-prompt", v, & more]: parse(more, acc ++ { "system_prompt": v })
+    | ["--append-system-prompt", v, & more]: parse(more, acc ++ { "append_system_prompt": v })
+    | ["--no-context-files", & more]: parse(more, acc ++ { "no_context": #true })
+    | ["--no-extensions", & more]: parse(more, acc ++ { "no_extensions": #true })
     | [a, & more]:
-        println("warning: ignoring argument " +& a)
-        parse(more, acc)
+        cond
+        | a.length() > 0 && a.substring(0..1) == "@" && filesystem.file_exists(a.substring(1..)):
+            let path = a.substring(1..)
+            let inlined = "\n\n``` " +& path +& "\n" +& filesystem.read_string(path) +& "\n```"
+            parse(more, acc ++ { "message": acc["message"].add(inlined) })
+        | a.length() > 0 && a.substring(0..1) == "-":
+            println("warning: ignoring argument " +& a)
+            parse(more, acc)
+        | ~else:
+            parse(more, acc ++ { "message": acc["message"].add(a) })
 
 def opts = parse_args()
+def headless = opts.get("print", #false) || opts.get("mode", "text") == "json"
+def json_mode = opts.get("mode", "text") == "json"
 def config = load_config(~provider: opts.get("provider", #false),
                          ~model: opts.get("model", #false))
 def registry = make_registry()
@@ -40,16 +82,24 @@ def session = start_session(~resume: opts.get("resume", #false))
 def api = PiAPI(registry, out)
 
 fun cwd() :: String:
-  to_string(rkt.#{current-directory}())
+  let s = to_string(rkt.#{current-directory}())
+  if s.length() > 1 && s.substring(s.length() - 1 ..) == "/"
+  | s.substring(0 .. s.length() - 1)
+  | s
 
-fun agents_md() :: String:
-  // AGENTS.md from cwd, injected into the system prompt when present
-  let path = cwd() +& "AGENTS.md"
-  if filesystem.file_exists(path)
-  | "\n\n## Project instructions (AGENTS.md)\n\n" +& filesystem.read_string(path)
+fun context_section() :: String:
+  if opts.get("no_context", #false)
   | ""
+  | let files = context.gather_context_files(~cwd: cwd())
+    if files == []
+    | ""
+    | let parts:
+        for List (entry in files):
+          let [path, content] = entry
+          "### " +& path +& "\n\n" +& content
+      "\n\n## Project context\n\n" +& String.join(parts, "\n\n")
 
-fun system_prompt() :: String:
+fun default_system_prompt() :: String:
   "You are rho, a coding agent written in Rhombus, running in a terminal.\n"
     +& "Working directory: " +& cwd() +& "\n"
     +& "Use the available tools to read, write, and edit files and to run shell commands.\n"
@@ -78,7 +128,22 @@ fun system_prompt() :: String:
     +& "    \"Hello \" +& name\n"
     +& "which derives the JSON schema from the annotations (defaults become optional).\n"
     +& "Be concise. Prefer tools over guessing."
-    +& agents_md()
+
+fun system_prompt() :: String:
+  context.resolve_system_prompt(~default_prompt: default_system_prompt(),
+                                ~override_text: opts.get("system_prompt", #false),
+                                ~append_text: opts.get("append_system_prompt", #false),
+                                ~cwd: cwd())
+    +& context_section()
+
+// ---- tool filters ----
+fun apply_tool_filters():
+  cond
+  | opts.get("no_tools", #false):
+      registry.set_tool_filter(~allow: [])
+  | ~else:
+      registry.set_tool_filter(~allow: opts.get("tools", #false),
+                               ~deny: opts.get("exclude_tools", []))
 
 // ---- built-in commands ----
 fun show_help(_args):
@@ -186,8 +251,62 @@ def banner:
     +& "session=" +& session.path +& "\n"
     +& "type /help for commands\n\n"
 
+// ---- headless mode ----
+fun emit_json(m :: Map):
+  out.write_string(json.to_string(m) +& "\n")
+  out.flush()
+
+fun stdin_text() :: String:
+  let stdin = rkt.#{current-input-port}()
+  if rkt.#{terminal-port?}(stdin)
+  | ""
+  | to_string(rktport.#{port->string}(stdin))
+
+fun headless_prompt() :: String:
+  let msg = String.join(opts["message"], " ")
+  let piped = stdin_text()
+  cond
+  | piped == "": msg
+  | msg == "": piped
+  | ~else: msg +& "\n\n" +& piped
+
+fun run_headless():
+  let input = headless_prompt()
+  when input.trim() == ""
+  | println("error: no prompt (pass a message argument or pipe stdin)")
+    rkt.exit(1)
+  when json_mode
+  | emit_json({ "type": "session_start", "session": session.path,
+                "provider": config.provider, "model": config.model })
+  run_turn(~config: config,
+           ~registry: registry,
+           ~session: session,
+           ~system_prompt: system_prompt(),
+           ~input: input,
+           ~on_text:
+             if json_mode
+             | fun (s): emit_json({ "type": "text", "text": s })
+             | fun (s):
+                 out.write_string(s)
+                 out.flush(),
+           ~on_tool:
+             if json_mode
+             | fun (name, args): emit_json({ "type": "tool_call", "name": name, "args": args })
+             | fun (name, args): #void,
+           ~on_tool_result:
+             if json_mode
+             | fun (name, r): emit_json({ "type": "tool_result", "name": name, "result": r })
+             | fun (name, r): #void)
+  if json_mode
+  | emit_json({ "type": "done", "session": session.path })
+  | out.write_string("\n")
+
 module main:
-  do_reload(#false)
-  run_repl(~banner: banner,
-           ~handle_command: handle_command,
-           ~handle_input: handle_input)
+  apply_tool_filters()
+  when !opts.get("no_extensions", #false)
+  | do_reload(#false)
+  if headless
+  | run_headless()
+  | run_repl(~banner: banner,
+             ~handle_command: handle_command,
+             ~handle_input: handle_input)

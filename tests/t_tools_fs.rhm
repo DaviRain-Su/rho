@@ -1,0 +1,36 @@
+#lang rhombus
+
+import:
+  "../src/kernel/registry.rhm" open
+  "../src/tools/core.rhm" open
+
+def registry = make_registry()
+install_core_tools(registry)
+
+// ls
+def ls = registry.find_tool("ls")
+def ls_out = ls.fn({ "path": "src" })
+println("ls src -> " +& ls_out)
+when !ls_out.contains("kernel/") | error("ls missing kernel/")
+
+// grep
+def grep = registry.find_tool("grep")
+def g_out = grep.fn({ "pattern": "install_core_tools", "path": "src", "glob": "*.rhm" })
+println("grep -> " +& g_out)
+when !g_out.contains("core.rhm") | error("grep missing core.rhm hit")
+
+// find
+def find = registry.find_tool("find")
+def f_out = find.fn({ "pattern": "*.rhm", "path": "src/kernel" })
+when !f_out.contains("session.rhm") | error("find missing session.rhm")
+
+// filters
+registry.set_tool_filter(~allow: ["bash"], ~deny: [])
+when registry.find_tool("grep") | error("grep should be filtered")
+when !registry.find_tool("bash") | error("bash should remain")
+when registry.tool_list().length() != 1 | error("tool_list should be 1")
+registry.set_tool_filter(~allow: #false, ~deny: ["bash"])
+when registry.find_tool("bash") | error("bash should be denied")
+registry.set_tool_filter()
+
+println("t_tools_fs OK")

@@ -28,7 +28,19 @@ class Registry(tools :: MutableMap,
                commands :: MutableMap,
                handlers :: MutableMap,
                state :: MutableMap,
-               mutable current_source :: String):
+               mutable current_source :: String,
+               mutable allow_tools,
+               mutable deny_tools :: List):
+
+  method set_tool_filter(~allow: allow = #false, ~deny: deny :: List = []):
+    allow_tools := allow
+    deny_tools := deny
+
+  method tool_visible(name :: String) :: Boolean:
+    cond
+    | deny_tools.contains(name): #false
+    | allow_tools is_a List: allow_tools.contains(name)
+    | ~else: #true
 
   method register_tool(~name: name :: String,
                        ~description: description :: String,
@@ -57,10 +69,11 @@ class Registry(tools :: MutableMap,
       result || (r is_a Map && r)
 
   method find_tool(name :: String) :: maybe(Tool):
-    tools.get(name, #false)
+    tool_visible(name) && tools.get(name, #false)
 
   method tool_list() :: List:
     for List (name in tools.keys().sort()):
+      skip_when !tool_visible(name)
       tools[name]
 
   method tools_wire() :: List:
@@ -88,4 +101,5 @@ class Registry(tools :: MutableMap,
                             entry)
 
 fun make_registry() :: Registry:
-  Registry(MutableMap(), MutableMap(), MutableMap(), MutableMap(), "builtin")
+  Registry(MutableMap(), MutableMap(), MutableMap(), MutableMap(), "builtin",
+           #false, [])

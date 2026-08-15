@@ -1,0 +1,68 @@
+#lang rhombus
+
+// Context files (AGENTS.md hierarchy) and system prompt files.
+//
+// Context files, in order: ~/.rho/AGENTS.md, then each ancestor directory of
+// cwd from the root down, then cwd itself. In each directory the first match
+// wins: AGENTS.override.md, else AGENTS.md, else CLAUDE.md.
+//
+// System prompt: .rho/SYSTEM.md (project) or ~/.rho/SYSTEM.md (global)
+// replaces the default; APPEND_SYSTEM.md in either location appends.
+
+import:
+  "config.rhm"
+
+export:
+  gather_context_files
+  resolve_system_prompt
+
+fun try_read(path :: String) :: maybe(String):
+  if filesystem.file_exists(path)
+  | filesystem.read_string(path)
+  | #false
+
+fun dir_context(dir :: String) :: maybe(List):
+  fun probe(name):
+    let path = dir +& "/" +& name
+    let content = try_read(path)
+    content && [path, content]
+  probe("AGENTS.override.md") || probe("AGENTS.md") || probe("CLAUDE.md")
+
+// "/a/b/c" -> ["/", "/a", "/a/b", "/a/b/c"]
+fun ancestor_dirs(cwd :: String) :: List:
+  let parts = cwd.split("/", ~trim: #false)
+  let dirs:
+    for values(acc = ["/"]) (i in 1 .. parts.length()):
+      skip_when parts[i] == ""
+      acc.add(String.join((for List (j in 0 .. i + 1): parts[j]), "/"))
+  dirs
+
+// Returns list of [path, content]
+fun gather_context_files(~cwd: cwd :: String) :: List:
+  let global_entry = dir_context(config.config_dir())
+  let dir_entries:
+    for List (dir in ancestor_dirs(cwd)):
+      let entry = dir_context(dir)
+      skip_when !entry
+      entry
+  (if global_entry | [global_entry] | []) ++ dir_entries
+
+fun resolve_system_prompt(~default_prompt: default_prompt :: String,
+                          ~override_text: override_text :: maybe(String) = #false,
+                          ~append_text: append_text :: maybe(String) = #false,
+                          ~cwd: cwd :: String) :: String:
+  let base:
+    override_text
+      || try_read(cwd +& "/.rho/SYSTEM.md")
+      || try_read(config.config_dir() +& "/SYSTEM.md")
+      || default_prompt
+  let appends:
+    for List (p in [cwd +& "/.rho/APPEND_SYSTEM.md",
+                    config.config_dir() +& "/APPEND_SYSTEM.md"]):
+      let c = try_read(p)
+      skip_when !c
+      c
+  let appends = (if append_text | appends.add(append_text) | appends)
+  if appends == []
+  | base
+  | base +& "\n\n" +& String.join(appends, "\n\n")

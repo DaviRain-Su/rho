@@ -741,6 +741,31 @@ registry.register_command(
                                  +& "Esc interrupt turn \u00B7 Ctrl-P cycle provider \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
                                  +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"))
 
+// command menu entries: registered commands + prompt templates + quit/exit
+fun tui_commands() :: List:
+  (for List (c in registry.command_list()): [c.name, c.description])
+    ++ (for List (t in discover_prompts()):
+          [t["name"], "(prompt) " +& t["description"]])
+    ++ [["quit", "exit rho"], ["exit", "exit rho"]]
+
+// argument completions for /model and /provider
+fun tui_arg_complete(cmd :: String, prefix :: String):
+  cond
+  | cmd == "model":
+      for List:
+        each name in models.all_models().keys().sort()
+        let name = to_string(name)
+        skip_when !name.contains(prefix)
+        let info = models.model_info(name)
+        [name, name, "ctx " +& info.get("context_window", "?")]
+  | cmd == "provider":
+      for List:
+        each name in config.providers.keys().sort()
+        let name = to_string(name)
+        skip_when !name.contains(prefix)
+        [name, name, to_string(config.providers[name].get("default_model", ""))]
+  | ~else: #false
+
 fun run_tui_mode():
   // route notify/command prints into the TUI transcript
   let (pin, pout) = rkt.#{make-pipe}()
@@ -753,12 +778,14 @@ fun run_tui_mode():
                      go()
                  | ~else: #void)
   tui.run_tui(~theme: load_theme(),
-              ~banner: banner +& "TUI: /hotkeys for keys, /help for commands\n",
+              ~banner: banner +& "TUI: type / for the command menu, /hotkeys for keys\n",
               ~handle_command: handle_command,
               ~handle_input: handle_input_tui,
               ~footer: tui_footer,
               ~cycle_model: cycle_model,
-              ~shell_exec: tui_shell)
+              ~shell_exec: tui_shell,
+              ~commands: tui_commands,
+              ~arg_complete: tui_arg_complete)
 
 fun stdin_is_tty():
   rkt.#{terminal-port?}(rkt.#{current-input-port}())

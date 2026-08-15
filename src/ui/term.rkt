@@ -91,10 +91,16 @@
 (define (term-rows) ROWS)
 (define (term-cols) COLS)
 
-(define (term-wait-event timeout)
-  (define e (sync/timeout (if (eq? timeout #f) #f timeout) (chaos-event C)))
+;; wake: optional semaphore; posting it wakes the wait immediately ('wake).
+;; Lets background threads (streaming, notify pump) trigger a repaint without
+;; waiting out the timeout.
+(define (term-wait-event timeout wake)
+  (define e (sync/timeout (if (eq? timeout #f) #f timeout)
+                          (chaos-event C)
+                          (if (semaphore? wake) wake never-evt)))
   (cond
     [(not e) 'timeout]
+    [(semaphore? e) 'wake]
     [(screen-size-report? e)
      (apply-size! (screen-size-report-rows e)
                   (screen-size-report-columns e))

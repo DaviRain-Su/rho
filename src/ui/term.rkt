@@ -29,6 +29,7 @@
          racket/system
          racket/string
          racket/port
+         net/base64
          lux/chaos
          raart/lux-chaos
          (only-in ansi/lcd-terminal
@@ -41,7 +42,10 @@
          term-poll-size!
          term-rows
          term-cols
-         term-draw!)
+         term-draw!
+         term-copy!
+         term-suspend!
+         term-resume!)
 
 (define C #f)
 (define OP #f)                        ; terminal output port
@@ -116,6 +120,25 @@
 
 (define (term-rows) ROWS)
 (define (term-cols) COLS)
+
+;; OSC 52: ask the terminal to place text on the system clipboard.
+;; Returns #t when the escape was written (terminal support varies).
+(define (term-copy! s)
+  (cond
+    [OP
+     (define b64 (bytes->string/utf-8
+                  (base64-encode (string->bytes/utf-8 s) #"")))
+     (write-string (format "\e]52;c;~a\a" b64) OP)
+     (flush-output OP)
+     #t]
+    [else #f]))
+
+;; Temporarily leave raw mode / the alternate screen (external editor).
+(define (term-suspend!)
+  (term-stop!))
+
+(define (term-resume!)
+  (term-start!))
 
 ;; wake: optional semaphore; posting it wakes the wait immediately ('wake).
 ;; Lets background threads (streaming, notify pump) trigger a repaint without

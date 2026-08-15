@@ -5,10 +5,15 @@
 // Layout (pi-style): transcript area / status line / separator / multi-line
 // editor / footer. The status line (spinner + activity + elapsed) is its own
 // row above the editor, so it never covers the footer stats.
-// Keys: Enter submit, Ctrl-J newline, Tab path completion, Up/Down history
-// (or cursor movement in multi-line input), PgUp/PgDn or mouse wheel scroll,
-// Ctrl-C interrupt turn (or clear input / quit), Escape interrupt, Ctrl-P
-// cycle model, Ctrl-L redraw, Ctrl-D quit.
+// Keys: Enter submit, Ctrl-J newline, Alt-Enter queue follow-up, Tab path
+// completion, Up/Down history (or cursor movement in multi-line input),
+// PgUp/PgDn or mouse wheel scroll, Ctrl-C interrupt turn (or clear input /
+// quit), Escape interrupt (restores queued follow-ups to the editor),
+// Ctrl-G external editor, Ctrl-X copy last assistant message, Ctrl-O
+// expand/collapse tool output, Shift-Tab cycle thinking level, Ctrl-P cycle
+// scoped models, Ctrl-L redraw, Ctrl-D quit. ~/.rho/keybindings.json remaps
+// actions (external_editor, copy_last, toggle_tool_output, cycle_thinking,
+// queue_followup).
 // Assistant output is rendered with lightweight markdown styling (headers,
 // bold, `code`, ``` fences, lists, quotes).
 //
@@ -18,13 +23,17 @@
 
 import:
   lib("racket/base.rkt") as rkt
+  lib("racket/file.rkt") as rktfile
+  lib("racket/system.rkt") as rktsys
   "term.rkt" as term
 
 export:
   run_tui
   push
+  push_block
   push_delta
   set_activity
+  copy_text
   default_theme
   md_line_spans
   wrap_spans
@@ -79,6 +88,30 @@ fun push(kind :: String, text :: String):
     lines := lines.add([kind, to_string(l)])
   dirty := #true
   wake()
+
+// Keep a multi-line text as ONE transcript entry (kept newlines), so the
+// renderer can fold it to its first line (tool output, Ctrl-O toggles).
+fun push_block(kind :: String, text :: String):
+  lines := lines.add([kind, strip_ansi(text)])
+  dirty := #true
+  wake()
+
+// Copy text to the system clipboard: OSC 52 escape (when the TUI is active)
+// plus best-effort external clipboard tools.
+fun copy_text(s :: String) :: Boolean:
+  let osc = term.#{term-copy!}(s) == #true
+  let tool_ok:
+    try:
+      let tmp = to_string(rktfile.#{make-temporary-file}("rho-clip-~a.txt"))
+      filesystem.write_string(tmp, s, ~exists: #'truncate)
+      let ok = rktsys.system("{ command -v wl-copy >/dev/null && wl-copy < " +& tmp
+                               +& "; } || { command -v xclip >/dev/null && xclip -selection clipboard < "
+                               +& tmp +& "; } || { command -v xsel >/dev/null && xsel -ib < "
+                               +& tmp +& "; } 2>/dev/null")
+      filesystem.delete(tmp)
+      ok == #true
+      ~catch _: #false
+  osc || tool_ok
 
 fun push_delta(s :: String):
   dlog("delta " +& s.length() +& " at " +& math.exact(math.round(rkt.#{current-inexact-milliseconds}())))
@@ -292,14 +325,21 @@ fun run_tui(~theme: theme_in :: Map = {},
             ~handle_input: handle_input,
             ~footer: footer = fun (): "rho",
             ~cycle_model: cycle_model = fun (): "",
+            ~cycle_thinking: cycle_thinking = fun (): "",
             ~shell_exec: shell_exec = fun (cmd): "(no shell handler)",
             ~tool_line: tool_line = fun (kind, text): #false,
             ~commands: commands = fun (): [],
-            ~arg_complete: arg_complete = fun (cmd, prefix): #false):
+            ~arg_complete: arg_complete = fun (cmd, prefix): #false,
+            ~editor_cmd: editor_cmd = fun (): "",
+            ~last_assistant: last_assistant = fun (): "",
+            ~keybind: keybind = fun (action, default): default):
   let theme = default_theme ++ theme_in
   fun tcolor(kind :: String):
     let c = theme.get(kind, "default")
     if c == "default" | #false | c
+  // keybindings.json can remap these action names
+  fun kb(action :: String, default :: String) :: String:
+    to_string(keybind(action, default))
 
   def mutable input_lines :: List = [""]
   def mutable cur_line = 0
@@ -314,6 +354,7 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable turn_started = 0
   def mutable last_size_poll = rkt.#{current-inexact-milliseconds}()
   def mutable last_trans_h = 20      // visible transcript height from last render
+  def mutable tools_expanded = #false  // Ctrl-O: expand tool output blocks
 
   // autocomplete popup (pi-style): opens while typing /command or @file
   def mutable ac_open = #false
@@ -503,6 +544,66 @@ fun run_tui(~theme: theme_in :: Map = {},
       activity := #false
       flush_partial()
       push("notify", "[turn interrupted]")
+      // pi behavior: interrupted queue returns to the editor for re-editing
+      when followups != [] && String.join(input_lines, "") == ""
+      | input_lines := (for List (f in followups): to_string(f))
+        cur_line := input_lines.length() - 1
+        cur_col := cur_text().length()
+        followups := []
+        push("notify", "[queued follow-ups restored to editor]")
+
+  // Ctrl-G: edit the current input in an external editor
+  fun external_edit():
+    let cmd = to_string(editor_cmd())
+    cond
+    | cmd == "":
+        push("notify", "[no editor: set external_editor in /settings or $EDITOR]")
+    | ~else:
+        let tmp = to_string(rktfile.#{make-temporary-file}("rho-edit-~a.txt"))
+        filesystem.write_string(tmp, String.join(input_lines, "\n"),
+                                ~exists: #'truncate)
+        term.#{term-suspend!}()
+        try:
+          rktsys.system(cmd +& " " +& tmp)
+          ~catch _: #void
+        term.#{term-resume!}()
+        let content = filesystem.read_string(tmp)
+        filesystem.delete(tmp)
+        let ls:
+          for List (l in content.split("\n", ~trim: #false)):
+            to_string(l)
+        // drop a trailing empty line from the editor's final newline
+        let ls:
+          if ls.length() > 1 && ls[ls.length() - 1] == ""
+          | ls.delete(ls.length() - 1)
+          | ls
+        input_lines := (if ls == [] | [""] | ls)
+        cur_line := input_lines.length() - 1
+        cur_col := cur_text().length()
+        dirty := #true
+
+  // Ctrl-X: copy the last assistant message
+  fun do_copy():
+    let text = to_string(last_assistant())
+    if text == ""
+    | push("notify", "[nothing to copy]")
+    | copy_text(text)
+      push("notify", "[copied last assistant message ("
+             +& text.length() +& " chars)]")
+
+  // Alt-Enter: queue the current input as a follow-up (runs after this turn)
+  fun queue_followup():
+    let text = String.join(input_lines, "\n").trim()
+    cond
+    | text == "": #void
+    | !turn_thread:
+        // nothing running: behave like submit
+        submit()
+    | ~else:
+        followups := followups.add(text)
+        history := history.add(text)
+        reset_input()
+        dirty := #true
 
   fun start_turn(input :: String):
     activity := "thinking"
@@ -604,7 +705,19 @@ fun run_tui(~theme: theme_in :: Map = {},
   fun handle_key_core(k :: String):
     cond
     | k == "C-M": submit()
+    | k == "M-C-M" || k == "M-<return>" || k == kb("queue_followup", "M-C-M"):
+        queue_followup()
     | k == "C-J": insert_newline()
+    | k == kb("external_editor", "C-G"): external_edit()
+    | k == kb("copy_last", "C-X"): do_copy()
+    | k == kb("toggle_tool_output", "C-O"):
+        tools_expanded := !tools_expanded
+        push("notify", (if tools_expanded
+                        | "[tool output expanded]"
+                        | "[tool output collapsed]"))
+    | k == "C-S-I" || k == "S-<tab>" || k == kb("cycle_thinking", "M-T"):
+        let msg = to_string(cycle_thinking())
+        when msg != "" | push("notify", msg)
     | k == "C-I": complete()
     | k == "<backspace>" || k == "C-H": backspace()
     | k == "<delete>":
@@ -686,8 +799,9 @@ fun run_tui(~theme: theme_in :: Map = {},
     let cols = term.#{term-cols}()
     let input_h = math.min(input_lines.length(), 8)
     let popup_h = (if ac_open && ac_items != [] | math.min(5, ac_items.length()) | 0)
-    // rows = transcript + status(1) + separator(1) + editor + popup + footer(1)
-    let trans_h = math.max(3, rows - input_h - 3 - popup_h)
+    let queue_h = math.min(followups.length(), 3)
+    // rows = transcript + queue + status(1) + separator(1) + editor + popup + footer(1)
+    let trans_h = math.max(3, rows - input_h - 3 - popup_h - queue_h)
     last_trans_h := trans_h
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
@@ -702,14 +816,24 @@ fun run_tui(~theme: theme_in :: Map = {},
         each i in tail_start .. all_lines.length()
         let [kind, text] = all_lines[i]
         let shown = to_string(tool_line(kind, text) || text)
+        // multi-line entries (push_block): tool output folds to its first
+        // line unless expanded with Ctrl-O
+        each sub:
+          if shown.contains("\n")
+          | let parts = shown.split("\n", ~trim: #false)
+            if kind == "tool_result" && !tools_expanded
+            | [to_string(parts[0])
+                 +& " \u2026(+" +& (parts.length() - 1) +& " lines, ctrl-o)"]
+            | for List (p in parts): to_string(p)
+          | [shown]
         let spans:
           cond
           | kind == "assistant":
               let was = fence
-              when shown.trim().starts_with("```")
+              when sub.trim().starts_with("```")
               | fence := !fence
-              md_line_spans(shown, was, tcolor)
-          | ~else: [[tcolor(kind), #false, #false, shown]]
+              md_line_spans(sub, was, tcolor)
+          | ~else: [[tcolor(kind), #false, #false, sub]]
         each row in wrap_spans(spans, cols)
         row
     let max_scroll:
@@ -741,6 +865,16 @@ fun run_tui(~theme: theme_in :: Map = {},
         let prompt = (if i == 0 | "\u276F " | "\u2502 ")
         [[tcolor("prompt"), #false, "bold", prompt],
          [#false, #false, #false, to_string(input_lines[i])]]
+    // queued follow-ups (Alt-Enter) shown above the status line
+    let queue_rows:
+      if queue_h == 0
+      | []
+      | let shown_start = followups.length() - queue_h
+        for List (i in shown_start .. followups.length()):
+          let f = String.join(to_string(followups[i]).split("\n"), " ")
+          let f = (if f.length() > cols - 12 | f.substring(0 .. cols - 12) +& "\u2026" | f)
+          [[tcolor("steer"), #false, "dim",
+            " \u29D6 queued " +& (i + 1) +& "/" +& followups.length() +& ": " +& f]]
     // status line (pi-style): its own row between transcript and editor;
     // blank when idle so the layout doesn't jump. Footer below stays intact.
     let status_row:
@@ -773,10 +907,10 @@ fun run_tui(~theme: theme_in :: Map = {},
       let padding = math.max(0, cols - display_width(ftext))
       ftext.substring(0 .. math.min(ftext.length(), cols)) +& String.make(padding, Char" ")
     let foot = [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
-    let cursor_row = trans_h + 2 + (cur_line - win_start)
+    let cursor_row = trans_h + queue_h + 2 + (cur_line - win_start)
     let cursor_col = clamp(2 + display_width(cur_text().substring(0 .. cur_col)),
                            0, cols - 1)
-    term.#{term-draw!}(trans_rows ++ [status_row] ++ [sep] ++ input_rows
+    term.#{term-draw!}(trans_rows ++ queue_rows ++ [status_row] ++ [sep] ++ input_rows
                          ++ popup_rows ++ [foot],
                        [cursor_row, cursor_col])
 
@@ -819,23 +953,41 @@ fun run_tui(~theme: theme_in :: Map = {},
           when term.#{term-poll-size!}()
           | dirty := #true
         let e = term.#{term-wait-event}((if turn_thread | 0.05 | 0.5), wake_sema)
-        match e
-        | #'timeout: #void
-        | #'wake: #void
-        | #'skip: #void
-        | #'eof: running := #false
-        | [#'resize, _, _]: dirty := #true
-        | [#'wheel, d]:
-            scroll := math.max(0, scroll + d)
-            dirty := #true
-        | [#'key, k]:
-            dlog("key " +& k)
-            try:
-              handle_key(to_string(k))
-              dlog("key done " +& k)
-              ~catch ex :: Exn.Fail:
-                push("error", "ui error: " +& ex.message)
-        | ~else: #void
+        fun dispatch_key(k :: String):
+          dlog("key " +& k)
+          try:
+            handle_key(k)
+            dlog("key done " +& k)
+            ~catch ex :: Exn.Fail:
+              push("error", "ui error: " +& ex.message)
+        fun handle_event(e):
+          match e
+          | #'timeout: #void
+          | #'wake: #void
+          | #'skip: #void
+          | #'eof: running := #false
+          | [#'resize, _, _]: dirty := #true
+          | [#'wheel, d]:
+              scroll := math.max(0, scroll + d)
+              dirty := #true
+          | [#'key, k]:
+              let k = to_string(k)
+              // the ansi lexer has no ESC-prefix meta: detect Alt-Enter as
+              // ESC immediately followed by Enter
+              if k == "<escape>" || k == "C-["
+              | let e2 = term.#{term-wait-event}(0.03, #false)
+                match e2
+                | [#'key, k2]:
+                    if to_string(k2) == "C-M"
+                    | queue_followup()
+                    | dispatch_key(k)
+                      handle_event(e2)
+                | ~else:
+                    dispatch_key(k)
+                    handle_event(e2)
+              | dispatch_key(k)
+          | ~else: #void
+        handle_event(e)
         loop()
     ~catch e :: Exn.Break:
       when turn_thread

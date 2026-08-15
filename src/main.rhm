@@ -81,6 +81,7 @@ fun parse_args() :: Map:
     | ["--list-models", & more]: parse(more, acc ++ { "list_models": #true })
     | ["--theme", v, & more]: parse(more, acc ++ { "theme": v })
     | ["--tui-mode", v, & more]: parse(more, acc ++ { "tui_mode": v })
+    | ["--models", v, & more]: parse(more, acc ++ { "models": split_list(v) })
     | ["--tools", v, & more]: parse(more, acc ++ { "tools": split_list(v) })
     | ["--exclude-tools", v, & more]: parse(more, acc ++ { "exclude_tools": split_list(v) })
     | ["--no-tools", & more]: parse(more, acc ++ { "no_tools": #true })
@@ -647,14 +648,80 @@ registry.register_command(
                   session := start_session(~cwd: cwd(), ~resume: session.path, ~fork: #true)
                   api.notify("cloned into " +& session.path))
 
+fun session_age(mtime) :: String:
+  let secs = rkt.#{current-seconds}() - mtime
+  cond
+  | secs < 3600: math.exact(math.floor(secs / 60)) +& "m ago"
+  | secs < 86400: math.exact(math.floor(secs / 3600)) +& "h ago"
+  | ~else: math.exact(math.floor(secs / 86400)) +& "d ago"
+
 registry.register_command(
-  ~name: "resume", ~description: "pick a previous session in this directory",
-  ~handler: fun (_args):
-              match pick_session()
-              | path :: String:
-                  session := start_session(~cwd: cwd(), ~resume: path)
-                  api.notify("resumed " +& path)
-              | ~else: api.notify("unchanged"))
+  ~name: "resume",
+  ~description: "switch to a previous session: /resume [file] (menu completes)",
+  ~handler: fun (args):
+              let a = args.trim()
+              cond
+              | a != "":
+                  cond
+                  | filesystem.file_exists(a):
+                      session := start_session(~cwd: cwd(), ~resume: a)
+                      api.notify("resumed " +& a)
+                  | ~else: api.notify("no such session file: " +& a)
+              | ~else:
+                  match pick_session()
+                  | path :: String:
+                      session := start_session(~cwd: cwd(), ~resume: path)
+                      api.notify("resumed " +& path)
+                  | ~else: api.notify("unchanged"))
+
+registry.register_command(
+  ~name: "sessions",
+  ~description: "list sessions here: /sessions [time|name]",
+  ~handler: fun (args):
+              let order = args.trim()
+              let ss = list_sessions(cwd())
+              let ss:
+                if order == "name"
+                | ss.sort(fun (a, b): a["name"] +& a["path"] < b["name"] +& b["path"])
+                | ss
+              if ss == []
+              | api.notify("no sessions in this directory")
+              | for (s in ss):
+                  out.write_string("  " +& session_age(s["mtime"])
+                                     +& (if s["name"] == "" | "" | "  [" +& s["name"] +& "]")
+                                     +& "  " +& s["preview"] +& "\n"
+                                     +& "    " +& s["path"] +& "\n"))
+
+registry.register_command(
+  ~name: "session-rename",
+  ~description: "rename a session file: /session-rename <file> <name>",
+  ~handler: fun (args):
+              let parts = args.trim().split(" ")
+              cond
+              | parts.length() < 2: api.notify("usage: /session-rename <file> <name>")
+              | ~else:
+                  let path = to_string(parts[0])
+                  let name = String.join(parts.rest, " ").trim()
+                  cond
+                  | !filesystem.file_exists(path): api.notify("no such session file: " +& path)
+                  | ~else:
+                      if session.path == path
+                      | session.set_name(name)
+                      | start_session(~cwd: cwd(), ~resume: path).set_name(name)
+                      api.notify("renamed to " +& name))
+
+registry.register_command(
+  ~name: "session-delete",
+  ~description: "delete a session file: /session-delete <file>",
+  ~handler: fun (args):
+              let path = args.trim()
+              cond
+              | path == "": api.notify("usage: /session-delete <file>")
+              | !filesystem.file_exists(path): api.notify("no such session file: " +& path)
+              | session.path == path: api.notify("refusing to delete the active session")
+              | ~else:
+                  filesystem.delete(path)
+                  api.notify("deleted " +& path))
 
 fun export_html(target :: String):
   let parts:
@@ -990,18 +1057,85 @@ fun tui_footer() :: String:
 
 def provider_ring = ["kimi", "kimi-anthropic", "openai", "anthropic", "openrouter", "ollama"]
 
+// scoped models (pi): --models a,b or settings enabled_models restrict the
+// Ctrl-P cycle to a hand-picked list ("provider/model" or bare model names)
+def mutable scoped_models :: List:
+  match opts.get("models", #false)
+  | l :: List: l
+  | ~else:
+      match settings.get("enabled_models", #false)
+      | l :: List: (for List (x in l): to_string(x))
+      | ~else: []
+
 fun cycle_model() :: String:
-  let avail:
-    for List (p in provider_ring):
-      skip_when !config.providers.has_key(p)
-      p
+  cond
+  | scoped_models != []:
+      let cur = config.provider +& "/" +& config.model
+      let idx:
+        for values(found = -1) (i in 0 .. scoped_models.length()):
+          let e = to_string(scoped_models[i])
+          if e == cur || e == config.model | i | found
+      let next = to_string(scoped_models[(idx + 1) mod scoped_models.length()])
+      set_model(next)
+  | ~else:
+      let avail:
+        for List (p in provider_ring):
+          skip_when !config.providers.has_key(p)
+          p
+      let idx:
+        for values(found = 0) (i in 0 .. avail.length()):
+          if avail[i] == config.provider | i | found
+      let next = avail[(idx + 1) mod avail.length()]
+      config.provider := next
+      config.model := config.providers[next].get("default_model", config.model)
+      "model: " +& config.provider +& "/" +& config.model
+
+registry.register_command(
+  ~name: "scoped-models",
+  ~description: "restrict Ctrl-P model cycling: /scoped-models [a,b,c | clear]",
+  ~handler: fun (args):
+              let a = args.trim()
+              cond
+              | a == "":
+                  if scoped_models == []
+                  | api.notify("no scoped models (Ctrl-P cycles providers); /scoped-models a,b,c")
+                  | api.notify("scoped models: "
+                                 +& String.join((for List (m in scoped_models): to_string(m)), ", "))
+              | a == "clear":
+                  scoped_models := []
+                  settings.set_global("enabled_models", [])
+                  api.notify("scoped models cleared")
+              | ~else:
+                  scoped_models := split_list(a)
+                  settings.set_global("enabled_models", scoped_models)
+                  api.notify("scoped models: " +& String.join(scoped_models, ", ")
+                               +& " (Ctrl-P cycles)"))
+
+// Shift-Tab: cycle the thinking level
+def thinking_ring = [#false, "low", "medium", "high"]
+
+fun cycle_thinking() :: String:
   let idx:
-    for values(found = 0) (i in 0 .. avail.length()):
-      if avail[i] == config.provider | i | found
-  let next = avail[(idx + 1) mod avail.length()]
-  config.provider := next
-  config.model := config.providers[next].get("default_model", config.model)
-  "model: " +& config.provider +& "/" +& config.model
+    for values(found = 0) (i in 0 .. thinking_ring.length()):
+      if thinking_ring[i] == config.thinking | i | found
+  config.thinking := thinking_ring[(idx + 1) mod thinking_ring.length()]
+  "thinking: " +& (if config.thinking | config.thinking | "off")
+
+// last assistant text on the active session path (for Ctrl-X / /copy)
+fun last_assistant_text() :: String:
+  for values(found = "") (m in session.messages()):
+    if m.get("role", "") == "assistant" && m.get("content", "") != ""
+    | to_string(m["content"])
+    | found
+
+registry.register_command(
+  ~name: "copy", ~description: "copy the last assistant message to the clipboard",
+  ~handler: fun (_args):
+              let text = last_assistant_text()
+              if text == ""
+              | api.notify("nothing to copy")
+              | tui.copy_text(text)
+                api.notify("copied " +& text.length() +& " chars"))
 
 fun tui_shell(text :: String) :: String:
   let double = text.starts_with("!!")
@@ -1033,19 +1167,23 @@ fun handle_input_tui(input :: String):
                                   || "\u25CF " +& name +& " " +& summarize(args)),
            ~on_tool_result: fun (name, r):
                               tui.set_activity("thinking")
-                              tui.push("tool_result",
-                                       render_tool("result", name, r)
-                                         || "  \u21B3 " +& first_line(r)))
+                              // full text as one block: folds to the first
+                              // line in the TUI, Ctrl-O expands
+                              tui.push_block("tool_result",
+                                             render_tool("result", name, r)
+                                               || "  \u21B3 " +& to_string(r)))
   auto_compact()
 
 registry.register_command(
   ~name: "hotkeys", ~description: "list TUI keyboard shortcuts",
   ~handler: fun (_args):
-              out.write_string("Enter submit \u00B7 Ctrl-J newline \u00B7 Tab complete path (@token fuzzy)\n"
+              out.write_string("Enter submit \u00B7 Ctrl-J newline \u00B7 Alt-Enter queue follow-up \u00B7 Tab complete path (@token fuzzy)\n"
                                  +& "Up/Down history or cursor \u00B7 PgUp/PgDn or mouse wheel scroll (Shift+drag to select text)\n"
-                                 +& "Ctrl-C interrupt/clear/quit\n"
-                                 +& "Esc interrupt turn \u00B7 Ctrl-P cycle provider \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
-                                 +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"))
+                                 +& "Ctrl-C interrupt/clear/quit \u00B7 Esc interrupt (queued follow-ups return to editor)\n"
+                                 +& "Ctrl-G external editor \u00B7 Ctrl-X copy last reply \u00B7 Ctrl-O expand/fold tool output\n"
+                                 +& "Shift-Tab cycle thinking \u00B7 Ctrl-P cycle scoped models/providers \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
+                                 +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"
+                                 +& "remap: ~/.rho/keybindings.json (external_editor, copy_last, toggle_tool_output, cycle_thinking, queue_followup)\n"))
 
 // command menu entries: registered commands + prompt templates + quit/exit
 fun tui_commands() :: List:
@@ -1071,6 +1209,17 @@ fun tui_arg_complete(cmd :: String, prefix :: String):
         let [pname, mdls] = group
         skip_when !pname.foldcase().contains(lp)
         [pname, pname, mdls.keys().length() +& " models"]
+  | cmd == "resume" || cmd == "session-rename" || cmd == "session-delete":
+      let lp = prefix.foldcase()
+      for List:
+        each s in list_sessions(cwd())
+        let parts = to_string(s["path"]).split("/")
+        let fname = to_string(parts[parts.length() - 1])
+        let desc = session_age(s["mtime"])
+                     +& (if s["name"] == "" | "" | " [" +& s["name"] +& "]")
+                     +& " " +& s["preview"]
+        skip_when !(fname +& " " +& desc).foldcase().contains(lp)
+        [to_string(s["path"]), fname, desc]
   | cmd == "settings":
       let parts = prefix.split(" ")
       cond
@@ -1118,9 +1267,18 @@ fun run_tui_mode():
               ~handle_input: handle_input_tui,
               ~footer: tui_footer,
               ~cycle_model: cycle_model,
+              ~cycle_thinking: cycle_thinking,
               ~shell_exec: tui_shell,
               ~commands: tui_commands,
-              ~arg_complete: tui_arg_complete)
+              ~arg_complete: tui_arg_complete,
+              ~editor_cmd: fun ():
+                             match settings.get("external_editor", #false)
+                             | s :: String: s
+                             | ~else:
+                                 envvar.getenv("VISUAL") || envvar.getenv("EDITOR") || "",
+              ~last_assistant: last_assistant_text,
+              ~keybind: fun (action, default):
+                          settings.keybinding(action, to_string(default)))
 
 fun stdin_is_tty():
   rkt.#{terminal-port?}(rkt.#{current-input-port}())

@@ -15,7 +15,9 @@ export:
 
 def MAX_STEPS = 40
 
-fun call_provider(config, messages, tools, on_text, ~headers: headers :: Map = {}):
+fun call_provider(config, messages, tools, on_text,
+                  ~on_thinking: on_thinking = fun (s): #void,
+                  ~headers: headers :: Map = {}):
   // auto-retry with exponential backoff (settings: auto_retry / max_retries)
   let retries:
     if config.settings.get("auto_retry", #true) == #false
@@ -23,7 +25,7 @@ fun call_provider(config, messages, tools, on_text, ~headers: headers :: Map = {
     | config.settings.get("max_retries", 3)
   recur attempt(n = 0):
     try:
-      do_call_provider(config, messages, tools, on_text, headers)
+      do_call_provider(config, messages, tools, on_text, on_thinking, headers)
       ~catch e :: Exn.Fail:
         let transient:
           e.message.contains("timed out") || e.message.contains("connection")
@@ -33,7 +35,7 @@ fun call_provider(config, messages, tools, on_text, ~headers: headers :: Map = {
           attempt(n + 1)
         | throw e
 
-fun do_call_provider(config, messages, tools, on_text, headers :: Map):
+fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: Map):
   match config.kind()
   | "anthropic":
       anthropic.stream_chat(~base_url: config.base_url(),
@@ -42,6 +44,7 @@ fun do_call_provider(config, messages, tools, on_text, headers :: Map):
                             ~messages: messages,
                             ~tools: tools,
                             ~on_text: on_text,
+                            ~on_thinking: on_thinking,
                             ~thinking: config.thinking,
                             ~extra_headers: headers)
   | ~else:
@@ -51,6 +54,7 @@ fun do_call_provider(config, messages, tools, on_text, headers :: Map):
                          ~messages: messages,
                          ~tools: tools,
                          ~on_text: on_text,
+                         ~on_thinking: on_thinking,
                          ~thinking: config.thinking,
                          ~extra_headers: headers)
 
@@ -71,6 +75,7 @@ fun drain_steering(session, registry, on_steer):
 
 // Executes one full user turn. UI callbacks:
 //   on_text(delta)                     streaming assistant text
+//   on_thinking(delta)                 streaming chain-of-thought text
 //   on_tool(name, args_map)            before a tool runs
 //   on_tool_result(name, result_str)   after a tool ran
 //   on_steer(msg)                      a queued steering message was injected
@@ -88,6 +93,7 @@ fun run_turn(~config: config,
              ~system_prompt: system_prompt :: String,
              ~input: input :: String,
              ~on_text: on_text = fun (s): #void,
+             ~on_thinking: on_thinking = fun (s): #void,
              ~on_tool: on_tool = fun (name, args): #void,
              ~on_tool_result: on_tool_result = fun (name, r): #void,
              ~on_steer: on_steer = fun (s): #void,
@@ -137,6 +143,10 @@ fun run_turn(~config: config,
                                   fun (s):
                                     registry.emit("message_update", { "delta": s })
                                     on_text(s),
+                                  ~on_thinking:
+                                    fun (s):
+                                      registry.emit("thinking_update", { "delta": s })
+                                      on_thinking(s),
                                   ~headers: extra_headers)
     registry.emit("message_end", { "message": assistant })
     session.append_message(assistant)

@@ -50,10 +50,15 @@ fun convert_messages(messages :: List):
     | "assistant":
         flush_results()
         let blocks:
+          // thinking blocks must be replayed verbatim (with signatures)
+          // when thinking is enabled and the turn continues with tool results
+          let base :: List:
+            for List (tb in m.get("thinking_blocks", [])):
+              tb
           let text = m.get("content", "")
           let base :: List = (if text is_a String && text != ""
-                              | [{ "type": "text", "text": text }]
-                              | [])
+                              | base.add({ "type": "text", "text": text })
+                              | base)
           for values(bs = base) (tc in m.get("tool_calls", [])):
             let input = try:
                           json.from_string(tc["arguments"])
@@ -79,6 +84,7 @@ fun stream_chat(~base_url: base_url :: String,
                 ~messages: messages :: List,
                 ~tools: tools :: List = [],
                 ~on_text: on_text = fun (s): #void,
+                ~on_thinking: on_thinking = fun (s): #void,
                 ~max_tokens: max_tokens :: Int = 8192,
                 ~thinking: thinking :: maybe(String) = #false,
                 ~extra_headers: extra_headers :: Map = {}) :: Map:
@@ -145,11 +151,17 @@ fun stream_chat(~base_url: base_url :: String,
       | "content_block_start":
           let idx = msg.get("index", 0)
           let cb = msg.get("content_block", {})
-          when cb.get("type", "") == "tool_use"
-          | blocks[idx] := { "type": "tool_use",
-                             "id": cb.get("id", ""),
-                             "name": cb.get("name", ""),
-                             "arguments": "" }
+          match cb.get("type", "")
+          | "tool_use":
+              blocks[idx] := { "type": "tool_use",
+                               "id": cb.get("id", ""),
+                               "name": cb.get("name", ""),
+                               "arguments": "" }
+          | "thinking":
+              blocks[idx] := { "type": "thinking", "thinking": "", "signature": "" }
+          | "redacted_thinking":
+              blocks[idx] := { "type": "redacted_thinking", "data": cb.get("data", "") }
+          | ~else: #void
       | "content_block_delta":
           let idx = msg.get("index", 0)
           let delta = msg.get("delta", {})
@@ -158,6 +170,14 @@ fun stream_chat(~base_url: base_url :: String,
               let s = delta.get("text", "")
               content := content +& s
               on_text(s)
+          | "thinking_delta":
+              let s = delta.get("thinking", "")
+              let prev = blocks.get(idx, { "type": "thinking", "thinking": "", "signature": "" })
+              blocks[idx] := prev ++ { "thinking": prev.get("thinking", "") +& s }
+              when s != "" | on_thinking(s)
+          | "signature_delta":
+              let prev = blocks.get(idx, { "type": "thinking", "thinking": "", "signature": "" })
+              blocks[idx] := prev ++ { "signature": prev.get("signature", "") +& delta.get("signature", "") }
           | "input_json_delta":
               let prev = blocks.get(idx, { "type": "tool_use", "id": "", "name": "", "arguments": "" })
               blocks[idx] := prev ++ { "arguments": prev["arguments"] +& delta.get("partial_json", "") }
@@ -168,11 +188,27 @@ fun stream_chat(~base_url: base_url :: String,
   sse.each_event(resp.output(), handle)
   resp.close()
   let tool_calls:
-    for List (idx in blocks.keys().sort()):
+    for List:
+      each idx in blocks.keys().sort()
       let b = blocks[idx]
+      skip_when b.get("type", "") != "tool_use"
       { "id": b["id"], "name": b["name"],
         "arguments": if b["arguments"] == "" | "{}" | b["arguments"] }
-  { "role": "assistant", "content": content, "tool_calls": tool_calls,
-    "finish_reason": finish_reason,
-    "usage": { "input": input_tokens, "output": output_tokens,
-               "cache_read": cache_read } }
+  let thinking_blocks:
+    for List:
+      each idx in blocks.keys().sort()
+      let b = blocks[idx]
+      skip_when b.get("type", "") != "thinking" && b.get("type", "") != "redacted_thinking"
+      b
+  let thinking_text:
+    String.join((for List:
+                   each b in thinking_blocks
+                   skip_when b.get("type", "") != "thinking"
+                   to_string(b.get("thinking", ""))),
+                "\n\n")
+  let msg = { "role": "assistant", "content": content, "tool_calls": tool_calls,
+              "finish_reason": finish_reason,
+              "usage": { "input": input_tokens, "output": output_tokens,
+                         "cache_read": cache_read } }
+  let msg = (if thinking_blocks == [] | msg | msg ++ { "thinking_blocks": thinking_blocks })
+  if thinking_text == "" | msg | msg ++ { "thinking": thinking_text }

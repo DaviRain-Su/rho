@@ -10,10 +10,11 @@
 // PgUp/PgDn or mouse wheel scroll, Ctrl-C interrupt turn (or clear input /
 // quit), Escape interrupt (restores queued follow-ups to the editor),
 // Ctrl-G external editor, Ctrl-X copy last assistant message, Ctrl-O
-// expand/collapse tool output, Shift-Tab cycle thinking level, Ctrl-P cycle
+// expand/collapse tool output, Ctrl-T show/hide chain of thought,
+// Shift-Tab cycle thinking level, Ctrl-P cycle
 // scoped models, Ctrl-L redraw, Ctrl-D quit. ~/.rho/keybindings.json remaps
-// actions (external_editor, copy_last, toggle_tool_output, cycle_thinking,
-// queue_followup).
+// actions (external_editor, copy_last, toggle_tool_output, toggle_thinking,
+// cycle_thinking, queue_followup).
 // Assistant output is rendered with lightweight markdown styling (headers,
 // bold, `code`, ``` fences, lists, quotes).
 //
@@ -32,6 +33,7 @@ export:
   push
   push_block
   push_delta
+  push_think_delta
   set_activity
   set_widget
   set_footer_extra
@@ -43,6 +45,7 @@ export:
 // ---- shared transcript state (written by turn threads, read by render) ----
 def mutable lines :: List = []       // [kind, text] finalized lines
 def mutable partial :: String = ""   // streaming tail without newline yet
+def mutable partial_kind :: String = "assistant"  // "assistant" | "think"
 def mutable dirty = #true
 def mutable activity = #false        // "thinking" / "tool: x" / ... while a turn runs
 
@@ -132,30 +135,45 @@ fun copy_text(s :: String) :: Boolean:
       ~catch _: #false
   osc || tool_ok
 
-fun push_delta(s :: String):
-  dlog("delta " +& s.length() +& " at " +& math.exact(math.round(rkt.#{current-inexact-milliseconds}())))
+fun push_delta_kind(kind :: String, s :: String):
+  dlog("delta " +& kind +& " " +& s.length() +& " at "
+         +& math.exact(math.round(rkt.#{current-inexact-milliseconds}())))
+  // switching streams (thinking -> text or back) finalizes the partial line
+  when partial != "" && partial_kind != kind
+  | lines := lines.add([partial_kind, strip_ansi(partial)])
+    partial := ""
+  partial_kind := kind
   partial := partial +& s
   recur split():
     let idx:
       for values(found = #false) (i in 0 .. partial.length()):
         found || (partial[i] == Char"\n" && i)
     when idx is_a Int
-    | lines := lines.add(["assistant", strip_ansi(partial.substring(0 .. idx))])
+    | lines := lines.add([kind, strip_ansi(partial.substring(0 .. idx))])
       partial := partial.substring(idx + 1 ..)
       split()
   dirty := #true
   wake()
 
+fun push_delta(s :: String):
+  push_delta_kind("assistant", s)
+
+// streaming chain-of-thought: rendered dim, Ctrl-T hides/shows
+fun push_think_delta(s :: String):
+  push_delta_kind("think", s)
+
 fun flush_partial():
   when partial != ""
-  | lines := lines.add(["assistant", strip_ansi(partial)])
+  | lines := lines.add([partial_kind, strip_ansi(partial)])
     partial := ""
+    partial_kind := "assistant"
     dirty := #true
     wake()
 
 def default_theme :: Map:
   { "user": "cyan", "assistant": "default", "tool": "yellow",
-    "tool_result": "brblack", "notify": "blue", "steer": "magenta",
+    "tool_result": "brblack", "think": "brblack",
+    "notify": "blue", "steer": "magenta",
     "error": "red", "shell": "green", "sep": "brblack",
     "footer_fg": "black", "footer_bg": "white", "prompt": "magenta",
     "md_head": "cyan", "md_code": "yellow", "md_quote": "brblack",
@@ -374,6 +392,7 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable last_size_poll = rkt.#{current-inexact-milliseconds}()
   def mutable last_trans_h = 20      // visible transcript height from last render
   def mutable tools_expanded = #false  // Ctrl-O: expand tool output blocks
+  def mutable thinking_shown = #true   // Ctrl-T: show/hide chain of thought
 
   // autocomplete popup (pi-style): opens while typing /command or @file
   def mutable ac_open = #false
@@ -734,6 +753,11 @@ fun run_tui(~theme: theme_in :: Map = {},
         push("notify", (if tools_expanded
                         | "[tool output expanded]"
                         | "[tool output collapsed]"))
+    | k == kb("toggle_thinking", "C-T"):
+        thinking_shown := !thinking_shown
+        push("notify", (if thinking_shown
+                        | "[thinking shown]"
+                        | "[thinking hidden]"))
     | k == "C-S-I" || k == "S-<tab>" || k == kb("cycle_thinking", "M-T"):
         let msg = to_string(cycle_thinking())
         when msg != "" | push("notify", msg)
@@ -831,7 +855,7 @@ fun run_tui(~theme: theme_in :: Map = {},
     last_trans_h := trans_h
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
-    let all_lines = (if partial == "" | lines | lines.add(["assistant", partial]))
+    let all_lines = (if partial == "" | lines | lines.add([partial_kind, partial]))
     let need = trans_h + scroll + 4
     let tail_start = math.max(0, all_lines.length() - need)
     // assistant lines get markdown styling; ``` fences are tracked while
@@ -841,7 +865,13 @@ fun run_tui(~theme: theme_in :: Map = {},
       for List:
         each i in tail_start .. all_lines.length()
         let [kind, text] = all_lines[i]
-        let shown = to_string(tool_line(kind, text) || text)
+        // hidden thinking: one marker row per run of think lines (Ctrl-T)
+        skip_when kind == "think" && !thinking_shown
+          && i > tail_start && all_lines[i - 1][0] == "think"
+        let shown:
+          if kind == "think" && !thinking_shown
+          | "\u2234 thinking\u2026 (hidden, ctrl-t shows)"
+          | to_string(tool_line(kind, text) || text)
         // multi-line entries (push_block): tool output folds to its first
         // line unless expanded with Ctrl-O
         each sub:
@@ -859,6 +889,7 @@ fun run_tui(~theme: theme_in :: Map = {},
               when sub.trim().starts_with("```")
               | fence := !fence
               md_line_spans(sub, was, tcolor)
+          | kind == "think": [[tcolor("think"), #false, "dim", sub]]
           | ~else: [[tcolor(kind), #false, #false, sub]]
         each row in wrap_spans(spans, cols)
         row

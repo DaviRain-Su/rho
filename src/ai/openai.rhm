@@ -59,6 +59,7 @@ fun stream_chat(~base_url: base_url :: String,
                 ~messages: messages :: List,
                 ~tools: tools :: List = [],
                 ~on_text: on_text = fun (s): #void,
+                ~on_thinking: on_thinking = fun (s): #void,
                 ~thinking: thinking :: maybe(String) = #false,
                 ~extra_headers: extra_headers :: Map = {}) :: Map:
   let body:
@@ -88,6 +89,7 @@ fun stream_chat(~base_url: base_url :: String,
     resp.close()
     error("openai: HTTP " +& resp.status_code +& ": " +& err_body)
   def mutable content = ""
+  def mutable reasoning = ""
   def mutable finish_reason = ""
   def mutable usage :: Map = {}
   def acc = MutableMap()  // index -> {id, name, arguments}
@@ -113,6 +115,14 @@ fun stream_chat(~base_url: base_url :: String,
           | s :: String: finish_reason := s
           | ~else: #void
           let delta = choices[0].get("delta", {})
+          // chain of thought: DeepSeek/Kimi use reasoning_content,
+          // OpenRouter and others use reasoning
+          match delta.get("reasoning_content", delta.get("reasoning", #'null))
+          | s :: String:
+              when s != ""
+              | reasoning := reasoning +& s
+                on_thinking(s)
+          | ~else: #void
           match delta.get("content", #'null)
           | s :: String:
               // skip the empty role-announcement chunk so callers don't flip
@@ -135,5 +145,6 @@ fun stream_chat(~base_url: base_url :: String,
   let tool_calls:
     for List (idx in acc.keys().sort()):
       acc[idx]
-  { "role": "assistant", "content": content, "tool_calls": tool_calls,
-    "finish_reason": finish_reason, "usage": usage }
+  let msg = { "role": "assistant", "content": content, "tool_calls": tool_calls,
+              "finish_reason": finish_reason, "usage": usage }
+  if reasoning == "" | msg | msg ++ { "thinking": reasoning }

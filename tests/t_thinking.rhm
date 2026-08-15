@@ -1,0 +1,59 @@
+#lang rhombus
+
+// Thinking/chain-of-thought: anthropic thinking-block replay in
+// convert_messages, openai payload keeps thinking fields out of the wire
+// format, model capability lookup.
+
+import:
+  "../src/ai/openai.rhm" as openai
+  "../src/ai/anthropic.rhm" as anthropic
+  "../src/ai/models.rhm" as models
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+// anthropic: assistant message with thinking blocks + tool call replays
+// thinking first, then text, then tool_use (API requirement)
+def tb = { "type": "thinking", "thinking": "let me look", "signature": "sig123" }
+def msgs = [{ "role": "user", "content": "hi" },
+            { "role": "assistant", "content": "checking",
+              "thinking": "let me look",
+              "thinking_blocks": [tb],
+              "tool_calls": [{ "id": "t1", "name": "read_file",
+                               "arguments": "{\"path\": \"x\"}" }] },
+            { "role": "tool", "tool_call_id": "t1", "content": "data" }]
+def values(_sys, am) = anthropic.convert_messages(msgs)
+def blocks = am[1]["content"]
+check("anthropic replay order",
+      blocks is_a List && blocks.length() == 3
+        && blocks[0]["type"] == "thinking"
+        && blocks[0]["signature"] == "sig123"
+        && blocks[1]["type"] == "text"
+        && blocks[2]["type"] == "tool_use")
+
+// assistant without thinking blocks is unchanged
+def values(_s2, am2) = anthropic.convert_messages(
+  [{ "role": "assistant", "content": "plain" }])
+check("anthropic plain assistant",
+      am2[0]["content"] is_a List && am2[0]["content"].length() == 1
+        && am2[0]["content"][0]["type"] == "text")
+
+// openai: thinking/thinking_blocks fields never reach the wire payload
+def op = openai.messages_payload(
+  [{ "role": "assistant", "content": "done", "thinking": "hmm",
+     "thinking_blocks": [tb] }])
+check("openai drops thinking fields",
+      !op[0].has_key("thinking") && !op[0].has_key("thinking_blocks")
+        && op[0]["content"] == "done")
+
+// capability lookup drives the /thinking selector
+check("kimi-k2-thinking supports", models.model_info("kimi-k2-thinking")["thinking"] == #true)
+check("kimi-k2-turbo does not", models.model_info("kimi-k2-turbo-preview")["thinking"] == #false)
+
+if failures == 0
+| println("ALL PASS")
+| error("t_thinking failed: " +& failures)

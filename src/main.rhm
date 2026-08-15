@@ -24,7 +24,8 @@
 //   -a, --approve / -na, --no-approve   one-shot project trust override
 //   --export <in> [out]         export a session file to HTML and exit
 //   subcommands: rho install|remove|update|list
-//   @file arguments inline the file's content into the first message.
+//   @file arguments inline the file's content into the first message;
+//   @image.png/.jpg/.gif/.webp attach the file as a base64 image.
 //   In print mode, piped stdin is merged into the first message.
 
 import:
@@ -113,8 +114,11 @@ fun parse_args() :: Map:
         cond
         | a.length() > 0 && a.substring(0..1) == "@" && filesystem.file_exists(a.substring(1..)):
             let path = a.substring(1..)
-            let inlined = "\n\n``` " +& path +& "\n" +& filesystem.read_string(path) +& "\n```"
-            parse(more, acc ++ { "message": acc["message"].add(inlined) })
+            if image_media_type(path) is_a String
+            | // @image.png: attach as a base64 image on the first message
+              parse(more, acc ++ { "cli_images": acc.get("cli_images", []).add(path) })
+            | let inlined = "\n\n``` " +& path +& "\n" +& filesystem.read_string(path) +& "\n```"
+              parse(more, acc ++ { "message": acc["message"].add(inlined) })
         | a.starts_with("--"):
             // unknown long flags are kept for extensions (rho.flag("name"))
             parse(more, acc ++ { "extra": acc.get("extra", []).add(a) })
@@ -996,12 +1000,23 @@ fun handle_command(name :: String, args :: String):
           | t :: Map: handle_input(prompts.expand(t, args))
           | ~else: api.notify("unknown command: /" +& name +& " (try /help)")
 
+// @image.png CLI attachments ride along on the first turn only
+def mutable pending_cli_images :: List:
+  for List (p in opts.get("cli_images", [])):
+    encode_image(to_string(p))
+
+fun take_cli_images() :: List:
+  let l = pending_cli_images
+  pending_cli_images := []
+  l
+
 fun handle_input(input :: String):
   run_turn(~config: config,
            ~registry: registry,
            ~session: session,
            ~system_prompt: system_prompt(),
            ~input: input,
+           ~images: take_cli_images(),
            ~on_text: fun (s):
                        out.write_string(s)
                        out.flush(),
@@ -1077,6 +1092,7 @@ fun run_headless():
            ~session: session,
            ~system_prompt: system_prompt(),
            ~input: input,
+           ~images: take_cli_images(),
            ~on_text:
              if json_mode
              | fun (s): emit_json({ "type": "text", "text": s })
@@ -1235,6 +1251,7 @@ fun handle_input_tui(input :: String):
            ~session: session,
            ~system_prompt: system_prompt(),
            ~input: input,
+           ~images: take_cli_images(),
            ~on_text: fun (s):
                        tui.set_activity("responding")
                        tui.push_delta(s),

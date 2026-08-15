@@ -10,6 +10,7 @@ import:
 
 export:
   stream_chat
+  messages_payload
 
 // Convert canonical tool defs to OpenAI wire format
 fun tools_payload(tools :: List) :: List:
@@ -37,7 +38,17 @@ fun messages_payload(messages :: List) :: List:
           "tool_call_id": m.get("tool_call_id", ""),
           "content": m.get("content", "") }
     | role:
-        { "role": role, "content": m.get("content", "") }
+        // messages may carry base64 images: {"images": [{"media_type","data"}]}
+        let imgs = m.get("images", [])
+        if imgs is_a List && imgs != []
+        | { "role": role,
+            "content":
+              [{ "type": "text", "text": m.get("content", "") }]
+                ++ (for List (im in imgs):
+                      { "type": "image_url",
+                        "image_url": { "url": "data:" +& im.get("media_type", "image/png")
+                                                +& ";base64," +& im.get("data", "") } }) }
+        | { "role": role, "content": m.get("content", "") }
 
 // Returns canonical assistant message:
 //   {"role": "assistant", "content": String,

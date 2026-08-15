@@ -9,7 +9,7 @@ import:
 def c = load_config()
 def reg = make_registry()
 install_core_tools(reg)
-def sess = start_session()
+def sess = start_session(~cwd: "/tmp", ~no_session: #true)
 def out = Port.Output.current()
 
 run_turn(

@@ -35,6 +35,7 @@ rho [options] [message ...]           interactive (TUI by default on a tty)
 rho -p "prompt"                       headless: run one turn, print, exit
 cat data | rho -p "analyze stdin"     piped stdin merges into the prompt
 rho -p @notes.md "summarize"          @file inlines file content
+rho -p @shot.png "what is this?"      @image attaches it (png/jpg/gif/webp)
 rho --mode json -p "..."              JSONL event stream output
 rho --mode rpc                        JSON-lines RPC over stdin/stdout
 rho install <git-url|owner/repo>      install a package

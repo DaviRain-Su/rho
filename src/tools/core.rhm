@@ -13,10 +13,13 @@ import:
   lib("racket/base.rkt") as rkt
   lib("racket/file.rkt") as rktfile
   lib("racket/system.rkt") as rktsys
+  lib("net/base64.rkt") as rkt64
 
 export:
   install_core_tools
   set_stream_handler
+  image_media_type
+  encode_image
 
 def MAX_LINES = 2000
 def MAX_BYTES = 50 * 1024
@@ -67,11 +70,31 @@ fun truncate_head(s :: String, ~max_lines: max_lines = MAX_LINES) :: String:
       +& lines.length() +& " lines (" +& fmt_size(byte_len(s)) +& " total)]"
   | s
 
-fun tool_read_file(args :: Map):
+def image_types :: Map:
+  { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp" }
+
+fun image_media_type(path :: String) :: maybe(String):
+  for values(found = #false) (ext in image_types.keys()):
+    found || (path.foldcase().ends_with(ext) && image_types[ext])
+
+fun encode_image(path :: String) :: Map:
+  let data = rkt64.#{base64-encode}(filesystem.read_bytes(path), #"")
+  { "media_type": image_media_type(path) || "image/png",
+    "data": Bytes.utf8_string(data),
+    "name": path }
+
+// Reading an image stages it in registry.state["pending_images"]; the agent
+// loop turns staged images into a user message with attachments.
+fun tool_read_file(args :: Map, registry = #false):
   let path = args.get("path", "")
   cond
   | !filesystem.file_exists(path):
       "error: file not found: " +& path
+  | image_media_type(path) is_a String && registry:
+      registry.state["pending_images"]
+        := registry.state.get("pending_images", []).add(encode_image(path))
+      "[image " +& path +& " attached to the conversation]"
   | ~else:
       let content = filesystem.read_string(path)
       let lines = content.split("\n", ~trim: #false)
@@ -309,7 +332,7 @@ fun tool_ls(args :: Map):
 fun install_core_tools(registry):
   registry.register_tool(
     ~name: "read_file",
-    ~description: "Read a file from the filesystem with line numbers. Returns up to `limit` lines starting at line `offset` (1-based).",
+    ~description: "Read a file from the filesystem with line numbers. Returns up to `limit` lines starting at line `offset` (1-based). Reading an image file (png/jpg/gif/webp) attaches the image to the conversation.",
     ~schema: { "type": "object",
                "properties": {
                  "path": { "type": "string", "description": "Path to the file" },
@@ -317,7 +340,7 @@ fun install_core_tools(registry):
                  "limit": { "type": "integer", "description": "Max number of lines (default 2000)" }
                },
                "required": ["path"] },
-    ~fn: tool_read_file)
+    ~fn: fun (args): tool_read_file(args, registry))
   registry.register_tool(
     ~name: "write_file",
     ~description: "Write content to a file, creating parent directories as needed. Overwrites existing files.",

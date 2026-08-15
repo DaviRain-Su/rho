@@ -11,7 +11,7 @@ filesystem.write_string("/tmp/pi-tests/secret.txt", "the magic word is PLUM\n", 
 def c = load_config()
 def reg = make_registry()
 install_core_tools(reg)
-def sess = start_session()
+def sess = start_session(~cwd: "/tmp")
 def out = Port.Output.current()
 
 run_turn(
@@ -31,5 +31,5 @@ out.write_string("\n")
 println(["entries", sess.entries.length(), "file", sess.path])
 
 // resume round-trip
-def sess2 = start_session(~resume: sess.path)
+def sess2 = start_session(~cwd: "/tmp", ~resume: sess.path)
 println(["resumed", sess2.entries.length() == sess.entries.length()])

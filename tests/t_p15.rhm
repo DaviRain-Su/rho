@@ -1,0 +1,62 @@
+#lang rhombus
+
+// P15: image attachments — read tool staging, payload conversion for both
+// provider protocols, @image encoding.
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/registry.rhm" open
+  "../src/tools/core.rhm" open
+  "../src/ai/openai.rhm" as openai
+  "../src/ai/anthropic.rhm" as anthropic
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+// PNG magic bytes are enough for the encoder (it doesn't decode pixels)
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-img-~a.png"))
+filesystem.write_string(tmp, "\u0089PNG\r\n\u001A\nfake", ~exists: #'truncate)
+
+check("media type png", image_media_type("a/B.PNG") == "image/png")
+check("media type jpeg", image_media_type("x.jpg") == "image/jpeg")
+check("media type none", image_media_type("x.txt") == #false)
+
+def img = encode_image(tmp)
+check("encode has data", img["data"] is_a String && img["data"].length() > 4)
+check("encode media type", img["media_type"] == "image/png")
+
+// read tool stages the image
+def registry = make_registry()
+install_core_tools(registry)
+def r = to_string(registry.tools["read_file"].fn({ "path": tmp }))
+check("read stages image", r.contains("attached"))
+def staged = registry.state.get("pending_images", [])
+check("pending_images set", staged.length() == 1 && staged[0]["media_type"] == "image/png")
+
+// openai payload
+def msgs = [{ "role": "user", "content": "look", "images": [img] }]
+def op = openai.messages_payload(msgs)
+def oc = op[0]["content"]
+check("openai multimodal content", oc is_a List && oc.length() == 2)
+check("openai data url",
+      oc is_a List && to_string(oc[1]["image_url"]["url"]).starts_with("data:image/png;base64,"))
+
+// anthropic payload
+def values(sys, am) = anthropic.convert_messages(msgs)
+def ac = am[0]["content"]
+check("anthropic multimodal content", ac is_a List && ac.length() == 2)
+check("anthropic base64 source",
+      ac is_a List && ac[1]["source"]["type"] == "base64"
+        && ac[1]["source"]["media_type"] == "image/png")
+
+// plain user message untouched
+def op2 = openai.messages_payload([{ "role": "user", "content": "hi" }])
+check("plain content stays string", op2[0]["content"] == "hi")
+
+if failures == 0
+| println("ALL PASS")
+| error("t_p15 failed: " +& failures)

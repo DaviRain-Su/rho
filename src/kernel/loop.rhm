@@ -90,7 +90,8 @@ fun run_turn(~config: config,
              ~on_text: on_text = fun (s): #void,
              ~on_tool: on_tool = fun (name, args): #void,
              ~on_tool_result: on_tool_result = fun (name, r): #void,
-             ~on_steer: on_steer = fun (s): #void):
+             ~on_steer: on_steer = fun (s): #void,
+             ~images: images :: List = []):
   // "input" may rewrite the user's text before it enters the session
   let input:
     match registry.emit("input", { "text": input })
@@ -99,7 +100,9 @@ fun run_turn(~config: config,
         | s :: String: s
         | ~else: input
     | ~else: input
-  session.append_message(user_message(input))
+  session.append_message(if images == []
+                         | user_message(input)
+                         | user_message(input) ++ { "images": images })
   registry.emit("user_message", { "content": input })
   registry.emit("agent_start", { "input": input })
   recur step(n = 0):
@@ -164,6 +167,16 @@ fun run_turn(~config: config,
       registry.emit("tool_result", { "toolName": name, "result": result })
       on_tool_result(name, result)
       session.append_message(tool_message(tc["id"], result))
+    // images staged by tools (read_file on an image) become a user message
+    // with attachments so both provider protocols can carry them
+    match registry.state.get("pending_images", [])
+    | [] : #void
+    | imgs :: List:
+        registry.state["pending_images"] := []
+        let names:
+          String.join((for List (im in imgs): to_string(im.get("name", "image"))), ", ")
+        session.append_message(user_message("[attached image(s): " +& names +& "]")
+                                 ++ { "images": imgs })
     registry.emit("turn_end", { "step": n,
                                 "content": assistant.get("content", ""),
                                 "tool_count": tool_calls.length() })

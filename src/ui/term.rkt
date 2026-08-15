@@ -34,7 +34,7 @@
          raart/lux-chaos
          (only-in ansi/lcd-terminal
                   any-mouse-event? mouse-event? mouse-event-type
-                  mouse-event-button))
+                  mouse-event-button mouse-event-row mouse-event-column))
 
 (provide term-start!
          term-stop!
@@ -157,7 +157,20 @@
     [(and (mouse-event? e) (eq? (mouse-event-type e) 'scroll))
      ;; wheel up = button 4 (scroll toward older lines), down = button 5
      (treelist 'wheel (if (= (mouse-event-button e) 4) 3 -3))]
-    [(any-mouse-event? e) 'skip]     ; clicks, motion, focus: ignored
+    [(and (mouse-event? e)
+          (memq (mouse-event-type e) '(press motion drag release release-all)))
+     ;; in-app text selection: 1-based coordinates. NB: the ansi package
+     ;; passes (x y) to (mouse-event type button row column _), so the
+     ;; "row" field actually holds the column and vice versa.
+     (treelist 'mouse
+               (case (mouse-event-type e)
+                 [(release-all) "release"]
+                 [(motion) "drag"]
+                 [else (symbol->string (mouse-event-type e))])
+               (mouse-event-button e)
+               (mouse-event-column e)    ; real row
+               (mouse-event-row e))]     ; real column
+    [(any-mouse-event? e) 'skip]     ; motion without buttons, focus: ignored
     [(string? e) (treelist 'key (string->immutable-string e))]
     [(eof-object? e) 'eof]
     [else (treelist 'key (string->immutable-string (format "~a" e)))]))
@@ -177,7 +190,7 @@
 
 (define (style-code s)
   (case (->sym s)
-    [(bold) 1] [(dim) 2] [(italic) 3] [(underline) 4]
+    [(bold) 1] [(dim) 2] [(italic) 3] [(underline) 4] [(invert) 7]
     [else #f]))
 
 (define (span-sgr f b s)

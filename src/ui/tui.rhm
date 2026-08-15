@@ -7,7 +7,9 @@
 // row above the editor, so it never covers the footer stats.
 // Keys: Enter submit, Ctrl-J newline, Alt-Enter queue follow-up, Tab path
 // completion, Up/Down history (or cursor movement in multi-line input),
-// PgUp/PgDn or mouse wheel scroll, Ctrl-C interrupt turn (or clear input /
+// PgUp/PgDn or mouse wheel scroll, mouse drag selects transcript text and
+// copies it on release (OSC 52 + clipboard tools; Shift+drag falls back to
+// native terminal selection), Ctrl-C interrupt turn (or clear input /
 // quit), Escape interrupt (restores queued follow-ups to the editor),
 // Ctrl-G external editor, Ctrl-X copy last assistant message, Ctrl-O
 // expand/collapse tool output, Ctrl-T show/hide chain of thought,
@@ -180,6 +182,13 @@ def default_theme :: Map:
     "md_bullet": "magenta" }
 
 // ---- helpers ----
+
+// First character index at (or covering) display column col.
+fun idx_at_col(text :: String, col :: Int) :: Int:
+  recur go(i = 0, w = 0):
+    cond
+    | i >= text.length() || w >= col: i
+    | ~else: go(i + 1, w + char_width(text[i]))
 
 // Terminal display width: CJK and other East Asian wide/fullwidth
 // characters occupy two columns.
@@ -393,6 +402,44 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable last_trans_h = 20      // visible transcript height from last render
   def mutable tools_expanded = #false  // Ctrl-O: expand tool output blocks
   def mutable thinking_shown = #true   // Ctrl-T: show/hide chain of thought
+
+  // mouse text selection (pi-style, app-owned since mouse reporting is on):
+  // press anchors, drag extends (inverse-video highlight), release copies.
+  // Coordinates are 0-based [screen_row, display_col] in the transcript area.
+  def mutable sel_anchor = #false
+  def mutable sel_focus = #false
+  def mutable sel_dragged = #false
+  def mutable visible_plain :: List = []  // plain text of rendered transcript rows
+
+  fun norm_sel() :: List:
+    let [ar, ac] = sel_anchor
+    let [fr, fc] = sel_focus
+    if fr < ar || (fr == ar && fc < ac)
+    | [fr, fc, ar, ac]
+    | [ar, ac, fr, fc]
+
+  fun selection_text() :: String:
+    if !(sel_anchor && sel_focus)
+    | ""
+    | let [r0, c0, r1, c1] = norm_sel()
+      let parts:
+        for List:
+          each r in r0 .. r1 + 1
+          skip_when r >= visible_plain.length()
+          let t = to_string(visible_plain[r])
+          let a = (if r == r0 | c0 | 0)
+          let b = (if r == r1 | c1 + 1 | 999999)
+          let i0 = math.min(idx_at_col(t, a), t.length())
+          let i1 = math.min(idx_at_col(t, b), t.length())
+          t.substring(i0 .. i1)
+      String.join(parts, "\n")
+
+  fun clear_selection():
+    when sel_anchor
+    | sel_anchor := #false
+      sel_focus := #false
+      sel_dragged := #false
+      dirty := #true
 
   // autocomplete popup (pi-style): opens while typing /command or @file
   def mutable ac_open = #false
@@ -908,6 +955,31 @@ fun run_tui(~theme: theme_in :: Map = {},
         for List (i in 0 .. trans_h - real.length()):
           [[#false, #false, #false, ""]]
       real ++ pad
+    // remember what's on screen for mouse selection extraction
+    visible_plain := (for List (row in trans_rows):
+                        for values(acc = "") (sp in row):
+                          acc +& to_string(sp[3]))
+    // mouse selection: inverse-video highlight over the selected range
+    let trans_rows:
+      if sel_anchor && sel_focus && sel_dragged
+      | let [r0, c0, r1, c1] = norm_sel()
+        for List (r in 0 .. trans_rows.length()):
+          if r < r0 || r > r1
+          | trans_rows[r]
+          | let t = to_string(visible_plain[r])
+            let a = (if r == r0 | c0 | 0)
+            let b = (if r == r1 | c1 + 1 | 999999)
+            let i0 = math.min(idx_at_col(t, a), t.length())
+            let i1 = math.min(idx_at_col(t, b), t.length())
+            // empty rows inside the range keep a one-cell marker
+            let sel = (if i0 == i1 && t == "" | " " | t.substring(i0 .. i1))
+            for List:
+              each sp in [[#false, #false, #false, t.substring(0 .. i0)],
+                          [#false, #false, "invert", sel],
+                          [#false, #false, #false, t.substring(i1 ..)]]
+              skip_when sp[3] == ""
+              sp
+      | trans_rows
     // separator; shows position while scrolled back
     let sep_text:
       if off > 0
@@ -1033,6 +1105,30 @@ fun run_tui(~theme: theme_in :: Map = {},
           | [#'wheel, d]:
               scroll := math.max(0, scroll + d)
               dirty := #true
+          | [#'mouse, mtype, btn, mrow, mcol]:
+              let mt = to_string(mtype)
+              let r = mrow - 1
+              let c = mcol - 1
+              cond
+              | mt == "press" && btn == 1:
+                  if r < last_trans_h
+                  | sel_anchor := [r, c]
+                    sel_focus := [r, c]
+                    sel_dragged := #false
+                    dirty := #true
+                  | clear_selection()
+              | mt == "drag" && sel_anchor:
+                  sel_focus := [clamp(r, 0, last_trans_h - 1), math.max(0, c)]
+                  sel_dragged := #true
+                  dirty := #true
+              | mt == "release":
+                  when sel_anchor && sel_dragged
+                  | let text = selection_text()
+                    when text.trim() != ""
+                    | copy_text(text)
+                      push("notify", "[copied " +& text.length() +& " chars]")
+                  clear_selection()
+              | ~else: #void
           | [#'key, k]:
               let k = to_string(k)
               // the ansi lexer has no ESC-prefix meta: detect Alt-Enter as

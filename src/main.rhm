@@ -1335,7 +1335,8 @@ registry.register_command(
   ~name: "hotkeys", ~description: "list TUI keyboard shortcuts",
   ~handler: fun (_args):
               out.write_string("Enter submit \u00B7 Ctrl-J newline \u00B7 Alt-Enter queue follow-up \u00B7 Tab complete path (@token fuzzy)\n"
-                                 +& "Up/Down history or cursor \u00B7 PgUp/PgDn or mouse wheel scroll (Shift+drag to select text)\n"
+                                 +& "Up/Down history or cursor \u00B7 PgUp/PgDn or mouse wheel scroll\n"
+                                 +& "mouse drag selects + copies on release (Shift+drag for native terminal selection)\n"
                                  +& "Ctrl-C interrupt/clear/quit \u00B7 Esc interrupt (queued follow-ups return to editor)\n"
                                  +& "Ctrl-G external editor \u00B7 Ctrl-X copy last reply \u00B7 Ctrl-O expand/fold tool output\n"
                                  +& "Ctrl-T show/hide chain of thought \u00B7 Shift-Tab or /thinking cycle thinking level\n"

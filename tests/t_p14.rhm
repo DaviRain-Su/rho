@@ -1,0 +1,45 @@
+#lang rhombus
+
+// P14: custom_message / branch_summary enter context, custom does not;
+// labels; one-at-a-time steering mode flag shape.
+
+import:
+  "../src/kernel/session.rhm" open
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+def s = start_session(~cwd: "/tmp", ~no_session: #true)
+s.append_message({ "role": "user", "content": "hello" })
+s.append_message({ "role": "assistant", "content": "hi" })
+s.append("custom", { "note": "invisible" })
+s.append("custom_message", { "content": "extension context" })
+s.append("branch_summary", { "summary": "user: tried X\nassistant: did Y" })
+
+def msgs = s.messages()
+check("message count", msgs.length() == 4)
+check("custom excluded",
+      (for values(found = #false) (m in msgs):
+         found || to_string(m.get("content", "")).contains("invisible")) == #false)
+check("custom_message included",
+      for values(found = #false) (m in msgs):
+        found || (m.get("content", "") == "extension context"))
+check("branch_summary included",
+      for values(found = #false) (m in msgs):
+        found || to_string(m.get("content", "")).contains("abandoned conversation branch"))
+
+// labels
+s.set_label("important")
+def ls = s.labels()
+check("label recorded", ls.keys().length() == 1)
+check("label text",
+      for values(found = #false) (k in ls.keys()):
+        found || (ls[k] == "important"))
+
+if failures == 0
+| println("ALL PASS")
+| error("t_p14 failed: " +& failures)

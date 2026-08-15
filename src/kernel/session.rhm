@@ -4,7 +4,8 @@
 //
 // Each line is either an entry:
 //   {"id": Int, "parent": Int | null, "ts": Int, "kind": K, "data": ...}
-//   K = "message" | "meta" | "compaction" | "custom"
+//   K = "message" | "meta" | "compaction" | "custom" (ignored by context)
+//     | "custom_message" | "branch_summary" (both enter the model context)
 // or a leaf move (not a tree node):
 //   {"kind": "goto", "target": Int | -1}
 //
@@ -78,6 +79,9 @@ class Session(mutable path,
 
   // Messages for the model, honoring the most recent compaction entry on
   // the active path: its summary replaces everything up to first_kept.
+  // Besides "message" entries, "custom_message" (extension-provided) and
+  // "branch_summary" (context from an abandoned branch) enter the context;
+  // "custom" entries never do.
   method messages() :: List:
     let path_list = path_entries()
     let compaction_at:
@@ -88,23 +92,58 @@ class Session(mutable path,
       | let c = path_list[compaction_at]["data"]
         let first_kept = c.get("first_kept", -1)
         let kept:
-          for List (e in path_list):
-            skip_when e["kind"] != "message" || e["id"] < first_kept
-            e["data"]
+          for List:
+            each e in path_list
+            skip_when e["id"] < first_kept
+            each m in entry_messages(e)
+            m
         [{ "role": "user",
            "content": "[Conversation summary of earlier context]\n\n"
                         +& c.get("summary", "") }]
           ++ kept
-      | for List (e in path_list):
-          skip_when e["kind"] != "message"
-          e["data"]
+      | for List:
+          each e in path_list
+          each m in entry_messages(e)
+          m
     start_entries
 
   method set_name(n :: String):
     append("meta", { "event": "name", "name": n })
 
+  // Bookmark an entry: /label. target defaults to the current leaf.
+  method set_label(text :: String, ~target: target = #'use_leaf):
+    let id = (if target == #'use_leaf | leaf | target)
+    append("meta", { "event": "label", "target": (if id is_a Int | id | -1),
+                     "label": text })
+    #void
+
+  // id -> label for all labeled entries
+  method labels() :: Map:
+    for values(m :: Map = {}) (e in entries):
+      let data = e.get("data", {})
+      if e["kind"] == "meta" && data is_a Map && data.get("event", "") == "label"
+      | m ++ { data.get("target", -1): data.get("label", "") }
+      | m
+
   method clear():
     set_leaf(#false)
+
+// Which model-visible messages an entry contributes.
+fun entry_messages(e :: Map) :: List:
+  match e["kind"]
+  | "message": [e["data"]]
+  | "custom_message":
+      let data = e.get("data", {})
+      let content = (if data is_a Map | to_string(data.get("content", "")) | to_string(data))
+      if content == "" | [] | [{ "role": "user", "content": content }]
+  | "branch_summary":
+      let data = e.get("data", {})
+      let s = (if data is_a Map | to_string(data.get("summary", "")) | "")
+      if s == ""
+      | []
+      | [{ "role": "user",
+           "content": "[Summary of an abandoned conversation branch]\n\n" +& s }]
+  | ~else: []
 
 fun encode_cwd(cwd :: String) :: String:
   String.join(cwd.split("/", ~trim: #false), "-")

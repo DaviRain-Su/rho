@@ -164,6 +164,8 @@ fun apply_settings():
   match opts.get("session_dir", settings.get("session_dir", #false))
   | d :: String: set_sessions_dir(d)
   | ~else: #void
+  registry.state["steering_mode"] := settings.get("steering_mode", "all")
+  registry.state["followup_mode"] := settings.get("followup_mode", "all")
 
 settings.reload(~include_project: trust.trust_status(cwd()) == #'trusted)
 apply_settings()
@@ -591,19 +593,73 @@ fun show_tree(_args):
         | p :: Map: count(p.get("parent", #'null), n + 1)
         | ~else: n
     let marker = (if active.contains(e["id"]) | "*" | " ")
+    let tag:
+      match session.labels().get(e["id"], #false)
+      | l :: String: " \u2605" +& l
+      | ~else: ""
     out.write_string(marker +& " " +& e["id"] +& " "
                        +& String.make(depth * 2, Char" ")
-                       +& entry_label(e) +& "\n")
+                       +& entry_label(e) +& tag +& "\n")
   out.write_string("use /tree <id> to move the active leaf\n")
+
+// Heuristic summary of the branch being abandoned when jumping from
+// old_leaf to target: the user/assistant messages that are not on the new
+// path, condensed to first lines.
+fun branch_summary_text(old_leaf, target) :: String:
+  let new_path:
+    for values(s :: Set = Set()) (e in session.path_entries()):
+      s ++ { e["id"] }
+  let abandoned:
+    recur walk(id = old_leaf, acc :: List = []):
+      match session.entry(if id is_a Int | id | -1)
+      | e :: Map:
+          if new_path.contains(e["id"])
+          | acc
+          | walk(e.get("parent", #'null), acc.insert(0, e))
+      | ~else: acc
+  let parts:
+    for List (e in abandoned):
+      skip_when e["kind"] != "message"
+      let m = e["data"]
+      let role = m.get("role", "")
+      skip_when role != "user" && role != "assistant"
+      let content = to_string(m.get("content", ""))
+      skip_when content == ""
+      role +& ": " +& first_line(content).substring(
+        0 .. math.min(120, first_line(content).length()))
+  String.join(parts, "\n")
 
 registry.register_command(
   ~name: "tree", ~description: "show session tree; /tree <id> jumps to an entry",
   ~handler: fun (args):
               match String.maybe_to_int(args.trim())
               | n :: Int:
-                  session.set_leaf(n)
-                  api.notify("leaf moved to " +& n)
+                  cond
+                  | !session_event_ok("session_before_branch", { "target": n }):
+                      api.notify("branch switch cancelled by extension")
+                  | ~else:
+                      let old_leaf = session.leaf
+                      session.set_leaf(n)
+                      // keep a trace of what the abandoned branch contained
+                      let summary = branch_summary_text(old_leaf, n)
+                      when summary != "" && old_leaf != n
+                      | session.append("branch_summary",
+                                       { "summary": summary, "from": old_leaf })
+                      api.notify("leaf moved to " +& n)
               | ~else: show_tree(args))
+
+registry.register_command(
+  ~name: "label", ~description: "bookmark the current entry: /label <name> (shown in /tree)",
+  ~handler: fun (args):
+              let text = args.trim()
+              if text == ""
+              | let ls = session.labels()
+                if ls.keys().length() == 0
+                | api.notify("no labels; /label <name> bookmarks the current entry")
+                | for (id in ls.keys().sort()):
+                    out.write_string("  " +& id +& "  " +& ls[id] +& "\n")
+              | session.set_label(text)
+                api.notify("labeled entry " +& session.leaf +& ": " +& text))
 
 registry.register_command(
   ~name: "fork", ~description: "branch from a previous user message: /fork [id]",
@@ -1011,7 +1067,9 @@ fun run_headless():
   | println("error: no prompt (pass a message argument or pipe stdin)")
     rkt.exit(1)
   when json_mode
-  | emit_json({ "type": "session_start",
+  | // output guard: stray prints must not corrupt the JSONL stream
+    rkt.#{current-output-port}(rkt.#{current-error-port}())
+    emit_json({ "type": "session_start",
                 "session": (if session.path is_a String | session.path | ""),
                 "provider": config.provider, "model": config.model })
   run_turn(~config: config,
@@ -1348,9 +1406,54 @@ fun init_trust():
 
 // ---- RPC mode: JSON lines over stdin/stdout ----
 fun run_rpc():
+  // output guard: emit_json keeps the real stdout; stray prints (extension
+  // handlers, debug output) are diverted to stderr so the protocol stays clean
+  rkt.#{current-output-port}(rkt.#{current-error-port}())
   def mutable turn_t = #false
+  def mutable bash_t = #false
+  def mutable followups :: List = []
+  let qlock = rkt.#{make-semaphore}(1)
+  fun locked(thunk):
+    rkt.#{semaphore-wait}(qlock)
+    let r = thunk()
+    rkt.#{semaphore-post}(qlock)
+    r
   fun turn_running():
     turn_t && !rkt.#{thread-dead?}(turn_t)
+  fun do_run_turn(msg :: String):
+    run_turn(~config: config,
+             ~registry: registry,
+             ~session: session,
+             ~system_prompt: system_prompt(),
+             ~input: msg,
+             ~on_text: fun (x): emit_json({ "type": "text", "text": x }),
+             ~on_tool: fun (name, args):
+                         emit_json({ "type": "tool_call", "name": name, "args": args }),
+             ~on_tool_result: fun (name, r):
+                                emit_json({ "type": "tool_result", "name": name, "result": r }),
+             ~on_steer: fun (x): emit_json({ "type": "steering_applied", "message": x }))
+  // the turn thread drains queued follow-ups before finishing
+  fun turn_loop(msg :: String):
+    do_run_turn(msg)
+    emit_json({ "type": "done" })
+    auto_compact()
+    let next:
+      locked(fun ():
+               match followups
+               | []: #false
+               | [first, & rest]:
+                   followups := rest
+                   to_string(first))
+    when next is_a String
+    | emit_json({ "type": "follow_up_started", "message": next })
+      turn_loop(next)
+  fun start_turn(msg :: String):
+    turn_t := rkt.thread(fun ():
+                           try:
+                             turn_loop(msg)
+                             ~catch:
+                             | e :: Exn.Break: emit_json({ "type": "aborted" })
+                             | e :: Exn.Fail: emit_json({ "type": "error", "message": e.message }))
   emit_json({ "type": "ready",
               "session": (if session.path is_a String | session.path | ""),
               "provider": config.provider, "model": config.model })
@@ -1365,28 +1468,8 @@ fun run_rpc():
         | "prompt":
             cond
             | turn_running():
-                emit_json({ "type": "error", "message": "turn already running (use steer)" })
-            | ~else:
-                let msg = to_string(req.get("message", ""))
-                let t:
-                  rkt.thread(fun ():
-                               try:
-                                 run_turn(~config: config,
-                                          ~registry: registry,
-                                          ~session: session,
-                                          ~system_prompt: system_prompt(),
-                                          ~input: msg,
-                                          ~on_text: fun (x): emit_json({ "type": "text", "text": x }),
-                                          ~on_tool: fun (name, args):
-                                                      emit_json({ "type": "tool_call", "name": name, "args": args }),
-                                          ~on_tool_result: fun (name, r):
-                                                             emit_json({ "type": "tool_result", "name": name, "result": r }),
-                                          ~on_steer: fun (x): emit_json({ "type": "steering_applied", "message": x }))
-                                 emit_json({ "type": "done" })
-                                 ~catch:
-                                 | e :: Exn.Break: emit_json({ "type": "aborted" })
-                                 | e :: Exn.Fail: emit_json({ "type": "error", "message": e.message }))
-                turn_t := t
+                emit_json({ "type": "error", "message": "turn already running (use steer or follow_up)" })
+            | ~else: start_turn(to_string(req.get("message", "")))
             loop()
         | "steer":
             if turn_running()
@@ -1394,11 +1477,95 @@ fun run_rpc():
               emit_json({ "type": "steering_queued" })
             | emit_json({ "type": "error", "message": "no turn running" })
             loop()
+        | "follow_up":
+            let msg = to_string(req.get("message", ""))
+            if turn_running()
+            | locked(fun (): followups := followups.add(msg))
+              emit_json({ "type": "follow_up_queued", "queued": followups.length() })
+            | start_turn(msg)
+            loop()
         | "abort":
             when turn_running()
             | rkt.#{break-thread}(turn_t)
               rkt.#{thread-wait}(turn_t)
+            locked(fun (): followups := [])
             emit_json({ "type": "aborted" })
+            loop()
+        | "get_state":
+            emit_json({ "type": "state",
+                        "provider": config.provider, "model": config.model,
+                        "thinking": (if config.thinking | config.thinking | "off"),
+                        "session": (if session.path is_a String | session.path | ""),
+                        "leaf": (if session.leaf is_a Int | session.leaf | -1),
+                        "turn_running": turn_running() == #true,
+                        "queued_followups": followups.length() })
+            loop()
+        | "get_entries":
+            let since = req.get("since", -1)
+            let since = (if since is_a Int | since | -1)
+            let es:
+              for List (e in session.entries):
+                skip_when e["id"] <= since
+                e
+            emit_json({ "type": "entries", "entries": es,
+                        "leaf": (if session.leaf is_a Int | session.leaf | -1) })
+            loop()
+        | "get_tree":
+            emit_json({ "type": "tree", "entries": session.entries,
+                        "leaf": (if session.leaf is_a Int | session.leaf | -1),
+                        "labels": session.labels() })
+            loop()
+        | "get_last_assistant_text":
+            emit_json({ "type": "last_assistant_text", "text": last_assistant_text() })
+            loop()
+        | "set_steering_mode":
+            let mode = to_string(req.get("mode", "all"))
+            registry.state["steering_mode"] := mode
+            emit_json({ "type": "steering_mode", "mode": mode })
+            loop()
+        | "set_auto_compaction":
+            let enabled = req.get("enabled", #true) == #true
+            config.settings := config.settings ++ { "auto_compaction": enabled }
+            emit_json({ "type": "auto_compaction", "enabled": enabled })
+            loop()
+        | "compact":
+            if turn_running()
+            | emit_json({ "type": "error", "message": "turn running" })
+            | let r = try:
+                        compaction.compact(~session: session, ~config: config,
+                                           ~instructions: to_string(req.get("instructions", "")))
+                        ~catch e :: Exn.Fail: "error: " +& e.message
+              emit_json({ "type": "compacted", "result": to_string(r) })
+            loop()
+        | "export_html":
+            let target = to_string(req.get("path", "session.html"))
+            try:
+              export_html(target)
+              emit_json({ "type": "exported", "path": target })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "bash":
+            cond
+            | bash_t && !rkt.#{thread-dead?}(bash_t):
+                emit_json({ "type": "error", "message": "bash already running (abort_bash first)" })
+            | ~else:
+                let cmd = to_string(req.get("command", ""))
+                let tool = registry.tools.get("bash", #false)
+                if !tool
+                | emit_json({ "type": "error", "message": "bash tool unavailable" })
+                | bash_t := rkt.thread(fun ():
+                                         let r = try:
+                                                   to_string(tool.fn({ "command": cmd }))
+                                                   ~catch:
+                                                   | e :: Exn.Break: "(aborted)"
+                                                   | e :: Exn.Fail: "error: " +& e.message
+                                         emit_json({ "type": "bash_result", "result": r }))
+            loop()
+        | "abort_bash":
+            when bash_t && !rkt.#{thread-dead?}(bash_t)
+            | rkt.#{break-thread}(bash_t)
+            emit_json({ "type": "bash_aborted" })
             loop()
         | "quit":
             when turn_running()

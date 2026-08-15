@@ -79,6 +79,11 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
   method append_entry(data):
     get_session().append("custom", data)
 
+  // Append a custom message that DOES enter the model context (as a user
+  // message with the given content).
+  method append_custom_message(content :: String):
+    get_session().append("custom_message", { "content": content })
+
   // Read an extension CLI flag. Unrecognized "--name" / "--name=value"
   // arguments are collected at startup; returns value string, #true for a
   // bare flag, or #false when absent.

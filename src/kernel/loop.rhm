@@ -56,7 +56,9 @@ fun do_call_provider(config, messages, tools, on_text, headers :: Map):
 
 // Drain steering messages (sent to the current thread's mailbox by the REPL
 // while a turn runs) into the session. Returns #true if any arrived.
+// steering_mode "one-at-a-time" (registry.state) delivers one per round.
 fun drain_steering(session, registry, on_steer):
+  let one_at_a_time = registry.state.get("steering_mode", "all") == "one-at-a-time"
   recur go(any = #false):
     match rkt.#{thread-try-receive}()
     | #false: any
@@ -65,7 +67,7 @@ fun drain_steering(session, registry, on_steer):
         session.append_message(user_message(s))
         registry.emit("user_message", { "content": s, "steering": #true })
         on_steer(s)
-        go(#true)
+        if one_at_a_time | #true | go(#true)
 
 // Executes one full user turn. UI callbacks:
 //   on_text(delta)                     streaming assistant text

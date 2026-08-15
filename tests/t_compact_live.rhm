@@ -1,0 +1,33 @@
+#lang rhombus
+
+// Live test: forces a compaction against the real provider.
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/config.rhm" open
+  "../src/kernel/session.rhm" open
+  "../src/kernel/compaction.rhm" as compaction
+
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-cl-~a", #'directory))
+def cwd = (if tmp.substring(tmp.length() - 1 ..) == "/" | tmp.substring(0 .. tmp.length() - 1) | tmp)
+
+def base = load_config()
+def cfg = Config(base.provider, base.model, base.providers, #false,
+                 { "keep_recent_tokens": 50, "reserve_tokens": 16384 })
+
+def s = start_session(~cwd: cwd)
+s.append_message({ "role": "user", "content": "My favorite color is teal and I live in Hangzhou. Please remember this." })
+s.append_message({ "role": "assistant", "content": "Noted: favorite color teal, city Hangzhou.", "tool_calls": [] })
+s.append_message({ "role": "user", "content": "ok" })
+s.append_message({ "role": "assistant", "content": "ok", "tool_calls": [] })
+s.append_message({ "role": "user", "content": "thanks" })
+
+def r = compaction.compact(~session: s, ~config: cfg)
+println(r)
+when !r.contains("compacted") | error("compaction did not run: " +& r)
+def msgs = s.messages()
+println("first message: " +& msgs[0]["content"].substring(0 .. math.min(200, msgs[0]["content"].length())))
+when !(msgs[0]["content"].contains("summary") || msgs[0]["content"].contains("Summary")
+         || msgs[0]["content"].contains("teal"))
+| error("summary looks wrong")
+println("t_compact_live OK")

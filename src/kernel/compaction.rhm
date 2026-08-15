@@ -1,0 +1,142 @@
+#lang rhombus
+
+// Context compaction: summarize old turns into a CompactionEntry so long
+// sessions keep fitting the model's context window.
+//
+// Trigger: context_tokens > context_window - reserve_tokens (default 16k).
+// Cut point: walk back from the newest entry accumulating estimated tokens
+// until keep_recent_tokens (default 20k) is reached, then cut at the nearest
+// turn boundary (a user message). Tool results are never separated from
+// their tool calls because turns only start at user messages.
+
+import:
+  json
+  "loop.rhm" open
+  "../ai/models.rhm" as models
+
+export:
+  estimate_tokens
+  context_tokens
+  needs_compaction
+  find_cut
+  compact
+
+fun estimate_tokens(m :: Map) :: Int:
+  let content = m.get("content", "")
+  let content_len = (if content is_a String | content.length() | 0)
+  let tools_len:
+    for values(n = 0) (tc in m.get("tool_calls", [])):
+      n + tc.get("arguments", "").length() + 20
+  math.exact(math.floor((content_len + tools_len) / 4)) + 8
+
+// Prefer the provider-reported usage of the newest assistant message;
+// fall back to a character-count estimate over the active path.
+fun context_tokens(session) :: Int:
+  let msgs = session.messages()
+  let reported:
+    for values(found = #false) (m in msgs):
+      if m.get("role", "") == "assistant" && m.get("usage", {}) != {}
+      | let u = m["usage"]
+        u.get("input", 0) + u.get("output", 0)
+      | found
+  reported
+    || (for values(n = 0) (m in msgs): n + estimate_tokens(m))
+
+fun reserve_tokens(config) :: Int:
+  config.settings.get("reserve_tokens", 16384)
+
+fun keep_recent_tokens(config) :: Int:
+  config.settings.get("keep_recent_tokens", 20000)
+
+fun needs_compaction(session, config) :: Boolean:
+  let window = models.model_info(config.model)["context_window"]
+  context_tokens(session) > window - reserve_tokens(config)
+
+// Message entries on the active path that the model currently sees
+// (i.e. after any previous compaction), oldest first.
+fun visible_message_entries(session) :: List:
+  let path_list = session.path_entries()
+  let compaction_at:
+    for values(found = -1) (i in 0 .. path_list.length()):
+      if path_list[i]["kind"] == "compaction" | i | found
+  for List (i in 0 .. path_list.length()):
+    skip_when i <= compaction_at
+    skip_when path_list[i]["kind"] != "message"
+    path_list[i]
+
+// Returns the id of the first entry to keep (a user message), or #false if
+// there is nothing worth compacting.
+fun find_cut(session, config) :: maybe(Int):
+  let entries = visible_message_entries(session)
+  let keep = keep_recent_tokens(config)
+  // user-message indexes, and token total from each index to the end
+  def mutable best = #false
+  for (i in 0 .. entries.length()):
+    skip_when entries[i]["data"].get("role", "") != "user"
+    let tail_tokens:
+      for values(n = 0) (j in i .. entries.length()):
+        n + estimate_tokens(entries[j]["data"])
+    // earliest user message whose tail fits in keep_recent
+    when best == #false && tail_tokens <= keep
+    | best := entries[i]["id"]
+  let cut:
+    if best == #false
+    | // single oversized turn: keep just the last turn and warn via caller
+      for values(last_user = #false) (e in entries):
+        if e["data"].get("role", "") == "user" | e["id"] | last_user
+    | best
+  // nothing before the cut -> no point compacting
+  let has_before:
+    for values(any = #false) (e in entries):
+      any || (cut is_a Int && e["id"] < cut)
+  has_before && cut
+
+fun transcript_for_summary(session, first_kept :: Int) :: String:
+  let path_list = session.path_entries()
+  // include the previous summary, if any, so context is not lost
+  let prev_summary:
+    for values(found = "") (e in path_list):
+      if e["kind"] == "compaction" | e["data"].get("summary", "") | found
+  let parts:
+    for List (e in path_list):
+      skip_when e["kind"] != "message" || e["id"] >= first_kept
+      let m = e["data"]
+      let role = m.get("role", "?")
+      let tools:
+        for values(s = "") (tc in m.get("tool_calls", [])):
+          s +& "\n[tool_call " +& tc.get("name", "") +& " " +& tc.get("arguments", "") +& "]"
+      role +& ": " +& m.get("content", "") +& tools
+  (if prev_summary == "" | "" | "Previous summary:\n" +& prev_summary +& "\n\n")
+    +& String.join(parts, "\n\n")
+
+def summary_system:
+  "You are summarizing an earlier portion of a conversation between a user "
+    +& "and a coding agent. Write a dense summary that preserves: the user's "
+    +& "goals and constraints, decisions made, files/paths touched and how, "
+    +& "commands run and important outputs, current state, and open TODOs. "
+    +& "Write plain text, no preamble."
+
+// Runs a summarization request and appends a compaction entry.
+// Returns a status string.
+fun compact(~session: session,
+            ~config: config,
+            ~instructions: instructions :: String = "") :: String:
+  let cut = find_cut(session, config)
+  cond
+  | !cut: "nothing to compact"
+  | ~else:
+      let transcript = transcript_for_summary(session, cut)
+      let prompt:
+        (if instructions == "" | "" | "Extra instructions: " +& instructions +& "\n\n")
+          +& "Summarize this conversation so far:\n\n" +& transcript
+      let reply = call_provider(config,
+                                [{ "role": "system", "content": summary_system },
+                                 { "role": "user", "content": prompt }],
+                                [],
+                                fun (s): #void)
+      let summary = reply.get("content", "")
+      if summary == ""
+      | "compaction failed: empty summary"
+      | session.append("compaction", { "summary": summary, "first_kept": cut })
+        "compacted: summarized everything before entry " +& cut
+          +& " (" +& summary.length() +& " chars)"

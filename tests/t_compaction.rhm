@@ -1,0 +1,45 @@
+#lang rhombus
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/session.rhm" open
+  "../src/kernel/compaction.rhm" as compaction
+
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-comp-~a", #'directory))
+def cwd = (if tmp.substring(tmp.length() - 1 ..) == "/" | tmp.substring(0 .. tmp.length() - 1) | tmp)
+
+def s = start_session(~cwd: cwd)
+
+fun big(n :: Int) :: String:
+  String.make(n, Char"x")
+
+// 3 turns; each turn ~2500 tokens (10k chars)
+for (i in 0..3):
+  s.append_message({ "role": "user", "content": "question " +& i +& " " +& big(2000) })
+  s.append_message({ "role": "assistant", "content": "answer " +& i +& " " +& big(8000),
+                     "tool_calls": [] })
+
+class FakeConfig(settings :: Map, model :: String)
+def cfg = FakeConfig({ "keep_recent_tokens": 3000, "reserve_tokens": 16384 }, "unknown-model")
+
+// cut should land on the latest user message (only last turn fits in 3000)
+def cut = compaction.find_cut(s, cfg)
+def cut_entry = s.entry(cut)
+when cut_entry["data"].get("role", "") != "user" | error("cut not at user message")
+when !cut_entry["data"]["content"].contains("question 2") | error("expected cut at turn 3, got: " +& cut)
+
+// simulate a compaction entry without calling a model
+s.append("compaction", { "summary": "SUMMARY OF TURNS 0-1", "first_kept": cut })
+def msgs = s.messages()
+when !(msgs[0]["content"].contains("SUMMARY OF TURNS 0-1")) | error("summary not injected")
+when !(msgs[1]["content"].contains("question 2")) | error("kept messages wrong")
+when msgs.length() != 3 | error("expected summary + last turn, got " +& msgs.length())
+
+// context_tokens estimates from chars when no usage present
+when compaction.context_tokens(s) <= 0 | error("context_tokens broken")
+
+// persists across reload
+def s2 = start_session(~cwd: cwd, ~continue_latest: #true)
+when !(s2.messages()[0]["content"].contains("SUMMARY")) | error("compaction not persisted")
+
+println("t_compaction OK")

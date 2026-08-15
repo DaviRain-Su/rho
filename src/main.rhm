@@ -27,6 +27,7 @@ import:
   "kernel/session.rhm" open
   "kernel/loop.rhm" open
   "kernel/context.rhm" as context
+  "kernel/compaction.rhm" as compaction
   "ai/models.rhm" as models
   "tools/core.rhm" open
   "ext/api.rhm" open
@@ -435,8 +436,19 @@ registry.register_command(
                   session := start_session(~cwd: cwd(), ~resume: dest)
                   api.notify("imported into " +& dest))
 registry.register_command(
+  ~name: "compact", ~description: "summarize old turns to shrink context: /compact [instructions]",
+  ~handler: fun (args):
+              api.notify("compacting\u2026")
+              api.notify(compaction.compact(~session: session, ~config: config,
+                                            ~instructions: args.trim())))
+registry.register_command(
   ~name: "quit", ~description: "exit",
   ~handler: fun (_args): #'quit)
+
+fun auto_compact():
+  when compaction.needs_compaction(session, config)
+  | api.notify("context is near the window limit; compacting\u2026")
+    api.notify(compaction.compact(~session: session, ~config: config))
 
 // Also expose reload as a tool so the agent can activate its own extensions.
 registry.register_tool(
@@ -472,6 +484,7 @@ fun handle_input(input :: String):
                               out.write_string(color("2", "  \u21B3 " +& first_line(r)) +& "\n")
                               out.flush())
   out.write_string("\n")
+  auto_compact()
 
 fun summarize(args :: Map) :: String:
   let s = to_string(args)

@@ -20,12 +20,21 @@ export:
   run_tui
   push
   push_delta
+  set_activity
   default_theme
 
 // ---- shared transcript state (written by turn threads, read by render) ----
 def mutable lines :: List = []       // [kind, text] finalized lines
 def mutable partial :: String = ""   // streaming tail without newline yet
 def mutable dirty = #true
+def mutable activity = #false        // "thinking" / "tool: x" / ... while a turn runs
+
+def spinner_frames = ["\u280B", "\u2819", "\u2839", "\u2838", "\u283C",
+                      "\u2834", "\u2826", "\u2827", "\u2807", "\u280F"]
+
+fun set_activity(s):
+  activity := s
+  dirty := #true
 
 fun strip_ansi(s :: String) :: String:
   // remove \e[...m style sequences
@@ -144,6 +153,9 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable turn_thread = #false
   def mutable followups :: List = []
   def mutable running = #true
+  def mutable spin_i = 0
+  def mutable turn_started = 0
+  def mutable size_tick = 0
 
   when banner != ""
   | push("notify", banner)
@@ -238,10 +250,13 @@ fun run_tui(~theme: theme_in :: Map = {},
     | rkt.#{break-thread}(turn_thread)
       rkt.#{thread-wait}(turn_thread)
       turn_thread := #false
+      activity := #false
       flush_partial()
       push("notify", "[turn interrupted]")
 
   fun start_turn(input :: String):
+    activity := "thinking"
+    turn_started := rkt.#{current-inexact-milliseconds}()
     let t = rkt.thread(fun ():
                          try:
                            handle_input(input)
@@ -385,16 +400,22 @@ fun run_tui(~theme: theme_in :: Map = {},
     let cols = term.#{term-cols}()
     let input_h = math.min(input_lines.length(), 8)
     let trans_h = math.max(3, rows - input_h - 2)
-    // wrap transcript (including streaming tail)
+    // wrap only the tail of the transcript that can possibly be visible
+    // (each raw line wraps to >= 1 row, so this many raw lines suffice)
     let all_lines = (if partial == "" | lines | lines.add(["assistant", partial]))
+    let need = trans_h + scroll + 4
+    let tail_start = math.max(0, all_lines.length() - need)
     let wrapped:
       for List:
-        each entry in all_lines
-        let [kind, text] = entry
+        each i in tail_start .. all_lines.length()
+        let [kind, text] = all_lines[i]
         let shown = tool_line(kind, text) || text
         each piece in wrap_line(to_string(shown), cols)
         [kind, piece]
-    let max_scroll = math.max(0, wrapped.length() - trans_h)
+    let max_scroll:
+      if tail_start > 0
+      | scroll  // older lines exist beyond the wrapped tail; allow scrolling on
+      | math.max(0, wrapped.length() - trans_h)
     let off = clamp(scroll, 0, max_scroll)
     scroll := off
     let first = math.max(0, wrapped.length() - trans_h - off)
@@ -420,12 +441,26 @@ fun run_tui(~theme: theme_in :: Map = {},
         let prompt = (if i == 0 | "\u276F " | "\u2502 ")
         [[tcolor("prompt"), #false, "bold", prompt],
          [#false, #false, #false, to_string(input_lines[i])]]
-    // footer
-    let ftext = footer() +& (if turn_thread | "  [working\u2026 type to steer]" | "")
+    // footer: spinner + activity + elapsed while a turn runs
+    let status:
+      if turn_thread
+      | spin_i := spin_i + 1
+        let frame = spinner_frames[spin_i mod spinner_frames.length()]
+        let secs = math.exact(math.floor((rkt.#{current-inexact-milliseconds}() - turn_started) / 1000))
+        " " +& frame +& " " +& (if activity | to_string(activity) | "working")
+          +& " " +& secs +& "s \u00B7 esc to interrupt \u00B7 type to steer \u2502"
+      | ""
+    let ftext = status +& footer()
     let fpad:
       let padding = math.max(0, cols - ftext.length())
       ftext.substring(0 .. math.min(ftext.length(), cols)) +& String.make(padding, Char" ")
-    let foot = [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
+    let foot:
+      if turn_thread
+      | [[tcolor("prompt"), tcolor("footer_bg"), "bold",
+          status.substring(0 .. math.min(status.length(), cols))],
+         [tcolor("footer_fg"), tcolor("footer_bg"), #false,
+          fpad.substring(math.min(status.length(), cols) ..)]]
+      | [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
     let cursor_row = trans_h + 1 + (cur_line - win_start)
     let cursor_col = clamp(2 + cur_col, 0, cols - 1)
     term.#{term-draw!}(trans_rows ++ [sep] ++ input_rows ++ [foot],
@@ -440,16 +475,27 @@ fun run_tui(~theme: theme_in :: Map = {},
       | // reap finished turn
         when turn_thread && rkt.#{thread-dead?}(turn_thread)
         | turn_thread := #false
+          activity := #false
           flush_partial()
+          dirty := #true
           match followups
           | []: #void
           | [next, & rest]:
               followups := rest
               push("user", "\u276F " +& next +& "  (follow-up)")
               start_turn(next)
+        // while a turn runs, repaint every tick (streams text, spins spinner)
+        when turn_thread
+        | dirty := #true
         when dirty
         | render()
-        let e = term.#{term-wait-event}(if turn_thread | 0.08 | 0.5)
+        // periodically re-check the terminal size via stty (works even when
+        // the terminal ignores CSI size queries)
+        size_tick := size_tick + 1
+        when size_tick mod (if turn_thread | 25 | 2) == 0
+        | when term.#{term-poll-size!}()
+          | dirty := #true
+        let e = term.#{term-wait-event}(if turn_thread | 0.05 | 0.5)
         match e
         | #'timeout: #void
         | #'eof: running := #false

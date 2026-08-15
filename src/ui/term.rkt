@@ -3,20 +3,43 @@
 ;; Thin wrapper around raart's lux chaos so the Rhombus TUI can drive the
 ;; terminal without implementing lux's generic interfaces.
 ;;
-;; Events (term-wait-event) are simple lists:
-;;   (list 'key "a") / (list 'key "C-c") / (list 'key "<up>") ...
-;;   (list 'resize rows cols)
+;; We use the chaos only for raw-mode setup and key input; drawing goes
+;; through our own cached buffer so that we control the screen size. The
+;; size comes from `stty size` (reliable even when the terminal ignores the
+;; CSI 18t query that raart sends) and is refreshed on demand.
+;;
+;; Events (term-wait-event) are treelists so Rhombus patterns match them:
+;;   ['key "a"] / ['key "C-C"] / ['key "<up>"] ...
+;;   ['resize rows cols]
 ;;   'timeout | 'eof
 ;;
 ;; Drawing (term-draw!) takes rows of spans; a span is
-;;   (list fg-sym-or-#f bg-sym-or-#f style-sym-or-#f text-string)
+;;   [fg-sym-or-#f bg-sym-or-#f style-sym-or-#f text-string]
 ;; plus an optional cursor position.
 
 (require racket/match
          racket/treelist
+         racket/system
+         racket/string
+         racket/port
          lux/chaos
          raart/lux-chaos
-         raart/draw)
+         raart/draw
+         raart/buffer
+         (submod raart/buffer internal))
+
+(provide term-start!
+         term-stop!
+         term-wait-event
+         term-poll-size!
+         term-rows
+         term-cols
+         term-draw!)
+
+(define C #f)
+(define BUF #f)
+(define ROWS 24)
+(define COLS 80)
 
 ;; Rhombus lists are treelists; accept both.
 (define (->list v)
@@ -24,37 +47,57 @@
         [(list? v) v]
         [else (error '->list "not a list: ~e" v)]))
 
-(provide term-start!
-         term-stop!
-         term-wait-event
-         term-rows
-         term-cols
-         term-draw!)
+(define (stty-size)
+  (with-handlers ([exn:fail? (lambda (e) #f)])
+    (define s
+      (with-output-to-string
+        (lambda () (system "stty size < /dev/tty 2>/dev/null"))))
+    (match (string-split (string-trim s))
+      [(list r c)
+       (define rn (string->number r))
+       (define cn (string->number c))
+       (and rn cn (> rn 0) (> cn 0) (list rn cn))]
+      [_ #f])))
 
-(define C #f)
-(define ROWS 24)
-(define COLS 80)
+(define (apply-size! r c)
+  (unless (and (= r ROWS) (= c COLS))
+    (set! ROWS r)
+    (set! COLS c)
+    (when BUF (buffer-resize! BUF ROWS COLS))))
+
+;; Re-reads the tty size; returns #t when it changed.
+(define (term-poll-size!)
+  (match (stty-size)
+    [(list r c)
+     (define changed? (not (and (= r ROWS) (= c COLS))))
+     (apply-size! r c)
+     changed?]
+    [_ #f]))
 
 (define (term-start!)
   (set! C (make-raart))
-  (chaos-start! C))
+  (chaos-start! C)
+  (match (stty-size)
+    [(list r c) (set! ROWS r) (set! COLS c)]
+    [_ (void)])
+  (set! BUF (make-cached-buffer ROWS COLS)))
 
 (define (term-stop!)
   (when C
     (chaos-stop! C)
-    (set! C #f)))
+    (set! C #f)
+    (set! BUF #f)))
 
 (define (term-rows) ROWS)
 (define (term-cols) COLS)
 
-;; Events are returned as treelists so Rhombus list patterns match them.
 (define (term-wait-event timeout)
   (define e (sync/timeout (if (eq? timeout #f) #f timeout) (chaos-event C)))
   (cond
     [(not e) 'timeout]
     [(screen-size-report? e)
-     (set! ROWS (screen-size-report-rows e))
-     (set! COLS (screen-size-report-columns e))
+     (apply-size! (screen-size-report-rows e)
+                  (screen-size-report-columns e))
      (treelist 'resize ROWS COLS)]
     [(string? e) (treelist 'key (string->immutable-string e))]
     [(eof-object? e) 'eof]
@@ -84,4 +127,4 @@
         (let ([c (->list cursor)])
           (place-cursor-after matted (car c) (cadr c)))
         matted))
-  (chaos-output! C final))
+  (draw BUF final))

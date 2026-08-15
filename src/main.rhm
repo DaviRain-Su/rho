@@ -718,12 +718,16 @@ fun handle_input_tui(input :: String):
            ~session: session,
            ~system_prompt: system_prompt(),
            ~input: input,
-           ~on_text: fun (s): tui.push_delta(s),
+           ~on_text: fun (s):
+                       tui.set_activity("responding")
+                       tui.push_delta(s),
            ~on_tool: fun (name, args):
+                       tui.set_activity("tool: " +& name)
                        tui.push("tool",
                                 render_tool("call", name, args)
                                   || "\u25CF " +& name +& " " +& summarize(args)),
            ~on_tool_result: fun (name, r):
+                              tui.set_activity("thinking")
                               tui.push("tool_result",
                                        render_tool("result", name, r)
                                          || "  \u21B3 " +& first_line(r)))

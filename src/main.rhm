@@ -27,6 +27,7 @@ import:
   "kernel/session.rhm" open
   "kernel/loop.rhm" open
   "kernel/context.rhm" as context
+  "ai/models.rhm" as models
   "tools/core.rhm" open
   "ext/api.rhm" open
   "ext/loader.rhm" as loader
@@ -52,6 +53,8 @@ fun parse_args() :: Map:
     | ["-m", v, & more]: parse(more, acc ++ { "model": v })
     | ["--model", v, & more]: parse(more, acc ++ { "model": v })
     | ["--resume", v, & more]: parse(more, acc ++ { "resume": v })
+    | ["--thinking", v, & more]: parse(more, acc ++ { "thinking": v })
+    | ["--list-models", & more]: parse(more, acc ++ { "list_models": #true })
     | ["--tools", v, & more]: parse(more, acc ++ { "tools": split_list(v) })
     | ["--exclude-tools", v, & more]: parse(more, acc ++ { "exclude_tools": split_list(v) })
     | ["--no-tools", & more]: parse(more, acc ++ { "no_tools": #true })
@@ -75,7 +78,8 @@ def opts = parse_args()
 def headless = opts.get("print", #false) || opts.get("mode", "text") == "json"
 def json_mode = opts.get("mode", "text") == "json"
 def config = load_config(~provider: opts.get("provider", #false),
-                         ~model: opts.get("model", #false))
+                         ~model: opts.get("model", #false),
+                         ~thinking: opts.get("thinking", #false))
 def registry = make_registry()
 install_core_tools(registry)
 def session = start_session(~resume: opts.get("resume", #false))
@@ -186,10 +190,43 @@ registry.register_command(
                   api.notify("switched to " +& args +& " model=" +& config.model)
               | ~else:
                   api.notify("unknown provider: " +& args))
+// ---- usage accounting ----
+fun usage_totals() :: Map:
+  for values(acc :: Map = { "input": 0, "output": 0, "cache_read": 0, "cost": 0.0 }) (m in session.messages()):
+    skip_when m.get("role", "") != "assistant"
+    let u = m.get("usage", {})
+    skip_when !(u is_a Map) || u == {}
+    { "input": acc["input"] + u.get("input", 0),
+      "output": acc["output"] + u.get("output", 0),
+      "cache_read": acc["cache_read"] + u.get("cache_read", 0),
+      "cost": acc["cost"] + models.cost_of(config.model, u) }
+
+fun round2(x) :: String:
+  let cents = math.round(x * 10000)
+  to_string(cents / 10000.0)
+
+fun usage_line() :: String:
+  let t = usage_totals()
+  let info = models.model_info(config.model)
+  "tokens: in=" +& t["input"] +& " out=" +& t["output"]
+    +& " cached=" +& t["cache_read"]
+    +& " cost=$" +& round2(t["cost"])
+    +& " ctx-window=" +& info["context_window"]
+
+fun list_models():
+  let ms = models.all_models()
+  for (name in ms.keys().sort()):
+    let info = models.model_info(name)
+    println(name
+              +& "  ctx=" +& info["context_window"]
+              +& "  $" +& info["input_price"] +& "/$" +& info["output_price"] +& " per 1M"
+              +& (if info["thinking"] | "  [thinking]" | ""))
+
 registry.register_command(
-  ~name: "session", ~description: "show session file and entry count",
+  ~name: "session", ~description: "show session file, entry count, token usage",
   ~handler: fun (_args):
-              api.notify(session.path +& " (" +& session.entries.length() +& " entries)"))
+              api.notify(session.path +& " (" +& session.entries.length() +& " entries)")
+              api.notify(usage_line()))
 registry.register_command(
   ~name: "clear", ~description: "clear conversation history",
   ~handler: fun (_args):
@@ -302,11 +339,15 @@ fun run_headless():
   | out.write_string("\n")
 
 module main:
-  apply_tool_filters()
-  when !opts.get("no_extensions", #false)
-  | do_reload(#false)
-  if headless
-  | run_headless()
-  | run_repl(~banner: banner,
-             ~handle_command: handle_command,
-             ~handle_input: handle_input)
+  cond
+  | opts.get("list_models", #false):
+      list_models()
+  | ~else:
+      apply_tool_filters()
+      when !opts.get("no_extensions", #false)
+      | do_reload(#false)
+      if headless
+      | run_headless()
+      | run_repl(~banner: banner,
+                 ~handle_command: handle_command,
+                 ~handle_input: handle_input)

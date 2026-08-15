@@ -32,7 +32,9 @@ fun project_extensions_dir() :: String:
 
 class Config(mutable provider :: String,
              mutable model :: String,
-             providers :: Map):
+             providers :: Map,
+             mutable thinking,
+             settings :: Map):
   method profile() :: Map:
     providers.get(provider, {})
   method base_url() :: String:
@@ -96,7 +98,8 @@ fun read_config_file() :: Map:
   | {}
 
 fun load_config(~provider: provider_arg :: maybe(String) = #false,
-                ~model: model_arg :: maybe(String) = #false) :: Config:
+                ~model: model_arg :: maybe(String) = #false,
+                ~thinking: thinking :: maybe(String) = #false) :: Config:
   let file_cfg = read_config_file()
   let providers:
     let extra = file_cfg.get("providers", {})
@@ -106,4 +109,6 @@ fun load_config(~provider: provider_arg :: maybe(String) = #false,
   let provider = provider_arg || file_cfg.get("provider", "kimi")
   let prof = providers.get(provider, {})
   let model = model_arg || file_cfg.get("model", prof.get("default_model", ""))
-  Config(provider, model, providers)
+  let settings = file_cfg.get("settings", {})
+  Config(provider, model, providers, thinking,
+         if settings is_a Map | settings | {})

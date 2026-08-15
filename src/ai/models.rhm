@@ -1,0 +1,86 @@
+#lang rhombus
+
+// Model metadata registry: context window, pricing (USD per 1M tokens),
+// thinking support. Extendable via ~/.rho/models.json:
+//   { "models": { "<name>": { "context_window": N, "input_price": X,
+//                             "output_price": Y, "thinking": true } } }
+
+import:
+  json
+  "../kernel/config.rhm"
+
+export:
+  model_info
+  all_models
+  cost_of
+
+def defaults :: Map:
+  { "context_window": 128000, "input_price": 0.0, "output_price": 0.0,
+    "cache_read_price": 0.0, "thinking": #false }
+
+def builtin :: Map:
+  {
+    "kimi-k2-turbo-preview":
+      { "context_window": 262144, "input_price": 2.4, "output_price": 10.0,
+        "cache_read_price": 0.6 },
+    "kimi-k2-0905-preview":
+      { "context_window": 262144, "input_price": 0.6, "output_price": 2.5,
+        "cache_read_price": 0.15 },
+    "kimi-k2-thinking":
+      { "context_window": 262144, "input_price": 0.6, "output_price": 2.5,
+        "cache_read_price": 0.15, "thinking": #true },
+    "gpt-5.2":
+      { "context_window": 400000, "input_price": 1.25, "output_price": 10.0,
+        "cache_read_price": 0.125, "thinking": #true },
+    "gpt-5-mini":
+      { "context_window": 400000, "input_price": 0.25, "output_price": 2.0,
+        "cache_read_price": 0.025, "thinking": #true },
+    "claude-sonnet-4-5":
+      { "context_window": 200000, "input_price": 3.0, "output_price": 15.0,
+        "cache_read_price": 0.3, "thinking": #true },
+    "claude-opus-4-5":
+      { "context_window": 200000, "input_price": 5.0, "output_price": 25.0,
+        "cache_read_price": 0.5, "thinking": #true },
+    "claude-haiku-4-5":
+      { "context_window": 200000, "input_price": 1.0, "output_price": 5.0,
+        "cache_read_price": 0.1, "thinking": #true },
+    "deepseek-chat":
+      { "context_window": 128000, "input_price": 0.27, "output_price": 1.1,
+        "cache_read_price": 0.07 }
+  }
+
+fun custom_models() :: Map:
+  let path = config.config_dir() +& "/models.json"
+  if filesystem.file_exists(path)
+  | let parsed = try:
+                   json.from_string(filesystem.read_string(path))
+                   ~catch _: {}
+    if parsed is_a Map
+    | let m = parsed.get("models", {})
+      if m is_a Map | m | {}
+    | {}
+  | {}
+
+fun all_models() :: Map:
+  for values(m = builtin) ((k, v) in custom_models()):
+    m ++ { k: v }
+
+// Strips a provider prefix like "anthropic/claude-..." for lookup.
+fun model_info(name :: String) :: Map:
+  let models = all_models()
+  let short:
+    let parts = name.split("/")
+    to_string(parts[parts.length() - 1])
+  let entry = models.get(name, models.get(short, {}))
+  defaults ++ (if entry is_a Map | entry | {})
+
+// usage: {"input": n, "output": n, "cache_read": n}; returns USD
+fun cost_of(name :: String, usage :: Map) :: Real:
+  let info = model_info(name)
+  let inp = usage.get("input", 0)
+  let outp = usage.get("output", 0)
+  let cached = usage.get("cache_read", 0)
+  ((inp - cached) * info["input_price"]
+     + cached * info["cache_read_price"]
+     + outp * info["output_price"])
+    / 1000000

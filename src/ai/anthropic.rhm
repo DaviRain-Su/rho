@@ -67,13 +67,24 @@ fun stream_chat(~base_url: base_url :: String,
                 ~messages: messages :: List,
                 ~tools: tools :: List = [],
                 ~on_text: on_text = fun (s): #void,
-                ~max_tokens: max_tokens :: Int = 8192) :: Map:
+                ~max_tokens: max_tokens :: Int = 8192,
+                ~thinking: thinking :: maybe(String) = #false) :: Map:
   let (system_text, converted) = convert_messages(messages)
+  let budget:
+    match thinking
+    | "low": 4096
+    | "medium": 8192
+    | "high": 16384
+    | ~else: 0
   let body:
     let base = { "model": model,
-                 "max_tokens": max_tokens,
+                 "max_tokens": (if budget > 0 | budget + max_tokens | max_tokens),
                  "messages": converted,
                  "stream": #true }
+    let base:
+      if budget > 0
+      | base ++ { "thinking": { "type": "enabled", "budget_tokens": budget } }
+      | base
     let base = (if system_text == "" | base | base ++ { "system": system_text })
     if tools == []
     | base
@@ -89,6 +100,10 @@ fun stream_chat(~base_url: base_url :: String,
     resp.close()
     error("anthropic: HTTP " +& resp.status_code +& ": " +& err_body)
   def mutable content = ""
+  def mutable finish_reason = ""
+  def mutable input_tokens = 0
+  def mutable output_tokens = 0
+  def mutable cache_read = 0
   def blocks = MutableMap()  // index -> {"type", "id", "name", "arguments"}
   fun handle(_event, data :: String):
     let msg = try:
@@ -96,6 +111,23 @@ fun stream_chat(~base_url: base_url :: String,
                 ~catch _: #false
     when msg is_a Map
     | match msg.get("type", "")
+      | "message_start":
+          let u = msg.get("message", {}).get("usage", {})
+          when u is_a Map
+          | input_tokens := u.get("input_tokens", 0)
+              + u.get("cache_creation_input_tokens", 0)
+              + u.get("cache_read_input_tokens", 0)
+            cache_read := u.get("cache_read_input_tokens", 0)
+      | "message_delta":
+          let u = msg.get("usage", {})
+          when u is_a Map
+          | output_tokens := u.get("output_tokens", output_tokens)
+          match msg.get("delta", {}).get("stop_reason", #'null)
+          | "tool_use": finish_reason := "tool_calls"
+          | "end_turn": finish_reason := "stop"
+          | "max_tokens": finish_reason := "length"
+          | s :: String: finish_reason := s
+          | ~else: #void
       | "content_block_start":
           let idx = msg.get("index", 0)
           let cb = msg.get("content_block", {})
@@ -126,4 +158,7 @@ fun stream_chat(~base_url: base_url :: String,
       let b = blocks[idx]
       { "id": b["id"], "name": b["name"],
         "arguments": if b["arguments"] == "" | "{}" | b["arguments"] }
-  { "role": "assistant", "content": content, "tool_calls": tool_calls }
+  { "role": "assistant", "content": content, "tool_calls": tool_calls,
+    "finish_reason": finish_reason,
+    "usage": { "input": input_tokens, "output": output_tokens,
+               "cache_read": cache_read } }

@@ -30,14 +30,16 @@ fun do_call_provider(config, messages, tools, on_text):
                             ~model: config.model,
                             ~messages: messages,
                             ~tools: tools,
-                            ~on_text: on_text)
+                            ~on_text: on_text,
+                            ~thinking: config.thinking)
   | ~else:
       openai.stream_chat(~base_url: config.base_url(),
                          ~api_key: config.api_key(),
                          ~model: config.model,
                          ~messages: messages,
                          ~tools: tools,
-                         ~on_text: on_text)
+                         ~on_text: on_text,
+                         ~thinking: config.thinking)
 
 // Executes one full user turn. UI callbacks:
 //   on_text(delta)                     streaming assistant text

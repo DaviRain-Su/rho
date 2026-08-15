@@ -68,7 +68,8 @@ fun stream_chat(~base_url: base_url :: String,
                 ~tools: tools :: List = [],
                 ~on_text: on_text = fun (s): #void,
                 ~max_tokens: max_tokens :: Int = 8192,
-                ~thinking: thinking :: maybe(String) = #false) :: Map:
+                ~thinking: thinking :: maybe(String) = #false,
+                ~extra_headers: extra_headers :: Map = {}) :: Map:
   let (system_text, converted) = convert_messages(messages)
   let budget:
     match thinking
@@ -91,7 +92,8 @@ fun stream_chat(~base_url: base_url :: String,
     | base ++ { "tools": tools_payload(tools) }
   let resp = http.post(base_url +& "/v1/messages",
                        ~headers: { "x-api-key": api_key,
-                                   "anthropic-version": "2023-06-01" },
+                                   "anthropic-version": "2023-06-01" }
+                                   ++ extra_headers,
                        ~data: http.payload.json(body),
                        ~stream: #true,
                        ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))

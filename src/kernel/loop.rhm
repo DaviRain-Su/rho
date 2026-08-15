@@ -15,16 +15,25 @@ export:
 
 def MAX_STEPS = 40
 
-fun call_provider(config, messages, tools, on_text):
-  try:
-    do_call_provider(config, messages, tools, on_text)
-    ~catch e :: Exn.Fail:
-      // one retry for transient network errors (timeouts, resets)
-      if e.message.contains("timed out") || e.message.contains("connection")
-      | do_call_provider(config, messages, tools, on_text)
-      | throw e
+fun call_provider(config, messages, tools, on_text, ~headers: headers :: Map = {}):
+  // auto-retry with exponential backoff (settings: auto_retry / max_retries)
+  let retries:
+    if config.settings.get("auto_retry", #true) == #false
+    | 0
+    | config.settings.get("max_retries", 3)
+  recur attempt(n = 0):
+    try:
+      do_call_provider(config, messages, tools, on_text, headers)
+      ~catch e :: Exn.Fail:
+        let transient:
+          e.message.contains("timed out") || e.message.contains("connection")
+            || e.message.contains("HTTP 429") || e.message.contains("HTTP 5")
+        if transient && n < retries
+        | rkt.sleep(math.min(8, rkt.expt(2, n)))
+          attempt(n + 1)
+        | throw e
 
-fun do_call_provider(config, messages, tools, on_text):
+fun do_call_provider(config, messages, tools, on_text, headers :: Map):
   match config.kind()
   | "anthropic":
       anthropic.stream_chat(~base_url: config.base_url(),
@@ -33,7 +42,8 @@ fun do_call_provider(config, messages, tools, on_text):
                             ~messages: messages,
                             ~tools: tools,
                             ~on_text: on_text,
-                            ~thinking: config.thinking)
+                            ~thinking: config.thinking,
+                            ~extra_headers: headers)
   | ~else:
       openai.stream_chat(~base_url: config.base_url(),
                          ~api_key: config.api_key(),
@@ -41,7 +51,8 @@ fun do_call_provider(config, messages, tools, on_text):
                          ~messages: messages,
                          ~tools: tools,
                          ~on_text: on_text,
-                         ~thinking: config.thinking)
+                         ~thinking: config.thinking,
+                         ~extra_headers: headers)
 
 // Drain steering messages (sent to the current thread's mailbox by the REPL
 // while a turn runs) into the session. Returns #true if any arrived.
@@ -62,10 +73,13 @@ fun drain_steering(session, registry, on_steer):
 //   on_tool_result(name, result_str)   after a tool ran
 //   on_steer(msg)                      a queued steering message was injected
 //
-// Events emitted: agent_start/agent_end (whole turn), turn_start/turn_end
-// (each model round), before_request (may return {"messages": [...]} to
-// inject transient context), tool_call (may block), tool_execution_start/
-// tool_execution_end, tool_result, user_message.
+// Events emitted: input (may rewrite {"text"}), agent_start/agent_end/
+// agent_settled (whole turn), turn_start/turn_end (each model round),
+// before_request (may return {"messages": [...]} to inject transient
+// context), context (may rewrite the full outgoing {"messages"}),
+// before_provider_request (may return {"headers": {...}}), message_start/
+// message_update/message_end (streaming), tool_call (may block),
+// tool_execution_start/tool_execution_end, tool_result, user_message.
 fun run_turn(~config: config,
              ~registry: registry,
              ~session: session,
@@ -75,6 +89,14 @@ fun run_turn(~config: config,
              ~on_tool: on_tool = fun (name, args): #void,
              ~on_tool_result: on_tool_result = fun (name, r): #void,
              ~on_steer: on_steer = fun (s): #void):
+  // "input" may rewrite the user's text before it enters the session
+  let input:
+    match registry.emit("input", { "text": input })
+    | m :: Map:
+        match m.get("text", #false)
+        | s :: String: s
+        | ~else: input
+    | ~else: input
   session.append_message(user_message(input))
   registry.emit("user_message", { "content": input })
   registry.emit("agent_start", { "input": input })
@@ -89,7 +111,29 @@ fun run_turn(~config: config,
           if ms is_a List | ms | []
       | ~else: []
     let messages = [system_message(system_prompt)] ++ injected ++ session.messages()
-    let assistant = call_provider(config, messages, registry.tools_wire(), on_text)
+    // "context" may rewrite the outgoing message list wholesale
+    let messages:
+      match registry.emit("context", { "messages": messages })
+      | m :: Map:
+          match m.get("messages", #false)
+          | ms :: List: ms
+          | ~else: messages
+      | ~else: messages
+    // "before_provider_request" may contribute extra HTTP headers
+    let extra_headers:
+      match registry.emit("before_provider_request",
+                          { "model": config.model, "step": n })
+      | m :: Map:
+          let h = m.get("headers", {})
+          if h is_a Map | h | {}
+      | ~else: {}
+    registry.emit("message_start", { "step": n })
+    let assistant = call_provider(config, messages, registry.tools_wire(),
+                                  fun (s):
+                                    registry.emit("message_update", { "delta": s })
+                                    on_text(s),
+                                  ~headers: extra_headers)
+    registry.emit("message_end", { "message": assistant })
     session.append_message(assistant)
     let tool_calls = tool_calls_of(assistant)
     for (tc in tool_calls):
@@ -125,4 +169,5 @@ fun run_turn(~config: config,
     when tool_calls != [] || steered
     | step(n + 1)
   registry.emit("agent_end", {})
+  registry.emit("agent_settled", {})
   #void

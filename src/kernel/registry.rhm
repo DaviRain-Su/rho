@@ -99,6 +99,13 @@ class Registry(tools :: MutableMap,
       handlers[event] := (for List (entry in handlers[event]):
                             skip_when entry[0] != "builtin"
                             entry)
+    // renderers are only ever extension-contributed: rebuild from scratch
+    state["message_renderers"] := []
+    match state.get("tool_renderers", #false)
+    | mm :: MutableMap:
+        for (k in mm.keys()):
+          mm.remove(k)
+    | ~else: #void
 
 fun make_registry() :: Registry:
   Registry(MutableMap(), MutableMap(), MutableMap(), MutableMap(), "builtin",

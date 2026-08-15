@@ -33,6 +33,8 @@ export:
   push_block
   push_delta
   set_activity
+  set_widget
+  set_footer_extra
   copy_text
   default_theme
   md_line_spans
@@ -56,6 +58,23 @@ fun wake():
 
 fun set_activity(s):
   activity := s
+  dirty := #true
+  wake()
+
+// extension widgets: id -> text (may be multi-line), rendered above the
+// status row; #false removes the widget
+def mutable widgets :: Map = {}
+fun set_widget(id :: String, text):
+  widgets := (if text is_a String
+              | widgets ++ { id: text }
+              | widgets.remove(id))
+  dirty := #true
+  wake()
+
+// extension-owned suffix appended to the footer line
+def mutable footer_extra :: String = ""
+fun set_footer_extra(s :: String):
+  footer_extra := s
   dirty := #true
   wake()
 
@@ -800,8 +819,15 @@ fun run_tui(~theme: theme_in :: Map = {},
     let input_h = math.min(input_lines.length(), 8)
     let popup_h = (if ac_open && ac_items != [] | math.min(5, ac_items.length()) | 0)
     let queue_h = math.min(followups.length(), 3)
-    // rows = transcript + queue + status(1) + separator(1) + editor + popup + footer(1)
-    let trans_h = math.max(3, rows - input_h - 3 - popup_h - queue_h)
+    // extension widgets, one row per line (total capped at 4 rows)
+    let widget_lines:
+      for List:
+        each key in widgets.keys().sort()
+        each l in to_string(widgets[key]).split("\n")
+        l
+    let widget_h = math.min(widget_lines.length(), 4)
+    // rows = transcript + widgets + queue + status(1) + separator(1) + editor + popup + footer(1)
+    let trans_h = math.max(3, rows - input_h - 3 - popup_h - queue_h - widget_h)
     last_trans_h := trans_h
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
@@ -865,6 +891,12 @@ fun run_tui(~theme: theme_in :: Map = {},
         let prompt = (if i == 0 | "\u276F " | "\u2502 ")
         [[tcolor("prompt"), #false, "bold", prompt],
          [#false, #false, #false, to_string(input_lines[i])]]
+    // extension widgets above the queue/status area
+    let widget_rows:
+      for List (i in 0 .. widget_h):
+        let l = to_string(widget_lines[i])
+        let l = (if display_width(l) > cols | l.substring(0 .. cols) | l)
+        [[tcolor("notify"), #false, #false, " " +& l]]
     // queued follow-ups (Alt-Enter) shown above the status line
     let queue_rows:
       if queue_h == 0
@@ -902,16 +934,16 @@ fun run_tui(~theme: theme_in :: Map = {},
           | [[tcolor("prompt"), #false, #false, "   " +& lab],
              [tcolor("tool_result"), #false, #false, to_string(desc)]]
     // footer: always the full stats line, never overwritten by the spinner
-    let ftext = footer()
+    let ftext = footer() +& (if footer_extra == "" | "" | "  \u2502 " +& footer_extra)
     let fpad:
       let padding = math.max(0, cols - display_width(ftext))
       ftext.substring(0 .. math.min(ftext.length(), cols)) +& String.make(padding, Char" ")
     let foot = [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
-    let cursor_row = trans_h + queue_h + 2 + (cur_line - win_start)
+    let cursor_row = trans_h + widget_h + queue_h + 2 + (cur_line - win_start)
     let cursor_col = clamp(2 + display_width(cur_text().substring(0 .. cur_col)),
                            0, cols - 1)
-    term.#{term-draw!}(trans_rows ++ queue_rows ++ [status_row] ++ [sep] ++ input_rows
-                         ++ popup_rows ++ [foot],
+    term.#{term-draw!}(trans_rows ++ widget_rows ++ queue_rows ++ [status_row] ++ [sep]
+                         ++ input_rows ++ popup_rows ++ [foot],
                        [cursor_row, cursor_col])
 
   // optional render-loop profiling: RHO_TUI_DEBUG=/path/to/log

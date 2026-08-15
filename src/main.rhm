@@ -209,7 +209,9 @@ def mutable session:
                 ~fork: opts.get("fork", #false),
                 ~no_session: opts.get("no_session", #false),
                 ~name: opts.get("name", #false))
-def api = PiAPI(registry, fun (): out, fun (): session, opts.get("extra", []))
+def ui_hooks = MutableMap()
+def api = PiAPI(registry, fun (): out, fun (): session, opts.get("extra", []),
+                ui_hooks, fun (): config)
 
 fun context_section() :: String:
   if opts.get("no_context", #false)
@@ -639,11 +641,20 @@ registry.register_command(
               | session.set_name(args.trim())
                 api.notify("session named " +& args.trim()))
 
+// cancellable session lifecycle events: a handler returning
+// {"cancel": #true} aborts the operation
+fun session_event_ok(name :: String, data :: Map) :: Boolean:
+  match registry.emit(name, data)
+  | m :: Map: m.get("cancel", #false) != #true
+  | ~else: #true
+
 registry.register_command(
   ~name: "clone", ~description: "copy this session to a new file and switch to it",
   ~handler: fun (_args):
               cond
               | !(session.path is_a String): api.notify("no session file to clone")
+              | !session_event_ok("session_before_fork", { "path": session.path }):
+                  api.notify("clone cancelled by extension")
               | ~else:
                   session := start_session(~cwd: cwd(), ~resume: session.path, ~fork: #true)
                   api.notify("cloned into " +& session.path))
@@ -663,15 +674,19 @@ registry.register_command(
               cond
               | a != "":
                   cond
-                  | filesystem.file_exists(a):
+                  | !filesystem.file_exists(a): api.notify("no such session file: " +& a)
+                  | !session_event_ok("session_before_switch", { "path": a }):
+                      api.notify("switch cancelled by extension")
+                  | ~else:
                       session := start_session(~cwd: cwd(), ~resume: a)
                       api.notify("resumed " +& a)
-                  | ~else: api.notify("no such session file: " +& a)
               | ~else:
                   match pick_session()
                   | path :: String:
-                      session := start_session(~cwd: cwd(), ~resume: path)
-                      api.notify("resumed " +& path)
+                      if session_event_ok("session_before_switch", { "path": path })
+                      | session := start_session(~cwd: cwd(), ~resume: path)
+                        api.notify("resumed " +& path)
+                      | api.notify("switch cancelled by extension")
                   | ~else: api.notify("unchanged"))
 
 registry.register_command(
@@ -820,9 +835,11 @@ registry.register_command(
 registry.register_command(
   ~name: "compact", ~description: "summarize old turns to shrink context: /compact [instructions]",
   ~handler: fun (args):
-              api.notify("compacting\u2026")
-              api.notify(compaction.compact(~session: session, ~config: config,
-                                            ~instructions: args.trim())))
+              if !session_event_ok("session_before_compact", {})
+              | api.notify("compaction cancelled by extension")
+              | api.notify("compacting\u2026")
+                api.notify(compaction.compact(~session: session, ~config: config,
+                                              ~instructions: args.trim())))
 registry.register_command(
   ~name: "quit", ~description: "exit",
   ~handler: fun (_args): #'quit)
@@ -861,6 +878,8 @@ registry.register_command(
 
 fun auto_compact():
   when compaction.needs_compaction(session, config)
+      && config.settings.get("auto_compaction", #true) != #false
+      && session_event_ok("session_before_compact", { "auto": #true })
   | api.notify("context is near the window limit; compacting\u2026")
     api.notify(compaction.compact(~session: session, ~config: config))
 
@@ -1145,6 +1164,7 @@ fun tui_shell(text :: String) :: String:
   | cmd == "": "(empty command)"
   | !tool: "(bash tool unavailable)"
   | ~else:
+      registry.emit("user_bash", { "command": cmd, "to_context": double })
       let result = to_string(tool.fn({ "command": cmd }))
       when double
       | session.append_message({ "role": "user",
@@ -1245,12 +1265,23 @@ fun tui_arg_complete(cmd :: String, prefix :: String):
             [key +& " " +& c, to_string(c), ""]
   | ~else: #false
 
+// extension message renderers (register_message_renderer): first hit wins
+fun render_entry_ext(kind, text):
+  for values(found = #false) (fn in registry.state.get("message_renderers", [])):
+    found || (try:
+                fn(kind, text)
+                ~catch _: #false)
+
 fun run_tui_mode():
   // live bash output: show the latest line on the TUI status row
   set_stream_handler(fun (line):
                        let l = to_string(line)
                        let shown = (if l.length() > 60 | l.substring(0 .. 60) +& "\u2026" | l)
                        tui.set_activity("bash: " +& shown))
+  // extension UI hooks route into the TUI
+  ui_hooks["set_status"] := fun (s): tui.set_activity(s)
+  ui_hooks["set_widget"] := fun (id, text): tui.set_widget(to_string(id), text)
+  ui_hooks["set_footer"] := fun (s): tui.set_footer_extra(to_string(s))
   // route notify/command prints into the TUI transcript
   let (pin, pout) = rkt.#{make-pipe}()
   out := pout
@@ -1269,6 +1300,7 @@ fun run_tui_mode():
               ~cycle_model: cycle_model,
               ~cycle_thinking: cycle_thinking,
               ~shell_exec: tui_shell,
+              ~tool_line: render_entry_ext,
               ~commands: tui_commands,
               ~arg_complete: tui_arg_complete,
               ~editor_cmd: fun ():

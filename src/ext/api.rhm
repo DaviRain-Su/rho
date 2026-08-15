@@ -44,7 +44,9 @@ class UI(get_out):
         if n >= 1 && n <= options.length() | options[n - 1] | #false
     | ~else: #false
 
-class PiAPI(registry, get_out, get_session, extra_flags :: List):
+class PiAPI(registry, get_out, get_session, extra_flags :: List,
+            ui_hooks :: MutableMap = MutableMap(),
+            get_config = fun (): #false):
 
   method register_tool(~name: name :: String,
                        ~description: description :: String,
@@ -106,6 +108,39 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List):
           registry.state["tool_renderers"] := mm
           mm
     m[tool] := fn
+
+  // Custom rendering for transcript entries by kind (assistant, tool,
+  // notify, ...). fn(kind, text) -> maybe(String); first non-#false wins.
+  method register_message_renderer(~fn: fn):
+    registry.state["message_renderers"]
+      := registry.state.get("message_renderers", []).add(fn)
+
+  // pi alias
+  method register_entry_renderer(~fn: fn):
+    register_message_renderer(~fn: fn)
+
+  // Register a custom provider profile into the live config, e.g.
+  // {"kind": "openai", "base_url": ..., "api_key_env": ..., "default_model": ...}
+  method register_provider(~name: name :: String, ~profile: profile :: Map):
+    match get_config()
+    | #false: #void
+    | cfg: cfg.register_provider(name, profile)
+
+  // ---- TUI hooks (no-ops outside the TUI) ----
+  method set_status(s):
+    match ui_hooks.get("set_status", #false)
+    | #false: #void
+    | h: h(s)
+
+  method set_widget(id :: String, text):
+    match ui_hooks.get("set_widget", #false)
+    | #false: #void
+    | h: h(id, text)
+
+  method set_footer(s :: String):
+    match ui_hooks.get("set_footer", #false)
+    | #false: #void
+    | h: h(s)
 
   method notify(msg :: String):
     let out = get_out()

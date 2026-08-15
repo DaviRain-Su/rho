@@ -48,7 +48,8 @@ fun stream_chat(~base_url: base_url :: String,
                 ~messages: messages :: List,
                 ~tools: tools :: List = [],
                 ~on_text: on_text = fun (s): #void,
-                ~thinking: thinking :: maybe(String) = #false) :: Map:
+                ~thinking: thinking :: maybe(String) = #false,
+                ~extra_headers: extra_headers :: Map = {}) :: Map:
   let body:
     let base = { "model": model,
                  "messages": messages_payload(messages),
@@ -61,9 +62,11 @@ fun stream_chat(~base_url: base_url :: String,
   let headers:
     // identity: gzip streaming adds buffering that delays SSE deltas
     let base = { "Accept-Encoding": "identity" }
-    if api_key == ""
-    | base
-    | base ++ { "Authorization": "Bearer " +& api_key }
+    let base:
+      if api_key == ""
+      | base
+      | base ++ { "Authorization": "Bearer " +& api_key }
+    base ++ extra_headers
   let resp = http.post(base_url +& "/chat/completions",
                        ~headers: headers,
                        ~data: http.payload.json(body),

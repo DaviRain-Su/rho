@@ -1,0 +1,14 @@
+{
+  "user": "brcyan",
+  "assistant": "default",
+  "tool": "yellow",
+  "tool_result": "brblack",
+  "notify": "brblue",
+  "steer": "brmagenta",
+  "error": "brred",
+  "shell": "brgreen",
+  "sep": "brblack",
+  "footer_fg": "black",
+  "footer_bg": "brblue",
+  "prompt": "brmagenta"
+}

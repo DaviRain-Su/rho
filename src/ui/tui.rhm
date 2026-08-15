@@ -1,0 +1,467 @@
+#lang rhombus
+
+// Full-screen TUI on top of raart (via the term.rkt shim).
+//
+// Layout: transcript area / separator / multi-line editor / footer.
+// Keys: Enter submit, Ctrl-J newline, Tab path completion, Up/Down history
+// (or cursor movement in multi-line input), PgUp/PgDn scroll, Ctrl-C
+// interrupt turn (or clear input / quit), Escape interrupt, Ctrl-P cycle
+// model, Ctrl-L redraw, Ctrl-D quit.
+//
+// While a turn runs, typed lines steer (same mailbox protocol as the line
+// REPL); "/follow <msg>" queues a follow-up turn. "!cmd" runs a shell
+// command directly.
+
+import:
+  lib("racket/base.rkt") as rkt
+  "term.rkt" as term
+
+export:
+  run_tui
+  push
+  push_delta
+  default_theme
+
+// ---- shared transcript state (written by turn threads, read by render) ----
+def mutable lines :: List = []       // [kind, text] finalized lines
+def mutable partial :: String = ""   // streaming tail without newline yet
+def mutable dirty = #true
+
+fun strip_ansi(s :: String) :: String:
+  // remove \e[...m style sequences
+  recur go(rest = s, acc = ""):
+    let idx:
+      for values(found = #false) (i in 0 .. rest.length()):
+        found || (rest[i] == Char"\u001B" && i)
+    cond
+    | !idx: acc +& rest
+    | ~else:
+        let close:
+          for values(found = #false) (j in idx + 1 .. rest.length()):
+            found || ((rest[j] == Char"m") && j)
+        if close
+        | go(rest.substring(close + 1 ..), acc +& rest.substring(0 .. idx))
+        | acc +& rest.substring(0 .. idx)
+
+fun push(kind :: String, text :: String):
+  for (l in strip_ansi(text).split("\n", ~trim: #false)):
+    lines := lines.add([kind, to_string(l)])
+  dirty := #true
+
+fun push_delta(s :: String):
+  partial := partial +& s
+  recur split():
+    let idx:
+      for values(found = #false) (i in 0 .. partial.length()):
+        found || (partial[i] == Char"\n" && i)
+    when idx is_a Int
+    | lines := lines.add(["assistant", strip_ansi(partial.substring(0 .. idx))])
+      partial := partial.substring(idx + 1 ..)
+      split()
+  dirty := #true
+
+fun flush_partial():
+  when partial != ""
+  | lines := lines.add(["assistant", strip_ansi(partial)])
+    partial := ""
+    dirty := #true
+
+def default_theme :: Map:
+  { "user": "cyan", "assistant": "default", "tool": "yellow",
+    "tool_result": "brblack", "notify": "blue", "steer": "magenta",
+    "error": "red", "shell": "green", "sep": "brblack",
+    "footer_fg": "black", "footer_bg": "white", "prompt": "magenta" }
+
+// ---- helpers ----
+fun wrap_line(s :: String, w :: Int) :: List:
+  cond
+  | s == "": [""]
+  | ~else:
+      recur go(rest = s, acc :: List = []):
+        if rest.length() <= w
+        | acc.add(rest)
+        | go(rest.substring(w ..), acc.add(rest.substring(0 .. w)))
+
+fun clamp(x, lo, hi):
+  math.max(lo, math.min(x, hi))
+
+fun list_dir_safe(dir :: String) :: List:
+  if filesystem.directory_exists(dir)
+  | for List (f in filesystem.files(dir).sort()): f +& ""
+  | []
+
+// recursive fuzzy candidates for @token
+fun fuzzy_files(needle :: String) :: List:
+  def mutable count = 0
+  fun walk(dir :: String, prefix :: String) :: List:
+    cond
+    | count > 2000: []
+    | ~else:
+        for List:
+          each f in list_dir_safe(dir)
+          skip_when f == ".git" || f == "node_modules" || f == "compiled" || f == ".rho"
+          each path in (block:
+                          count := count + 1
+                          let full = (if dir == "." | f | dir +& "/" +& f)
+                          if filesystem.directory_exists(full)
+                          | walk(full, "")
+                          | [full])
+          skip_when !path.contains(needle)
+          path
+  walk(".", "")
+
+fun common_prefix(strs :: List) :: String:
+  match strs
+  | []: ""
+  | [first, & rest]:
+      for values(acc = first) (s in rest):
+        recur go(i = 0):
+          cond
+          | i >= acc.length() || i >= s.length() || acc[i] != s[i]:
+              acc.substring(0 .. i)
+          | ~else: go(i + 1)
+
+// ---- the main TUI loop ----
+fun run_tui(~theme: theme_in :: Map = {},
+            ~banner: banner :: String = "",
+            ~handle_command: handle_command,
+            ~handle_input: handle_input,
+            ~footer: footer = fun (): "rho",
+            ~cycle_model: cycle_model = fun (): "",
+            ~shell_exec: shell_exec = fun (cmd): "(no shell handler)",
+            ~tool_line: tool_line = fun (kind, text): #false):
+  let theme = default_theme ++ theme_in
+  fun tcolor(kind :: String):
+    let c = theme.get(kind, "default")
+    if c == "default" | #false | c
+
+  def mutable input_lines :: List = [""]
+  def mutable cur_line = 0
+  def mutable cur_col = 0
+  def mutable scroll = 0
+  def mutable history :: List = []
+  def mutable hist_idx = -1
+  def mutable turn_thread = #false
+  def mutable followups :: List = []
+  def mutable running = #true
+
+  when banner != ""
+  | push("notify", banner)
+
+  fun cur_text() :: String:
+    to_string(input_lines[cur_line])
+
+  fun set_cur(s :: String):
+    input_lines := input_lines.set(cur_line, s)
+
+  fun reset_input():
+    input_lines := [""]
+    cur_line := 0
+    cur_col := 0
+
+  fun insert(s :: String):
+    let t = cur_text()
+    set_cur(t.substring(0 .. cur_col) +& s +& t.substring(cur_col ..))
+    cur_col := cur_col + s.length()
+    dirty := #true
+
+  fun insert_newline():
+    let t = cur_text()
+    let before = t.substring(0 .. cur_col)
+    let after = t.substring(cur_col ..)
+    input_lines := input_lines.set(cur_line, before).insert(cur_line + 1, after)
+    cur_line := cur_line + 1
+    cur_col := 0
+    dirty := #true
+
+  fun backspace():
+    cond
+    | cur_col > 0:
+        let t = cur_text()
+        set_cur(t.substring(0 .. cur_col - 1) +& t.substring(cur_col ..))
+        cur_col := cur_col - 1
+    | cur_line > 0:
+        let prev = to_string(input_lines[cur_line - 1])
+        let t = cur_text()
+        input_lines := input_lines.set(cur_line - 1, prev +& t).delete(cur_line)
+        cur_line := cur_line - 1
+        cur_col := prev.length()
+    | ~else: #void
+    dirty := #true
+
+  fun complete():
+    // token before cursor: back to whitespace
+    let t = cur_text()
+    let start:
+      recur go(i = cur_col):
+        cond
+        | i <= 0: 0
+        | t[i - 1] == Char" ": i
+        | ~else: go(i - 1)
+    let token = t.substring(start .. cur_col)
+    let is_at = token.starts_with("@")
+    let raw = (if is_at | token.substring(1..) | token)
+    let candidates:
+      cond
+      | is_at && !raw.contains("/"):
+          fuzzy_files(raw)
+      | ~else:
+          let slash:
+            for values(found = #false) (i in 0 .. raw.length()):
+              if raw[i] == Char"/" | i | found
+          let dir = (if slash is_a Int | raw.substring(0 .. slash + 1) | "")
+          let base = (if slash is_a Int | raw.substring(slash + 1 ..) | raw)
+          for List:
+            each f in list_dir_safe(if dir == "" | "." | dir)
+            skip_when !f.starts_with(base)
+            dir +& f
+    match candidates
+    | []: push("notify", "(no completion for " +& token +& ")")
+    | [only]:
+        let full = (if is_at | "@" +& only | only)
+        let suffix = (if filesystem.directory_exists(only) | "/" | " ")
+        set_cur(t.substring(0 .. start) +& full +& suffix +& t.substring(cur_col ..))
+        cur_col := start + full.length() + suffix.length()
+    | many:
+        let shown = (for List (i in 0 .. math.min(8, many.length())): many[i])
+        push("notify", "candidates: " +& String.join(shown, "  ")
+               +& (if many.length() > 8 | " \u2026" | ""))
+        let cp = common_prefix(many)
+        when cp.length() > raw.length()
+        | let full = (if is_at | "@" +& cp | cp)
+          set_cur(t.substring(0 .. start) +& full +& t.substring(cur_col ..))
+          cur_col := start + full.length()
+    dirty := #true
+
+  fun interrupt_turn():
+    when turn_thread
+    | rkt.#{break-thread}(turn_thread)
+      rkt.#{thread-wait}(turn_thread)
+      turn_thread := #false
+      flush_partial()
+      push("notify", "[turn interrupted]")
+
+  fun start_turn(input :: String):
+    let t = rkt.thread(fun ():
+                         try:
+                           handle_input(input)
+                           ~catch:
+                           | e :: Exn.Break: push("notify", "[interrupted]")
+                           | e :: Exn.Fail: push("error", "error: " +& e.message))
+    turn_thread := t
+
+  fun submit():
+    let text = String.join(input_lines, "\n").trim()
+    reset_input()
+    dirty := #true
+    scroll := 0
+    when text != ""
+    | history := history.add(text)
+      hist_idx := -1
+      cond
+      | turn_thread:
+          cond
+          | text.starts_with("/follow"):
+              let msg = text.substring(7..).trim()
+              if msg == ""
+              | push("notify", "[usage: /follow <message>]")
+              | followups := followups.add(msg)
+                push("notify", "[follow-up queued]")
+          | text.starts_with("/"):
+              push("notify", "[commands can't run during a turn; plain text steers]")
+          | ~else:
+              rkt.#{thread-send}(turn_thread, text)
+              push("steer", "\u21AA steering: " +& text)
+      | text == "/quit" || text == "/exit":
+          running := #false
+      | text.starts_with("/follow"):
+          let msg = text.substring(7..).trim()
+          when msg != ""
+          | push("user", "\u276F " +& msg)
+            start_turn(msg)
+      | text.starts_with("/"):
+          push("user", "\u276F " +& text)
+          let parts = text.substring(1..).split(" ")
+          let name = (if parts == [] | "" | to_string(parts[0]))
+          let args = (if parts.length() > 1 | String.join(parts.rest, " ") | "")
+          let r = try:
+                    handle_command(name, args)
+                    ~catch e :: Exn.Fail:
+                      push("error", "error: " +& e.message)
+                      #void
+          when r == #'quit
+          | running := #false
+      | text.starts_with("!"):
+          push("user", "\u276F " +& text)
+          let cmd = text
+          rkt.thread(fun ():
+                       let r = try:
+                                 shell_exec(cmd)
+                                 ~catch e :: Exn.Fail: "error: " +& e.message
+                       push("shell", to_string(r)))
+      | ~else:
+          push("user", "\u276F " +& text)
+          start_turn(text)
+
+  fun handle_key(k :: String):
+    cond
+    | k == "C-M": submit()
+    | k == "C-J": insert_newline()
+    | k == "C-I": complete()
+    | k == "<backspace>" || k == "C-H": backspace()
+    | k == "<delete>":
+        let t = cur_text()
+        when cur_col < t.length()
+        | set_cur(t.substring(0 .. cur_col) +& t.substring(cur_col + 1 ..))
+          dirty := #true
+    | k == "<left>":
+        cur_col := clamp(cur_col - 1, 0, cur_text().length())
+        dirty := #true
+    | k == "<right>":
+        cur_col := clamp(cur_col + 1, 0, cur_text().length())
+        dirty := #true
+    | k == "<home>" || k == "C-A":
+        cur_col := 0
+        dirty := #true
+    | k == "<end>" || k == "C-E":
+        cur_col := cur_text().length()
+        dirty := #true
+    | k == "<up>":
+        cond
+        | input_lines.length() > 1 && cur_line > 0:
+            cur_line := cur_line - 1
+            cur_col := math.min(cur_col, cur_text().length())
+        | history != []:
+            hist_idx := (if hist_idx == -1 | history.length() - 1 | math.max(0, hist_idx - 1))
+            input_lines := [to_string(history[hist_idx])]
+            cur_line := 0
+            cur_col := cur_text().length()
+        | ~else: #void
+        dirty := #true
+    | k == "<down>":
+        cond
+        | input_lines.length() > 1 && cur_line < input_lines.length() - 1:
+            cur_line := cur_line + 1
+            cur_col := math.min(cur_col, cur_text().length())
+        | hist_idx != -1:
+            if hist_idx < history.length() - 1
+            | hist_idx := hist_idx + 1
+              input_lines := [to_string(history[hist_idx])]
+            | hist_idx := -1
+              input_lines := [""]
+            cur_line := 0
+            cur_col := cur_text().length()
+        | ~else: #void
+        dirty := #true
+    | k == "<page-up>":
+        scroll := scroll + 10
+        dirty := #true
+    | k == "<page-down>":
+        scroll := math.max(0, scroll - 10)
+        dirty := #true
+    | k == "C-C":
+        cond
+        | turn_thread: interrupt_turn()
+        | String.join(input_lines, "") != "": reset_input()
+                                              dirty := #true
+        | ~else: running := #false
+    | k == "<escape>" || k == "C-[": interrupt_turn()
+    | k == "C-P":
+        let msg = cycle_model()
+        when msg != "" | push("notify", msg)
+    | k == "C-L": dirty := #true
+    | k == "C-D":
+        when String.join(input_lines, "") == ""
+        | running := #false
+    | k == "C-U":
+        set_cur("")
+        cur_col := 0
+        dirty := #true
+    | k.length() == 1: insert(k)
+    | ~else: #void
+
+  fun render():
+    let rows = term.#{term-rows}()
+    let cols = term.#{term-cols}()
+    let input_h = math.min(input_lines.length(), 8)
+    let trans_h = math.max(3, rows - input_h - 2)
+    // wrap transcript (including streaming tail)
+    let all_lines = (if partial == "" | lines | lines.add(["assistant", partial]))
+    let wrapped:
+      for List:
+        each entry in all_lines
+        let [kind, text] = entry
+        let shown = tool_line(kind, text) || text
+        each piece in wrap_line(to_string(shown), cols)
+        [kind, piece]
+    let max_scroll = math.max(0, wrapped.length() - trans_h)
+    let off = clamp(scroll, 0, max_scroll)
+    scroll := off
+    let first = math.max(0, wrapped.length() - trans_h - off)
+    let visible:
+      for List (i in first .. math.min(wrapped.length(), first + trans_h)):
+        wrapped[i]
+    let trans_rows:
+      let real:
+        for List (entry in visible):
+          let [kind, text] = entry
+          [[tcolor(kind), #false, #false, text]]
+      let pad:
+        for List (i in 0 .. trans_h - visible.length()):
+          [[#false, #false, #false, ""]]
+      real ++ pad
+    // separator
+    let sep = [[tcolor("sep"), #false, #false,
+                String.make(cols, Char"\u2500")]]
+    // editor window containing the cursor
+    let win_start = clamp(cur_line - input_h + 1, 0, math.max(0, input_lines.length() - input_h))
+    let input_rows:
+      for List (i in win_start .. math.min(input_lines.length(), win_start + input_h)):
+        let prompt = (if i == 0 | "\u276F " | "\u2502 ")
+        [[tcolor("prompt"), #false, "bold", prompt],
+         [#false, #false, #false, to_string(input_lines[i])]]
+    // footer
+    let ftext = footer() +& (if turn_thread | "  [working\u2026 type to steer]" | "")
+    let fpad:
+      let padding = math.max(0, cols - ftext.length())
+      ftext.substring(0 .. math.min(ftext.length(), cols)) +& String.make(padding, Char" ")
+    let foot = [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
+    let cursor_row = trans_h + 1 + (cur_line - win_start)
+    let cursor_col = clamp(2 + cur_col, 0, cols - 1)
+    term.#{term-draw!}(trans_rows ++ [sep] ++ input_rows ++ [foot],
+                       [cursor_row, cursor_col])
+    dirty := #false
+
+  // main loop
+  term.#{term-start!}()
+  try:
+    recur loop():
+      when running
+      | // reap finished turn
+        when turn_thread && rkt.#{thread-dead?}(turn_thread)
+        | turn_thread := #false
+          flush_partial()
+          match followups
+          | []: #void
+          | [next, & rest]:
+              followups := rest
+              push("user", "\u276F " +& next +& "  (follow-up)")
+              start_turn(next)
+        when dirty
+        | render()
+        let e = term.#{term-wait-event}(if turn_thread | 0.08 | 0.5)
+        match e
+        | #'timeout: #void
+        | #'eof: running := #false
+        | [#'resize, _, _]: dirty := #true
+        | [#'key, k]:
+            try:
+              handle_key(to_string(k))
+              ~catch ex :: Exn.Fail:
+                push("error", "ui error: " +& ex.message)
+        | ~else: #void
+        loop()
+    ~catch e :: Exn.Break:
+      when turn_thread
+      | rkt.#{break-thread}(turn_thread)
+  term.#{term-stop!}()

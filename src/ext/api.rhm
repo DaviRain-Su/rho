@@ -20,8 +20,9 @@ fun read_reply() :: String:
     | ~else: ""
   | to_string(rkt.#{thread-receive}()).trim()
 
-class UI(out):
+class UI(get_out):
   method input(prompt :: String) :: String:
+    let out = get_out()
     out.write_string("\u001B[36m? " +& prompt +& "\u001B[0m ")
     out.flush()
     read_reply()
@@ -32,6 +33,7 @@ class UI(out):
 
   // Returns the chosen element of options, or #false.
   method select(prompt :: String, options :: List):
+    let out = get_out()
     out.write_string("\u001B[36m? " +& prompt +& "\u001B[0m\n")
     for (i in 0 .. options.length()):
       out.write_string("  " +& (i + 1) +& ". " +& options[i] +& "\n")
@@ -42,7 +44,7 @@ class UI(out):
         if n >= 1 && n <= options.length() | options[n - 1] | #false
     | ~else: #false
 
-class PiAPI(registry, out, get_session, extra_flags :: List):
+class PiAPI(registry, get_out, get_session, extra_flags :: List):
 
   method register_tool(~name: name :: String,
                        ~description: description :: String,
@@ -65,7 +67,7 @@ class PiAPI(registry, out, get_session, extra_flags :: List):
     registry.state
 
   property ui :: UI:
-    UI(out)
+    UI(get_out)
 
   property session:
     get_session()
@@ -93,6 +95,19 @@ class PiAPI(registry, out, get_session, extra_flags :: List):
                        ~description: _description :: String = ""):
     flag(name)
 
+  // Custom transcript rendering for a tool (used by the TUI).
+  // fn(phase, name, data) -> maybe(String); phase is "call" or "result".
+  method register_renderer(~tool: tool :: String, ~fn: fn):
+    let m:
+      match registry.state.get("tool_renderers", #false)
+      | mm :: MutableMap: mm
+      | ~else:
+          let mm = MutableMap()
+          registry.state["tool_renderers"] := mm
+          mm
+    m[tool] := fn
+
   method notify(msg :: String):
+    let out = get_out()
     out.write_string("\u001B[36m[rho]\u001B[0m " +& msg +& "\n")
     out.flush()

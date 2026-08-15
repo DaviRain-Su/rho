@@ -35,8 +35,9 @@ import:
   "ext/api.rhm" open
   "ext/loader.rhm" as loader
   "ui/repl.rhm" open
+  "ui/tui.rhm" as tui
 
-def out = Port.Output.current()
+def mutable out = Port.Output.current()
 
 // ---- command line ----
 fun split_list(v :: String) :: List:
@@ -64,6 +65,8 @@ fun parse_args() :: Map:
     | ["--name", v, & more]: parse(more, acc ++ { "name": v })
     | ["--thinking", v, & more]: parse(more, acc ++ { "thinking": v })
     | ["--list-models", & more]: parse(more, acc ++ { "list_models": #true })
+    | ["--theme", v, & more]: parse(more, acc ++ { "theme": v })
+    | ["--tui-mode", v, & more]: parse(more, acc ++ { "tui_mode": v })
     | ["--tools", v, & more]: parse(more, acc ++ { "tools": split_list(v) })
     | ["--exclude-tools", v, & more]: parse(more, acc ++ { "exclude_tools": split_list(v) })
     | ["--no-tools", & more]: parse(more, acc ++ { "no_tools": #true })
@@ -138,7 +141,7 @@ def mutable session:
                 ~fork: opts.get("fork", #false),
                 ~no_session: opts.get("no_session", #false),
                 ~name: opts.get("name", #false))
-def api = PiAPI(registry, out, fun (): session, opts.get("extra", []))
+def api = PiAPI(registry, fun (): out, fun (): session, opts.get("extra", []))
 
 fun context_section() :: String:
   if opts.get("no_context", #false)
@@ -603,6 +606,118 @@ fun run_headless():
                 "session": (if session.path is_a String | session.path | "") })
   | out.write_string("\n")
 
+// ---- TUI mode ----
+fun load_theme() :: Map:
+  match opts.get("theme", config.settings.get("theme", #false))
+  | name :: String:
+      let path = config_dir() +& "/themes/" +& name +& ".json"
+      if filesystem.file_exists(path)
+      | let parsed = try:
+                       json.from_string(filesystem.read_string(path))
+                       ~catch _: {}
+        if parsed is_a Map | parsed | {}
+      | (block:
+           println("warning: theme not found: " +& path)
+           {})
+  | ~else: {}
+
+fun renderer_for(name :: String):
+  match registry.state.get("tool_renderers", #false)
+  | m :: MutableMap: m.get(name, #false)
+  | ~else: #false
+
+fun render_tool(phase :: String, name :: String, data) :: maybe(String):
+  let fn = renderer_for(name)
+  if fn
+  | try:
+      let r = fn(phase, name, data)
+      if r is_a String | r | #false
+      ~catch _: #false
+  | #false
+
+fun tui_footer() :: String:
+  let t = usage_totals()
+  " " +& cwd() +& "  \u2502 " +& config.provider +& "/" +& config.model
+    +& "  \u2502 tok " +& t["input"] +& "/" +& t["output"]
+    +& " $" +& round2(t["cost"])
+    +& (if session.name == "" | "" | "  \u2502 " +& session.name)
+
+def provider_ring = ["kimi", "kimi-anthropic", "openai", "anthropic", "openrouter", "ollama"]
+
+fun cycle_model() :: String:
+  let avail:
+    for List (p in provider_ring):
+      skip_when !config.providers.has_key(p)
+      p
+  let idx:
+    for values(found = 0) (i in 0 .. avail.length()):
+      if avail[i] == config.provider | i | found
+  let next = avail[(idx + 1) mod avail.length()]
+  config.provider := next
+  config.model := config.providers[next].get("default_model", config.model)
+  "model: " +& config.provider +& "/" +& config.model
+
+fun tui_shell(text :: String) :: String:
+  let double = text.starts_with("!!")
+  let cmd = text.substring(if double | 2 | 1 ..).trim()
+  let tool = registry.tools.get("bash", #false)
+  cond
+  | cmd == "": "(empty command)"
+  | !tool: "(bash tool unavailable)"
+  | ~else:
+      let result = to_string(tool.fn({ "command": cmd }))
+      when double
+      | session.append_message({ "role": "user",
+                                 "content": "I ran `" +& cmd +& "` and got:\n" +& result })
+      result
+
+fun handle_input_tui(input :: String):
+  run_turn(~config: config,
+           ~registry: registry,
+           ~session: session,
+           ~system_prompt: system_prompt(),
+           ~input: input,
+           ~on_text: fun (s): tui.push_delta(s),
+           ~on_tool: fun (name, args):
+                       tui.push("tool",
+                                render_tool("call", name, args)
+                                  || "\u25CF " +& name +& " " +& summarize(args)),
+           ~on_tool_result: fun (name, r):
+                              tui.push("tool_result",
+                                       render_tool("result", name, r)
+                                         || "  \u21B3 " +& first_line(r)))
+  auto_compact()
+
+registry.register_command(
+  ~name: "hotkeys", ~description: "list TUI keyboard shortcuts",
+  ~handler: fun (_args):
+              out.write_string("Enter submit \u00B7 Ctrl-J newline \u00B7 Tab complete path (@token fuzzy)\n"
+                                 +& "Up/Down history or cursor \u00B7 PgUp/PgDn scroll \u00B7 Ctrl-C interrupt/clear/quit\n"
+                                 +& "Esc interrupt turn \u00B7 Ctrl-P cycle provider \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
+                                 +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"))
+
+fun run_tui_mode():
+  // route notify/command prints into the TUI transcript
+  let (pin, pout) = rkt.#{make-pipe}()
+  out := pout
+  rkt.thread(fun ():
+               recur go():
+                 match rkt.#{read-line}(pin, #'any)
+                 | s :: ReadableString:
+                     tui.push("notify", to_string(s))
+                     go()
+                 | ~else: #void)
+  tui.run_tui(~theme: load_theme(),
+              ~banner: banner +& "TUI: /hotkeys for keys, /help for commands\n",
+              ~handle_command: handle_command,
+              ~handle_input: handle_input_tui,
+              ~footer: tui_footer,
+              ~cycle_model: cycle_model,
+              ~shell_exec: tui_shell)
+
+fun stdin_is_tty():
+  rkt.#{terminal-port?}(rkt.#{current-input-port}())
+
 module main:
   cond
   | opts.get("list_models", #false):
@@ -611,8 +726,12 @@ module main:
       apply_tool_filters()
       when !opts.get("no_extensions", #false)
       | do_reload(#false)
-      if headless
-      | run_headless()
-      | run_repl(~banner: banner,
-                 ~handle_command: handle_command,
-                 ~handle_input: handle_input)
+      let tui_mode = opts.get("tui_mode", config.settings.get("tui_mode", "tui"))
+      cond
+      | headless: run_headless()
+      | tui_mode == "tui" && stdin_is_tty():
+          run_tui_mode()
+      | ~else:
+          run_repl(~banner: banner,
+                   ~handle_command: handle_command,
+                   ~handle_input: handle_input)

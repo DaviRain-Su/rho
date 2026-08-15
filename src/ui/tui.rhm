@@ -445,11 +445,19 @@ fun run_tui(~theme: theme_in :: Map = {},
         dirty := #true
     | ac_open && k == "C-I":
         apply_ac()
+        update_ac()  // completing "/model " immediately shows its argument menu
     | ac_open && k == "C-M":
-        // pi behavior: Enter on the slash menu picks the command and submits
-        let was_slash = (ac_kind == #'slash)
+        // Enter picks the highlighted item. For a slash command with argument
+        // completions (e.g. /model), open the argument menu so the user can
+        // keep selecting; otherwise submit right away (pi behavior).
+        let kind = ac_kind
         apply_ac()
-        when was_slash | submit()
+        match kind
+        | #'slash:
+            update_ac()
+            when !ac_open | submit()
+        | #'arg: submit()
+        | ~else: #void
     | ac_open && (k == "<escape>" || k == "C-["):
         close_ac()
     | ~else:

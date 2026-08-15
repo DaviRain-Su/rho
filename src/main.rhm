@@ -31,6 +31,7 @@ import:
   "kernel/skills.rhm" as skills
   "kernel/prompts.rhm" as prompts
   "kernel/packages.rhm" as packages
+  "kernel/settings.rhm" as settings
   "kernel/trust.rhm" as trust
   "ai/models.rhm" as models
   "ai/modelsdev.rhm" as modelsdev
@@ -77,6 +78,7 @@ fun parse_args() :: Map:
     | ["--system-prompt", v, & more]: parse(more, acc ++ { "system_prompt": v })
     | ["--append-system-prompt", v, & more]: parse(more, acc ++ { "append_system_prompt": v })
     | ["--no-context-files", & more]: parse(more, acc ++ { "no_context": #true })
+    | ["--session-dir", v, & more]: parse(more, acc ++ { "session_dir": v })
     | ["--no-extensions", & more]: parse(more, acc ++ { "no_extensions": #true })
     | [a, & more]:
         cond
@@ -109,6 +111,33 @@ fun cwd() :: String:
   if s.length() > 1 && s.substring(s.length() - 1 ..) == "/"
   | s.substring(0 .. s.length() - 1)
   | s
+
+// ---- settings (pi-style): global + project files, project needs trust ----
+fun apply_settings():
+  config.settings := config.settings ++ settings.all()
+  // defaults for anything the CLI didn't pin down
+  when !opts.get("provider", #false)
+  | match settings.get("default_provider", #false)
+    | p :: String:
+        when config.providers.get(p, #false)
+        | config.provider := p
+          when !opts.get("model", #false) && settings.get("default_model", #false) == #false
+          | config.model := config.profile().get("default_model", config.model)
+    | ~else: #void
+  when !opts.get("model", #false)
+  | match settings.get("default_model", #false)
+    | m :: String: config.model := m
+    | ~else: #void
+  when !opts.get("thinking", #false) && config.thinking == #false
+  | match settings.get("default_thinking", #false)
+    | t :: String: config.thinking := t
+    | ~else: #void
+  match opts.get("session_dir", settings.get("session_dir", #false))
+  | d :: String: set_sessions_dir(d)
+  | ~else: #void
+
+settings.reload(~include_project: trust.trust_status(cwd()) == #'trusted)
+apply_settings()
 
 fun read_stdin_line() :: String:
   match rkt.#{read-line}()
@@ -219,10 +248,14 @@ fun apply_tool_filters():
       registry.set_tool_filter(~allow: [])
   | ~else:
       let allow = opts.get("tools", #false)
+      let enabled = settings.get("default_tools", [])
       let default_deny:
-        if allow is_a List
-        | []          // explicit allowlist: user decides
-        | optin_tools
+        cond
+        | allow is_a List: []      // explicit allowlist: user decides
+        | ~else:
+            for List (t in optin_tools):
+              skip_when enabled is_a List && enabled.contains(t)
+              t
       registry.set_tool_filter(~allow: allow,
                                ~deny: opts.get("exclude_tools", []) ++ default_deny)
 
@@ -236,12 +269,79 @@ fun show_help(_args):
     out.write_string("  " +& t.name +& " [" +& t.source +& "]\n")
 
 fun do_reload(notify = #true):
+  settings.reload(~include_project: project_trusted)
+  apply_settings()
   let [ok, failed] = loader.load_extensions(registry, api,
                                             ~notify: fun (s): api.notify(s),
                                             ~extra_dirs: packages.package_extension_dirs(),
                                             ~include_project: project_trusted)
   when notify
   | api.notify("extensions: " +& ok +& " loaded, " +& failed +& " failed")
+
+// ---- /settings: list, show, set (persisted to ~/.rho/settings.json) ----
+fun settings_value_str(key :: String) :: String:
+  match settings.get(key, #false)
+  | #false: "(unset)"
+  | #true: "true"
+  | l :: List: String.join((for List (x in l): to_string(x)), ",")
+  | v: to_string(v)
+
+// returns [#'ok, value] or [#'err, message]
+fun parse_setting(key :: String, raw :: String) :: List:
+  let spec = settings.known_keys.get(key, #false)
+  let kind = (if spec is_a List | spec[1] | "string")
+  cond
+  | kind == "int":
+      match String.maybe_to_int(raw)
+      | n :: Int: [#'ok, n]
+      | ~else: [#'err, key +& " expects a number"]
+  | kind == "bool":
+      cond
+      | ["true", "on", "yes", "1"].contains(raw.foldcase()): [#'ok, #true]
+      | ["false", "off", "no", "0"].contains(raw.foldcase()): [#'ok, #false]
+      | ~else: [#'err, key +& " expects true/false"]
+  | kind == "list":
+      [#'ok,
+       for List (s in raw.split(",")):
+         skip_when s.trim() == ""
+         s.trim()]
+  | kind is_a List:
+      if kind.contains(raw)
+      | [#'ok, raw]
+      | [#'err, key +& " expects one of " +& String.join(kind, "|")]
+  | ~else: [#'ok, raw]
+
+registry.register_command(
+  ~name: "settings",
+  ~description: "show or change settings: /settings [key [value]]",
+  ~handler: fun (args):
+              let parts = args.trim().split(" ")
+              cond
+              | args.trim() == "":
+                  for (key in settings.known_keys.keys().sort()):
+                    let [desc, _] = settings.known_keys[key]
+                    out.write_string("  " +& key +& " = " +& settings_value_str(key)
+                                       +& "  \u2014 " +& desc +& "\n")
+              | parts.length() == 1:
+                  let key = to_string(parts[0])
+                  match settings.known_keys.get(key, #false)
+                  | [desc, _]:
+                      api.notify(key +& " = " +& settings_value_str(key) +& "  \u2014 " +& desc)
+                  | ~else: api.notify("unknown setting: " +& key)
+              | ~else:
+                  let key = to_string(parts[0])
+                  let raw = String.join(parts.rest, " ").trim()
+                  cond
+                  | settings.known_keys.get(key, #false) == #false:
+                      api.notify("unknown setting: " +& key)
+                  | ~else:
+                      match parse_setting(key, raw)
+                      | [#'err, msg]: api.notify("error: " +& msg)
+                      | [#'ok, v]:
+                          settings.set_global(key, v)
+                          apply_settings()
+                          apply_tool_filters()
+                          api.notify(key +& " = " +& settings_value_str(key)))
 
 registry.register_command(
   ~name: "help", ~description: "list commands and tools",
@@ -700,15 +800,17 @@ fun first_line(s :: String) :: String:
   | ~else: to_string(lines[0]) +& " \u2026"
 
 def banner:
-  color("1;35", "rho") +& " \u2014 hot-reloadable Rhombus coding agent\n"
-    +& "provider=" +& config.provider +& " model=" +& config.model
-    +& " ctx-window=" +& models.model_info(config.model)["context_window"] +& "\n"
-    +& "session=" +& (if session.path is_a String | session.path | "(none)")
-    +& (if session.entries.length() > 1
-        | " (" +& session.entries.length() +& " entries resumed)"
-        | "")
-    +& "\n"
-    +& "type /help for commands\n\n"
+  if settings.get("quiet_startup", #false) == #true
+  | ""
+  | color("1;35", "rho") +& " \u2014 hot-reloadable Rhombus coding agent\n"
+      +& "provider=" +& config.provider +& " model=" +& config.model
+      +& " ctx-window=" +& models.model_info(config.model)["context_window"] +& "\n"
+      +& "session=" +& (if session.path is_a String | session.path | "(none)")
+      +& (if session.entries.length() > 1
+          | " (" +& session.entries.length() +& " entries resumed)"
+          | "")
+      +& "\n"
+      +& "type /help for commands\n\n"
 
 // ---- headless mode ----
 fun emit_json(m :: Map):
@@ -881,6 +983,29 @@ fun tui_arg_complete(cmd :: String, prefix :: String):
         let [pname, mdls] = group
         skip_when !pname.foldcase().contains(lp)
         [pname, pname, mdls.keys().length() +& " models"]
+  | cmd == "settings":
+      let parts = prefix.split(" ")
+      cond
+      | parts.length() <= 1:
+          let lp = prefix.foldcase()
+          for List:
+            each key in settings.known_keys.keys().sort()
+            skip_when !key.foldcase().contains(lp)
+            let [desc, _] = settings.known_keys[key]
+            [to_string(key), to_string(key), to_string(desc)]
+      | ~else:
+          let key = to_string(parts[0])
+          let vp = to_string(parts[parts.length() - 1]).foldcase()
+          let spec = settings.known_keys.get(key, #false)
+          let choices:
+            match (if spec is_a List | spec[1] | #false)
+            | l :: List: l
+            | "bool": ["true", "false"]
+            | ~else: []
+          for List:
+            each c in choices
+            skip_when !to_string(c).foldcase().starts_with(vp)
+            [key +& " " +& c, to_string(c), ""]
   | ~else: #false
 
 fun run_tui_mode():
@@ -936,6 +1061,10 @@ fun ensure_trust() :: Boolean:
 
 fun init_trust():
   project_trusted := ensure_trust()
+  // a just-approved project unlocks its .rho/settings.json
+  when project_trusted
+  | settings.reload(~include_project: #true)
+    apply_settings()
 
 // ---- RPC mode: JSON lines over stdin/stdout ----
 fun run_rpc():

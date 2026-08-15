@@ -1,0 +1,78 @@
+#lang rhombus
+
+// pi-style settings: global ~/.rho/settings.json merged with project
+// .rho/settings.json (project wins; only loaded for trusted projects).
+// Keybindings live in a separate ~/.rho/keybindings.json mapping
+// action names to key strings (as reported by the TUI, e.g. "C-G").
+
+import:
+  json
+  "config.rhm" as config
+
+export:
+  reload
+  all
+  get
+  set_global
+  known_keys
+  keybinding
+
+def mutable global_map :: Map = {}
+def mutable project_map :: Map = {}
+def mutable keys_map :: Map = {}
+
+fun global_path() :: String:
+  config.config_dir() +& "/settings.json"
+
+fun project_path() :: String:
+  ".rho/settings.json"
+
+fun keybindings_path() :: String:
+  config.config_dir() +& "/keybindings.json"
+
+fun read_json(path :: String) :: Map:
+  if filesystem.file_exists(path)
+  | let parsed = try:
+                   json.from_string(filesystem.read_string(path))
+                   ~catch _: {}
+    if parsed is_a Map | parsed | {}
+  | {}
+
+fun reload(~include_project: include_project = #true):
+  global_map := read_json(global_path())
+  project_map := (if include_project | read_json(project_path()) | {})
+  keys_map := read_json(keybindings_path())
+
+fun all() :: Map:
+  global_map ++ project_map
+
+fun get(key :: String, default):
+  all().get(key, default)
+
+fun set_global(key :: String, v):
+  global_map := global_map ++ { key: v }
+  when !filesystem.directory_exists(config.config_dir())
+  | filesystem.make_directory(config.config_dir(), ~parents: #true)
+  filesystem.write_string(global_path(), json.to_string(global_map),
+                          ~exists: #'truncate)
+
+fun keybinding(action :: String, default :: String) :: String:
+  to_string(keys_map.get(action, default))
+
+// key -> [description, kind]; kind: "string" | "int" | "bool" | enum list
+def known_keys :: Map:
+  { "default_provider": ["provider used when none is given", "string"],
+    "default_model": ["model used when none is given", "string"],
+    "default_thinking": ["thinking level", ["off", "low", "medium", "high"]],
+    "theme": ["TUI theme name (~/.rho/themes/<name>.json)", "string"],
+    "quiet_startup": ["suppress the startup banner", "bool"],
+    "external_editor": ["editor command for Ctrl-G (falls back to $VISUAL/$EDITOR)", "string"],
+    "default_tools": ["extra tools enabled by default (grep,find,ls)", "list"],
+    "session_dir": ["directory for session files", "string"],
+    "reserve_tokens": ["compaction trigger reserve (default 16384)", "int"],
+    "keep_recent_tokens": ["tokens kept after compaction (default 20000)", "int"],
+    "auto_compaction": ["compact automatically near the context limit", "bool"],
+    "steering_mode": ["steering delivery", ["all", "one-at-a-time"]],
+    "followup_mode": ["follow-up delivery", ["all", "one-at-a-time"]],
+    "auto_retry": ["retry failed provider requests", "bool"],
+    "max_retries": ["max auto-retry attempts (default 3)", "int"] }

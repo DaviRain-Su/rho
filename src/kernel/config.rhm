@@ -12,6 +12,7 @@ export:
   load_config
   config_dir
   sessions_dir
+  set_sessions_dir
   global_extensions_dir
   project_extensions_dir
 
@@ -21,8 +22,16 @@ fun home() :: String:
 fun config_dir() :: String:
   home() +& "/.rho"
 
+// overridable via --session-dir or the session_dir setting
+def mutable sessions_dir_override = #false
+
+fun set_sessions_dir(d :: String):
+  sessions_dir_override := d
+
 fun sessions_dir() :: String:
-  config_dir() +& "/sessions"
+  if sessions_dir_override is_a String
+  | sessions_dir_override
+  | config_dir() +& "/sessions"
 
 fun global_extensions_dir() :: String:
   config_dir() +& "/extensions"
@@ -34,7 +43,7 @@ class Config(mutable provider :: String,
              mutable model :: String,
              mutable providers :: Map,
              mutable thinking,
-             settings :: Map):
+             mutable settings :: Map):
   method profile() :: Map:
     providers.get(provider, {})
   method register_provider(name :: String, prof :: Map):

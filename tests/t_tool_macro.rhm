@@ -5,7 +5,7 @@ import:
   "../src/ext/api.rhm" open
 
 def reg = make_registry()
-def api = PiAPI(reg, Port.Output.current())
+def api = PiAPI(reg, fun (): Port.Output.current(), fun (): #false, [])
 
 tool api shout(text :: String) ~desc "Uppercase with bangs":
   String.upcase(text) +& "!!!"

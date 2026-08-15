@@ -1,0 +1,91 @@
+#lang rhombus
+
+// Package management: git repos cloned into ~/.rho/packages/<name>.
+// A package's extensions/, skills/ and prompts/ directories automatically
+// join the discovery paths.
+
+import:
+  rhombus/subprocess
+  lib("racket/file.rkt") as rktfile
+  "config.rhm"
+
+export:
+  packages_dir
+  install
+  remove
+  installed
+  package_extension_dirs
+  package_skill_dirs
+  package_prompt_dirs
+
+fun packages_dir() :: String:
+  config.config_dir() +& "/packages"
+
+fun installed() :: List:
+  let dir = packages_dir()
+  if filesystem.directory_exists(dir)
+  | for List (f in filesystem.files(dir).sort()):
+      skip_when !filesystem.directory_exists(dir +& "/" +& (f +& ""))
+      f +& ""
+  | []
+
+// Accepts "git:<url>", a plain URL, or "owner/repo" GitHub shorthand.
+fun resolve_url(spec :: String) :: String:
+  cond
+  | spec.starts_with("git:"): spec.substring(4..)
+  | spec.starts_with("http://") || spec.starts_with("https://")
+      || spec.starts_with("git@"):
+      spec
+  | ~else: "https://github.com/" +& spec
+
+fun name_of(url :: String) :: String:
+  let parts = url.split("/")
+  let last = to_string(parts[parts.length() - 1])
+  if last.ends_with(".git") | last.substring(0 .. last.length() - 4) | last
+
+fun install(spec :: String) :: String:
+  let url = resolve_url(spec)
+  let name = name_of(url)
+  let dest = packages_dir() +& "/" +& name
+  cond
+  | filesystem.directory_exists(dest):
+      "already installed: " +& name +& " (rho remove " +& name +& " first)"
+  | ~else:
+      when !filesystem.directory_exists(packages_dir())
+      | filesystem.make_directory(packages_dir(), ~parents: #true)
+      let sp = subprocess.run_shell("git clone --depth 1 "
+                                      +& "'" +& url +& "' '" +& dest +& "' 2>&1",
+                                    ~in: Port.Input.open_string(""),
+                                    ~out: #'pipe)
+      let buf = Port.Output.open_string()
+      sp.out.copy_to(buf)
+      let code = sp.wait()
+      if code == 0
+      | "installed " +& name +& " -> " +& dest
+      | "install failed (exit " +& code +& "):\n" +& buf.get_string()
+
+fun remove(name :: String) :: String:
+  let dest = packages_dir() +& "/" +& name
+  cond
+  | name == "" || name.contains("/") || name.contains(".."):
+      "invalid package name: " +& name
+  | !filesystem.directory_exists(dest):
+      "not installed: " +& name
+  | ~else:
+      rktfile.#{delete-directory/files}(Path(dest))
+      "removed " +& name
+
+fun subdirs_of(kind :: String) :: List:
+  for List (name in installed()):
+    let d = packages_dir() +& "/" +& name +& "/" +& kind
+    skip_when !filesystem.directory_exists(d)
+    d
+
+fun package_extension_dirs() :: List:
+  subdirs_of("extensions")
+
+fun package_skill_dirs() :: List:
+  subdirs_of("skills")
+
+fun package_prompt_dirs() :: List:
+  subdirs_of("prompts")

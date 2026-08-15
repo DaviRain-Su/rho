@@ -30,6 +30,8 @@ import:
   "kernel/compaction.rhm" as compaction
   "kernel/skills.rhm" as skills
   "kernel/prompts.rhm" as prompts
+  "kernel/packages.rhm" as packages
+  "kernel/trust.rhm" as trust
   "ai/models.rhm" as models
   "tools/core.rhm" open
   "ext/api.rhm" open
@@ -90,8 +92,10 @@ fun parse_args() :: Map:
             parse(more, acc ++ { "message": acc["message"].add(a) })
 
 def opts = parse_args()
-def headless = opts.get("print", #false) || opts.get("mode", "text") == "json"
+def rpc_mode = opts.get("mode", "text") == "rpc"
+def headless = opts.get("print", #false) || opts.get("mode", "text") == "json" || rpc_mode
 def json_mode = opts.get("mode", "text") == "json"
+def mutable project_trusted = #false
 def config = load_config(~provider: opts.get("provider", #false),
                          ~model: opts.get("model", #false),
                          ~thinking: opts.get("thinking", #false))
@@ -185,13 +189,23 @@ fun default_system_prompt() :: String:
     +& "which derives the JSON schema from the annotations (defaults become optional).\n"
     +& "Be concise. Prefer tools over guessing."
 
+fun discover_skills() :: List:
+  skills.discover(~cwd: cwd(),
+                  ~extra: packages.package_skill_dirs(),
+                  ~include_project: project_trusted)
+
+fun discover_prompts() :: List:
+  prompts.discover(~cwd: cwd(),
+                   ~extra: packages.package_prompt_dirs(),
+                   ~include_project: project_trusted)
+
 fun system_prompt() :: String:
   context.resolve_system_prompt(~default_prompt: default_system_prompt(),
                                 ~override_text: opts.get("system_prompt", #false),
                                 ~append_text: opts.get("append_system_prompt", #false),
                                 ~cwd: cwd())
     +& context_section()
-    +& skills.xml_section(skills.discover(~cwd: cwd()))
+    +& skills.xml_section(discover_skills())
 
 // ---- tool filters ----
 fun apply_tool_filters():
@@ -213,7 +227,9 @@ fun show_help(_args):
 
 fun do_reload(notify = #true):
   let [ok, failed] = loader.load_extensions(registry, api,
-                                            ~notify: fun (s): api.notify(s))
+                                            ~notify: fun (s): api.notify(s),
+                                            ~extra_dirs: packages.package_extension_dirs(),
+                                            ~include_project: project_trusted)
   when notify
   | api.notify("extensions: " +& ok +& " loaded, " +& failed +& " failed")
 
@@ -445,6 +461,25 @@ registry.register_command(
                   session := start_session(~cwd: cwd(), ~resume: dest)
                   api.notify("imported into " +& dest))
 registry.register_command(
+  ~name: "share", ~description: "upload the session as a GitHub gist (needs gh CLI)",
+  ~handler: fun (_args):
+              cond
+              | !(session.path is_a String): api.notify("no session file to share")
+              | ~else:
+                  let tool = registry.tools.get("bash", #false)
+                  let cmd = "gh gist create '" +& session.path +& "' --desc 'rho session' 2>&1 || echo 'gh CLI unavailable or failed'"
+                  if tool
+                  | api.notify(to_string(tool.fn({ "command": cmd })))
+                  | api.notify("bash tool unavailable"))
+registry.register_command(
+  ~name: "packages", ~description: "list installed packages (rho install/remove to manage)",
+  ~handler: fun (_args):
+              match packages.installed()
+              | []: api.notify("no packages installed (rho install <git-url|owner/repo>)")
+              | ps:
+                  for (p in ps):
+                    out.write_string("  " +& p +& " (" +& packages.packages_dir() +& "/" +& p +& ")\n"))
+registry.register_command(
   ~name: "compact", ~description: "summarize old turns to shrink context: /compact [instructions]",
   ~handler: fun (args):
               api.notify("compacting\u2026")
@@ -466,14 +501,16 @@ registry.register_tool(
   ~schema: { "type": "object", "properties": {}, "required": [] },
   ~fn: fun (_args):
          let [ok, failed] = loader.load_extensions(registry, api,
-                                                   ~notify: fun (s): api.notify(s))
+                                                   ~notify: fun (s): api.notify(s),
+                                                   ~extra_dirs: packages.package_extension_dirs(),
+                                                   ~include_project: project_trusted)
          "extensions reloaded: " +& ok +& " ok, " +& failed +& " failed")
 
 // ---- skills & prompt templates ----
 registry.register_command(
   ~name: "skills", ~description: "list discovered skills",
   ~handler: fun (_args):
-              let found = skills.discover(~cwd: cwd())
+              let found = discover_skills()
               if found == []
               | api.notify("no skills found (put SKILL.md dirs in .rho/skills or ~/.rho/skills)")
               | for (s in found):
@@ -482,7 +519,7 @@ registry.register_command(
 registry.register_command(
   ~name: "prompts", ~description: "list prompt templates (run one with /<name>)",
   ~handler: fun (_args):
-              let found = prompts.discover(~cwd: cwd())
+              let found = discover_prompts()
               if found == []
               | api.notify("no templates found (put .md files in .rho/prompts or ~/.rho/prompts)")
               | for (t in found):
@@ -498,7 +535,9 @@ fun handle_command(name :: String, args :: String):
       cond
       | name.starts_with("skill:"):
           let sname = name.substring(6..)
-          match skills.find_skill(sname, ~cwd: cwd())
+          match skills.find_skill(sname, ~cwd: cwd(),
+                                  ~extra: packages.package_skill_dirs(),
+                                  ~include_project: project_trusted)
           | s :: Map:
               let content = filesystem.read_string(s["path"])
               handle_input("Load and follow this skill now.\n\n<skill source=\""
@@ -506,7 +545,9 @@ fun handle_command(name :: String, args :: String):
                              +& (if args.trim() == "" | "" | "\n\nTask: " +& args))
           | ~else: api.notify("unknown skill: " +& sname +& " (see /skills)")
       | ~else:
-          match prompts.find_template(name, ~cwd: cwd())
+          match prompts.find_template(name, ~cwd: cwd(),
+                                      ~extra: packages.package_prompt_dirs(),
+                                      ~include_project: project_trusted)
           | t :: Map: handle_input(prompts.expand(t, args))
           | ~else: api.notify("unknown command: /" +& name +& " (try /help)")
 
@@ -718,16 +759,129 @@ fun run_tui_mode():
 fun stdin_is_tty():
   rkt.#{terminal-port?}(rkt.#{current-input-port}())
 
+// ---- project trust ----
+fun ensure_trust() :: Boolean:
+  cond
+  | !filesystem.directory_exists(cwd() +& "/.rho"): #true
+  | ~else:
+      match trust.trust_status(cwd())
+      | #'trusted: #true
+      | #'untrusted: #false
+      | ~else:
+          cond
+          | headless || !stdin_is_tty():
+              config.settings.get("default_project_trust", "ignore") == "trust"
+          | ~else:
+              out.write_string("This project has a .rho/ directory (extensions, skills, prompts).\n"
+                                 +& "Trust it? Its code will run inside the agent. [y/N] ")
+              out.flush()
+              let ans = read_stdin_line()
+              let yes = ans.starts_with("y") || ans.starts_with("Y")
+              trust.set_trust(cwd(), yes)
+              api.notify(if yes | "project trusted (saved)" | "project ignored (saved)")
+              yes
+
+fun init_trust():
+  project_trusted := ensure_trust()
+
+// ---- RPC mode: JSON lines over stdin/stdout ----
+fun run_rpc():
+  def mutable turn_t = #false
+  fun turn_running():
+    turn_t && !rkt.#{thread-dead?}(turn_t)
+  emit_json({ "type": "ready",
+              "session": (if session.path is_a String | session.path | ""),
+              "provider": config.provider, "model": config.model })
+  recur loop():
+    match rkt.#{read-line}(rkt.#{current-input-port}(), #'any)
+    | s :: ReadableString:
+        let req = try:
+                    json.from_string(to_string(s))
+                    ~catch _: {}
+        let req = (if req is_a Map | req | {})
+        match req.get("type", "")
+        | "prompt":
+            cond
+            | turn_running():
+                emit_json({ "type": "error", "message": "turn already running (use steer)" })
+            | ~else:
+                let msg = to_string(req.get("message", ""))
+                let t:
+                  rkt.thread(fun ():
+                               try:
+                                 run_turn(~config: config,
+                                          ~registry: registry,
+                                          ~session: session,
+                                          ~system_prompt: system_prompt(),
+                                          ~input: msg,
+                                          ~on_text: fun (x): emit_json({ "type": "text", "text": x }),
+                                          ~on_tool: fun (name, args):
+                                                      emit_json({ "type": "tool_call", "name": name, "args": args }),
+                                          ~on_tool_result: fun (name, r):
+                                                             emit_json({ "type": "tool_result", "name": name, "result": r }),
+                                          ~on_steer: fun (x): emit_json({ "type": "steering_applied", "message": x }))
+                                 emit_json({ "type": "done" })
+                                 ~catch:
+                                 | e :: Exn.Break: emit_json({ "type": "aborted" })
+                                 | e :: Exn.Fail: emit_json({ "type": "error", "message": e.message }))
+                turn_t := t
+            loop()
+        | "steer":
+            if turn_running()
+            | rkt.#{thread-send}(turn_t, to_string(req.get("message", "")))
+              emit_json({ "type": "steering_queued" })
+            | emit_json({ "type": "error", "message": "no turn running" })
+            loop()
+        | "abort":
+            when turn_running()
+            | rkt.#{break-thread}(turn_t)
+              rkt.#{thread-wait}(turn_t)
+            emit_json({ "type": "aborted" })
+            loop()
+        | "quit":
+            when turn_running()
+            | rkt.#{break-thread}(turn_t)
+              rkt.#{thread-wait}(turn_t)
+            emit_json({ "type": "bye" })
+        | t:
+            emit_json({ "type": "error", "message": "unknown request type: " +& t })
+            loop()
+    | ~else:
+        when turn_running()
+        | rkt.#{thread-wait}(turn_t)
+
+// ---- package subcommands: rho install <spec> / rho remove <name> / rho list ----
+fun try_subcommand() :: Boolean:
+  match opts["message"]
+  | ["install", spec]:
+      println(packages.install(to_string(spec)))
+      #true
+  | ["remove", name]:
+      println(packages.remove(to_string(name)))
+      #true
+  | ["list"]:
+      match packages.installed()
+      | []: println("no packages installed")
+      | ps:
+          for (p in ps):
+            println(p +& "  (" +& packages.packages_dir() +& "/" +& p +& ")")
+      #true
+  | ~else: #false
+
 module main:
   cond
   | opts.get("list_models", #false):
       list_models()
+  | try_subcommand():
+      #void
   | ~else:
+      init_trust()
       apply_tool_filters()
       when !opts.get("no_extensions", #false)
       | do_reload(#false)
       let tui_mode = opts.get("tui_mode", config.settings.get("tui_mode", "tui"))
       cond
+      | rpc_mode: run_rpc()
       | headless: run_headless()
       | tui_mode == "tui" && stdin_is_tty():
           run_tui_mode()

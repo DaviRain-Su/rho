@@ -1,0 +1,38 @@
+#lang rhombus
+
+// Project trust: a project's .rho/ directory (extensions, skills, prompts)
+// is only honored after the user approves it once. Decisions are stored in
+// ~/.rho/trust.json as {"<cwd>": true|false}.
+
+import:
+  json
+  "config.rhm"
+
+export:
+  trust_status
+  set_trust
+
+fun trust_path() :: String:
+  config.config_dir() +& "/trust.json"
+
+fun read_trust() :: Map:
+  if filesystem.file_exists(trust_path())
+  | let parsed = try:
+                   json.from_string(filesystem.read_string(trust_path()))
+                   ~catch _: {}
+    if parsed is_a Map | parsed | {}
+  | {}
+
+// #'trusted | #'untrusted | #'unknown
+fun trust_status(cwd :: String):
+  match read_trust().get(cwd, #'missing)
+  | #true: #'trusted
+  | #false: #'untrusted
+  | ~else: #'unknown
+
+fun set_trust(cwd :: String, decision :: Boolean):
+  when !filesystem.directory_exists(config.config_dir())
+  | filesystem.make_directory(config.config_dir(), ~parents: #true)
+  filesystem.write_string(trust_path(),
+                          json.to_string(read_trust() ++ { cwd: decision }),
+                          ~exists: #'truncate)

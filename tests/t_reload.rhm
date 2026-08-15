@@ -44,7 +44,7 @@ def v2 = @str{#lang rhombus
 
 def reg = make_registry()
 def out = Port.Output.current()
-def api = PiAPI(reg, out)
+def api = PiAPI(reg, fun (): out, fun (): #false, [])
 
 fun load_one():
   reg.clear_extensions()

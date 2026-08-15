@@ -53,6 +53,12 @@ fun parse_args() :: Map:
     | ["-m", v, & more]: parse(more, acc ++ { "model": v })
     | ["--model", v, & more]: parse(more, acc ++ { "model": v })
     | ["--resume", v, & more]: parse(more, acc ++ { "resume": v })
+    | ["--session", v, & more]: parse(more, acc ++ { "resume": v })
+    | ["-c", & more]: parse(more, acc ++ { "continue": #true })
+    | ["-r", & more]: parse(more, acc ++ { "pick": #true })
+    | ["--fork", & more]: parse(more, acc ++ { "fork": #true })
+    | ["--no-session", & more]: parse(more, acc ++ { "no_session": #true })
+    | ["--name", v, & more]: parse(more, acc ++ { "name": v })
     | ["--thinking", v, & more]: parse(more, acc ++ { "thinking": v })
     | ["--list-models", & more]: parse(more, acc ++ { "list_models": #true })
     | ["--tools", v, & more]: parse(more, acc ++ { "tools": split_list(v) })
@@ -82,14 +88,51 @@ def config = load_config(~provider: opts.get("provider", #false),
                          ~thinking: opts.get("thinking", #false))
 def registry = make_registry()
 install_core_tools(registry)
-def session = start_session(~resume: opts.get("resume", #false))
-def api = PiAPI(registry, out)
 
 fun cwd() :: String:
   let s = to_string(rkt.#{current-directory}())
   if s.length() > 1 && s.substring(s.length() - 1 ..) == "/"
   | s.substring(0 .. s.length() - 1)
   | s
+
+fun read_stdin_line() :: String:
+  match rkt.#{read-line}()
+  | s :: ReadableString: to_string(s).trim()
+  | ~else: ""
+
+// -r: interactive session picker before anything else starts
+fun pick_session() :: maybe(String):
+  let sessions = list_sessions(cwd())
+  cond
+  | sessions == []:
+      println("no previous sessions here")
+      #false
+  | ~else:
+      for (i in 0 .. sessions.length()):
+        let s = sessions[i]
+        println((i + 1) +& ". "
+                  +& (if s["name"] == "" | "" | "[" +& s["name"] +& "] ")
+                  +& s["preview"]
+                  +& "  (" +& s["path"] +& ")")
+      print("resume which? (number, empty = new) ")
+      let ans = read_stdin_line()
+      match String.maybe_to_int(ans)
+      | n :: Int:
+          if n >= 1 && n <= sessions.length()
+          | sessions[n - 1]["path"]
+          | #false
+      | ~else: #false
+
+def mutable session:
+  start_session(~cwd: cwd(),
+                ~resume: (if opts.get("pick", #false)
+                          | pick_session()
+                          | opts.get("resume", #false)),
+                ~continue_latest: opts.get("continue", #false),
+                ~fork: opts.get("fork", #false),
+                ~no_session: opts.get("no_session", #false),
+                ~name: opts.get("name", #false))
+def api = PiAPI(registry, out)
 
 fun context_section() :: String:
   if opts.get("no_context", #false)
@@ -225,13 +268,172 @@ fun list_models():
 registry.register_command(
   ~name: "session", ~description: "show session file, entry count, token usage",
   ~handler: fun (_args):
-              api.notify(session.path +& " (" +& session.entries.length() +& " entries)")
+              api.notify((if session.path is_a String | session.path | "(no session file)")
+                           +& " (" +& session.entries.length() +& " entries)"
+                           +& (if session.name == "" | "" | " name=" +& session.name))
               api.notify(usage_line()))
 registry.register_command(
-  ~name: "clear", ~description: "clear conversation history",
+  ~name: "clear", ~description: "start a new branch from the root (history kept in tree)",
   ~handler: fun (_args):
               session.clear()
-              api.notify("history cleared"))
+              api.notify("history cleared (old branch kept; see /tree)"))
+
+// ---- session tree commands ----
+fun snippet(s :: String) :: String:
+  let one = String.join(s.split("\n"), " ")
+  if one.length() > 56 | one.substring(0..56) +& "\u2026" | one
+
+fun entry_label(e :: Map) :: String:
+  match e["kind"]
+  | "message":
+      let m = e["data"]
+      let role = m.get("role", "?")
+      cond
+      | role == "assistant" && m.get("tool_calls", []) != []:
+          let names = (for List (tc in m["tool_calls"]): tc["name"])
+          "assistant \u2699 " +& String.join(names, ",") +& " " +& snippet(m.get("content", ""))
+      | ~else: role +& ": " +& snippet(m.get("content", ""))
+  | "compaction": "[compaction] " +& snippet(e["data"].get("summary", ""))
+  | "meta": "[meta " +& e["data"].get("event", "") +& "]"
+  | k: "[" +& k +& "]"
+
+fun show_tree(_args):
+  let active:
+    for values(s :: Set = Set()) (e in session.path_entries()):
+      s ++ { e["id"] }
+  for (e in session.entries):
+    let depth:
+      recur count(id = e.get("parent", #'null), n = 0):
+        match session.entry(if id is_a Int | id | -1)
+        | p :: Map: count(p.get("parent", #'null), n + 1)
+        | ~else: n
+    let marker = (if active.contains(e["id"]) | "*" | " ")
+    out.write_string(marker +& " " +& e["id"] +& " "
+                       +& String.make(depth * 2, Char" ")
+                       +& entry_label(e) +& "\n")
+  out.write_string("use /tree <id> to move the active leaf\n")
+
+registry.register_command(
+  ~name: "tree", ~description: "show session tree; /tree <id> jumps to an entry",
+  ~handler: fun (args):
+              match String.maybe_to_int(args.trim())
+              | n :: Int:
+                  session.set_leaf(n)
+                  api.notify("leaf moved to " +& n)
+              | ~else: show_tree(args))
+
+registry.register_command(
+  ~name: "fork", ~description: "branch from a previous user message: /fork [id]",
+  ~handler: fun (args):
+              let target:
+                match String.maybe_to_int(args.trim())
+                | n :: Int: session.entry(n)
+                | ~else:
+                    // last user message on the active path
+                    for values(found = #false) (e in session.path_entries()):
+                      if e["kind"] == "message" && e["data"].get("role", "") == "user"
+                      | e
+                      | found
+              cond
+              | !target: api.notify("no user message to fork from")
+              | ~else:
+                  let parent = target.get("parent", #'null)
+                  session.set_leaf(if parent is_a Int | parent | #false)
+                  when target["kind"] == "message"
+                  | add_history(target["data"].get("content", ""))
+                  api.notify("forked before entry " +& target["id"]
+                               +& "; press \u2191 to edit the original message"))
+
+registry.register_command(
+  ~name: "new", ~description: "start a fresh session file",
+  ~handler: fun (_args):
+              session := start_session(~cwd: cwd())
+              api.notify("new session: " +& session.path))
+
+registry.register_command(
+  ~name: "name", ~description: "name this session: /name <name>",
+  ~handler: fun (args):
+              if args.trim() == ""
+              | api.notify("name: " +& (if session.name == "" | "(none)" | session.name))
+              | session.set_name(args.trim())
+                api.notify("session named " +& args.trim()))
+
+registry.register_command(
+  ~name: "clone", ~description: "copy this session to a new file and switch to it",
+  ~handler: fun (_args):
+              cond
+              | !(session.path is_a String): api.notify("no session file to clone")
+              | ~else:
+                  session := start_session(~cwd: cwd(), ~resume: session.path, ~fork: #true)
+                  api.notify("cloned into " +& session.path))
+
+registry.register_command(
+  ~name: "resume", ~description: "pick a previous session in this directory",
+  ~handler: fun (_args):
+              match pick_session()
+              | path :: String:
+                  session := start_session(~cwd: cwd(), ~resume: path)
+                  api.notify("resumed " +& path)
+              | ~else: api.notify("unchanged"))
+
+fun export_html(target :: String):
+  let parts:
+    for List (e in session.path_entries()):
+      skip_when e["kind"] != "message"
+      let m = e["data"]
+      let role = m.get("role", "?")
+      let body = html_escape(m.get("content", ""))
+      let tools:
+        for List (tc in m.get("tool_calls", [])):
+          "<div class=tool>\u2699 " +& html_escape(tc["name"]) +& " "
+            +& html_escape(tc["arguments"]) +& "</div>"
+      "<div class=" +& role +& "><b>" +& role +& "</b><pre>" +& body +& "</pre>"
+        +& String.join(tools, "") +& "</div>"
+  let doc:
+    "<!doctype html><meta charset=utf-8><title>rho session</title>"
+      +& "<style>body{font-family:sans-serif;max-width:52em;margin:2em auto}"
+      +& "pre{white-space:pre-wrap}div{margin:1em 0;padding:.5em 1em;border-radius:8px}"
+      +& ".user{background:#eef}.assistant{background:#f7f7f7}.tool{color:#666;font-size:90%}"
+      +& ".system{background:#ffe}</style>"
+      +& String.join(parts, "\n")
+  filesystem.write_string(target, doc, ~exists: #'truncate)
+
+fun html_escape(s :: String) :: String:
+  let s = String.join(s.split("&"), "&amp;")
+  let s = String.join(s.split("<"), "&lt;")
+  String.join(s.split(">"), "&gt;")
+
+registry.register_command(
+  ~name: "export", ~description: "export session: /export [file.html|file.jsonl]",
+  ~handler: fun (args):
+              let target = (if args.trim() == "" | "session-export.html" | args.trim())
+              cond
+              | target.ends_with(".jsonl"):
+                  cond
+                  | session.path is_a String:
+                      filesystem.write_string(target, filesystem.read_string(session.path),
+                                              ~exists: #'truncate)
+                      api.notify("exported " +& target)
+                  | ~else: api.notify("no session file")
+              | ~else:
+                  export_html(target)
+                  api.notify("exported " +& target))
+
+registry.register_command(
+  ~name: "import", ~description: "import a session file: /import <file.jsonl>",
+  ~handler: fun (args):
+              let src = args.trim()
+              cond
+              | !filesystem.file_exists(src): api.notify("no such file: " +& src)
+              | ~else:
+                  let dir = session_dir_for(cwd())
+                  when !filesystem.directory_exists(dir)
+                  | filesystem.make_directory(dir, ~parents: #true)
+                  let dest = dir +& "/imported-" +& rkt.#{current-seconds}() +& ".jsonl"
+                  filesystem.write_string(dest, filesystem.read_string(src),
+                                          ~exists: #'truncate)
+                  session := start_session(~cwd: cwd(), ~resume: dest)
+                  api.notify("imported into " +& dest))
 registry.register_command(
   ~name: "quit", ~description: "exit",
   ~handler: fun (_args): #'quit)
@@ -284,8 +486,13 @@ fun first_line(s :: String) :: String:
 
 def banner:
   color("1;35", "rho") +& " \u2014 hot-reloadable Rhombus coding agent\n"
-    +& "provider=" +& config.provider +& " model=" +& config.model +& "\n"
-    +& "session=" +& session.path +& "\n"
+    +& "provider=" +& config.provider +& " model=" +& config.model
+    +& " ctx-window=" +& models.model_info(config.model)["context_window"] +& "\n"
+    +& "session=" +& (if session.path is_a String | session.path | "(none)")
+    +& (if session.entries.length() > 1
+        | " (" +& session.entries.length() +& " entries resumed)"
+        | "")
+    +& "\n"
     +& "type /help for commands\n\n"
 
 // ---- headless mode ----
@@ -313,7 +520,8 @@ fun run_headless():
   | println("error: no prompt (pass a message argument or pipe stdin)")
     rkt.exit(1)
   when json_mode
-  | emit_json({ "type": "session_start", "session": session.path,
+  | emit_json({ "type": "session_start",
+                "session": (if session.path is_a String | session.path | ""),
                 "provider": config.provider, "model": config.model })
   run_turn(~config: config,
            ~registry: registry,
@@ -335,7 +543,8 @@ fun run_headless():
              | fun (name, r): emit_json({ "type": "tool_result", "name": name, "result": r })
              | fun (name, r): #void)
   if json_mode
-  | emit_json({ "type": "done", "session": session.path })
+  | emit_json({ "type": "done",
+                "session": (if session.path is_a String | session.path | "") })
   | out.write_string("\n")
 
 module main:

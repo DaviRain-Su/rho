@@ -1,8 +1,16 @@
 #lang rhombus
 
-// Append-only JSONL session persistence.
-// Each line: {"id": Int, "ts": Int, "kind": "message" | "meta", "data": ...}
-// "message" entries hold canonical messages (see src/ai/types.rhm).
+// Session tree with append-only JSONL persistence.
+//
+// Each line is either an entry:
+//   {"id": Int, "parent": Int | null, "ts": Int, "kind": K, "data": ...}
+//   K = "message" | "meta" | "compaction" | "custom"
+// or a leaf move (not a tree node):
+//   {"kind": "goto", "target": Int | -1}
+//
+// Entries form a tree via parent pointers; the active conversation is the
+// path from the current leaf back to the root. New entries attach to the
+// leaf. Session files live in ~/.rho/sessions/<encoded-cwd>/.
 
 import:
   json
@@ -12,43 +20,199 @@ import:
 export:
   Session
   start_session
+  session_dir_for
+  list_sessions
+  encode_cwd
 
-class Session(path :: String,
-              mutable entries :: List):
+class Session(mutable path,
+              mutable entries :: List,
+              index :: MutableMap,
+              mutable leaf,
+              mutable name :: String):
 
-  method append(kind :: String, data):
-    let entry = { "id": entries.length(),
+  method persist_line(v :: Map):
+    when path is_a String
+    | let out = Port.Output.open_file(path, ~exists: #'append)
+      out.write_string(json.to_string(v) +& "\n")
+      out.close()
+
+  method next_id() :: Int:
+    for values(m = 0) (e in entries):
+      math.max(m, e["id"] + 1)
+
+  method append(kind :: String, data, ~parent: parent = #'use_leaf) :: Int:
+    let id = next_id()
+    let parent_id = (if parent == #'use_leaf | leaf | parent)
+    let entry = { "id": id,
+                  "parent": (if parent_id is_a Int | parent_id | #'null),
                   "ts": rkt.#{current-seconds}(),
                   "kind": kind,
                   "data": data }
     entries := entries.add(entry)
-    let out = Port.Output.open_file(path, ~exists: #'append)
-    out.write_string(json.to_string(entry) +& "\n")
-    out.close()
+    index[id] := entry
+    leaf := id
+    persist_line(entry)
+    when kind == "meta" && data is_a Map && data.get("event", "") == "name"
+    | name := data.get("name", "")
+    id
 
-  method append_message(msg :: Map):
+  method append_message(msg :: Map) :: Int:
     append("message", msg)
 
+  method set_leaf(target):
+    // target: entry id, or #false for root
+    when target is_a Int && !index.has_key(target)
+    | error("no such entry: " +& target)
+    leaf := target
+    persist_line({ "kind": "goto", "target": (if target is_a Int | target | -1) })
+
+  method entry(id :: Int) :: maybe(Map):
+    index.get(id, #false)
+
+  // Path of entries from root to leaf (inclusive).
+  method path_entries() :: List:
+    recur walk(id = leaf, acc :: List = []):
+      if id is_a Int && index.has_key(id)
+      | walk(index[id].get("parent", #'null), acc.insert(0, index[id]))
+      | acc
+
+  // Messages for the model, honoring the most recent compaction entry on
+  // the active path: its summary replaces everything up to first_kept.
   method messages() :: List:
-    for List (e in entries):
-      skip_when e.get("kind", "") != "message"
-      e["data"]
+    let path_list = path_entries()
+    let compaction_at:
+      for values(found = #false) (i in 0 .. path_list.length()):
+        if path_list[i]["kind"] == "compaction" | i | found
+    let start_entries:
+      if compaction_at is_a Int
+      | let c = path_list[compaction_at]["data"]
+        let first_kept = c.get("first_kept", -1)
+        let kept:
+          for List (e in path_list):
+            skip_when e["kind"] != "message" || e["id"] < first_kept
+            e["data"]
+        [{ "role": "user",
+           "content": "[Conversation summary of earlier context]\n\n"
+                        +& c.get("summary", "") }]
+          ++ kept
+      | for List (e in path_list):
+          skip_when e["kind"] != "message"
+          e["data"]
+    start_entries
+
+  method set_name(n :: String):
+    append("meta", { "event": "name", "name": n })
 
   method clear():
-    entries := []
-    append("meta", { "event": "clear" })
+    set_leaf(#false)
 
-fun start_session(~resume: resume :: maybe(String) = #false) :: Session:
-  let dir = config.sessions_dir()
+fun encode_cwd(cwd :: String) :: String:
+  String.join(cwd.split("/", ~trim: #false), "-")
+
+fun session_dir_for(cwd :: String) :: String:
+  config.sessions_dir() +& "/" +& encode_cwd(cwd)
+
+fun new_session_path(dir :: String) :: String:
   when !filesystem.directory_exists(dir)
   | filesystem.make_directory(dir, ~parents: #true)
+  dir +& "/" +& rkt.#{current-seconds}() +& "-" +& math.random(100000) +& ".jsonl"
+
+fun load_session(path :: String) :: Session:
+  let index = MutableMap()
+  def mutable entries :: List = []
+  def mutable leaf = #false
+  def mutable name = ""
+  for (line in filesystem.read_lines(path)):
+    skip_when line.trim() == ""
+    let v = try:
+              json.from_string(line)
+              ~catch _: #false
+    skip_when !(v is_a Map)
+    cond
+    | v.get("kind", "") == "goto":
+        let t = v.get("target", -1)
+        leaf := (if t is_a Int && t >= 0 | t | #false)
+    | v.has_key("id"):
+        entries := entries.add(v)
+        index[v["id"]] := v
+        leaf := v["id"]
+        when v.get("kind", "") == "meta" && v["data"] is_a Map
+            && v["data"].get("event", "") == "name"
+        | name := v["data"].get("name", "")
+    | ~else: #void
+  Session(path, entries, index, leaf, name)
+
+// Returns list of {"path", "name", "mtime", "preview"} newest first.
+fun list_sessions(cwd :: String) :: List:
+  let dir = session_dir_for(cwd)
+  if !filesystem.directory_exists(dir)
+  | []
+  | let items:
+      for List (f in filesystem.files(dir)):
+        let fname = f +& ""
+        skip_when !fname.ends_with(".jsonl")
+        let path = dir +& "/" +& fname
+        def mutable name = ""
+        def mutable preview = ""
+        for (line in filesystem.read_lines(path)):
+          let v = try:
+                    json.from_string(line)
+                    ~catch _: #false
+          skip_when !(v is_a Map)
+          let data = v.get("data", {})
+          skip_when !(data is_a Map)
+          when v.get("kind", "") == "meta" && data.get("event", "") == "name"
+          | name := data.get("name", "")
+          when preview == "" && v.get("kind", "") == "message"
+              && data.get("role", "") == "user"
+          | preview := data.get("content", "")
+        { "path": path, "name": name,
+          "mtime": rkt.#{file-or-directory-modify-seconds}(path),
+          "preview": (if preview.length() > 60 | preview.substring(0..60) +& "\u2026" | preview) }
+    items.sort(fun (a, b): a["mtime"] > b["mtime"])
+
+fun latest_session(cwd :: String) :: maybe(String):
+  match list_sessions(cwd)
+  | []: #false
+  | [first, & _]: first["path"]
+
+// resume can be a full path or a bare id/filename fragment searched in the
+// cwd session dir.
+fun resolve_session_ref(ref :: String, cwd :: String) :: maybe(String):
   cond
-  | resume && filesystem.file_exists(resume):
-      let entries:
-        for List (line in filesystem.read_lines(resume)):
-          skip_when line.trim() == ""
-          json.from_string(line)
-      Session(resume, entries)
+  | filesystem.file_exists(ref): ref
   | ~else:
-      let path = dir +& "/" +& rkt.#{current-seconds}() +& "-" +& math.random(100000) +& ".jsonl"
-      Session(path, [])
+      for values(found = #false) (s in list_sessions(cwd)):
+        found || (s["path"].contains(ref) && s["path"])
+
+fun start_session(~cwd: cwd :: String,
+                  ~resume: resume :: maybe(String) = #false,
+                  ~continue_latest: continue_latest = #false,
+                  ~fork: fork = #false,
+                  ~no_session: no_session = #false,
+                  ~name: name :: maybe(String) = #false) :: Session:
+  let dir = session_dir_for(cwd)
+  let source:
+    cond
+    | resume: resolve_session_ref(resume, cwd)
+    | continue_latest || fork: latest_session(cwd)
+    | ~else: #false
+  let session:
+    cond
+    | no_session:
+        Session(#false, [], MutableMap(), #false, "")
+    | source && fork:
+        // copy the source file into a fresh session, then continue there
+        let path = new_session_path(dir)
+        filesystem.write_string(path, filesystem.read_string(source),
+                                ~exists: #'truncate)
+        load_session(path)
+    | source:
+        load_session(source)
+    | ~else:
+        let s = Session(new_session_path(dir), [], MutableMap(), #false, "")
+        s.append("meta", { "event": "header", "cwd": cwd })
+        s
+  when name is_a String && name != ""
+  | session.set_name(name)
+  session

@@ -8,9 +8,14 @@ import:
 export:
   run_repl
   color
+  add_history
 
 fun color(code :: String, s :: String) :: String:
   "\u001B[" +& code +& "m" +& s +& "\u001B[0m"
+
+// Pre-fill a line into readline history (e.g. /fork message editing).
+fun add_history(s :: String):
+  rl.#{add-history}(s)
 
 // handle_command(name, args) is called for "/cmd args" lines; it returns
 // #'quit to exit. handle_input(line) runs an agent turn.

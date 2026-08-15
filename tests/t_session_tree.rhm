@@ -1,0 +1,54 @@
+#lang rhombus
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/session.rhm" open
+
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-sess-~a", #'directory))
+def cwd = (if tmp.substring(tmp.length() - 1 ..) == "/" | tmp.substring(0 .. tmp.length() - 1) | tmp)
+
+def s = start_session(~cwd: cwd)
+def u1 = s.append_message({ "role": "user", "content": "first" })
+def a1 = s.append_message({ "role": "assistant", "content": "reply1" })
+def u2 = s.append_message({ "role": "user", "content": "second" })
+def a2 = s.append_message({ "role": "assistant", "content": "reply2" })
+
+when (for List (m in s.messages()): m["content"]) != ["first", "reply1", "second", "reply2"]
+| error("linear path wrong")
+
+// jump back to a1 and branch
+s.set_leaf(a1)
+def u3 = s.append_message({ "role": "user", "content": "branch!" })
+when (for List (m in s.messages()): m["content"]) != ["first", "reply1", "branch!"]
+| error("branch path wrong: " +& to_string(s.messages()))
+
+// name + reload from disk
+s.set_name("mytree")
+def s2 = start_session(~cwd: cwd, ~continue_latest: #true)
+when s2.name != "mytree" | error("name not persisted")
+when (for List (m in s2.messages()): m["content"]) != ["first", "reply1", "branch!"]
+| error("reloaded path wrong: " +& to_string(s2.messages()))
+when s2.entries.length() != 7 | error("expected 7 entries, got " +& s2.entries.length())
+
+// fork copies the file
+def s3 = start_session(~cwd: cwd, ~fork: #true)
+when s3.path == s2.path | error("fork should create a new file")
+when (for List (m in s3.messages()): m["content"]) != ["first", "reply1", "branch!"]
+| error("forked path wrong")
+
+// clear starts a new root branch but keeps entries
+s2.clear()
+when s2.messages() != [] | error("clear should empty the active path")
+def u4 = s2.append_message({ "role": "user", "content": "fresh" })
+when (for List (m in s2.messages()): m["content"]) != ["fresh"] | error("fresh branch wrong")
+when s2.entries.length() != 8 | error("entries should be kept")
+
+// list_sessions sees both files
+when list_sessions(cwd).length() != 2 | error("expected 2 sessions")
+
+// no_session works without a file
+def s4 = start_session(~cwd: cwd, ~no_session: #true)
+s4.append_message({ "role": "user", "content": "x" })
+when (for List (m in s4.messages()): m["content"]) != ["x"] | error("no_session path wrong")
+
+println("t_session_tree OK")

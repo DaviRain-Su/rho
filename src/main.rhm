@@ -28,6 +28,8 @@ import:
   "kernel/loop.rhm" open
   "kernel/context.rhm" as context
   "kernel/compaction.rhm" as compaction
+  "kernel/skills.rhm" as skills
+  "kernel/prompts.rhm" as prompts
   "ai/models.rhm" as models
   "tools/core.rhm" open
   "ext/api.rhm" open
@@ -183,6 +185,7 @@ fun system_prompt() :: String:
                                 ~append_text: opts.get("append_system_prompt", #false),
                                 ~cwd: cwd())
     +& context_section()
+    +& skills.xml_section(skills.discover(~cwd: cwd()))
 
 // ---- tool filters ----
 fun apply_tool_filters():
@@ -460,12 +463,46 @@ registry.register_tool(
                                                    ~notify: fun (s): api.notify(s))
          "extensions reloaded: " +& ok +& " ok, " +& failed +& " failed")
 
+// ---- skills & prompt templates ----
+registry.register_command(
+  ~name: "skills", ~description: "list discovered skills",
+  ~handler: fun (_args):
+              let found = skills.discover(~cwd: cwd())
+              if found == []
+              | api.notify("no skills found (put SKILL.md dirs in .rho/skills or ~/.rho/skills)")
+              | for (s in found):
+                  out.write_string("  " +& s["name"] +& " \u2014 " +& s["description"]
+                                     +& " (" +& s["path"] +& ")\n"))
+registry.register_command(
+  ~name: "prompts", ~description: "list prompt templates (run one with /<name>)",
+  ~handler: fun (_args):
+              let found = prompts.discover(~cwd: cwd())
+              if found == []
+              | api.notify("no templates found (put .md files in .rho/prompts or ~/.rho/prompts)")
+              | for (t in found):
+                  out.write_string("  /" +& t["name"]
+                                     +& (if t["argument_hint"] == "" | "" | " " +& t["argument_hint"])
+                                     +& " \u2014 " +& t["description"] +& "\n"))
+
 // ---- wire up ----
 fun handle_command(name :: String, args :: String):
   match registry.find_command(name)
   | c :: Command: c.handler(args)
   | ~else:
-      api.notify("unknown command: /" +& name +& " (try /help)")
+      cond
+      | name.starts_with("skill:"):
+          let sname = name.substring(6..)
+          match skills.find_skill(sname, ~cwd: cwd())
+          | s :: Map:
+              let content = filesystem.read_string(s["path"])
+              handle_input("Load and follow this skill now.\n\n<skill source=\""
+                             +& s["path"] +& "\">\n" +& content +& "\n</skill>"
+                             +& (if args.trim() == "" | "" | "\n\nTask: " +& args))
+          | ~else: api.notify("unknown skill: " +& sname +& " (see /skills)")
+      | ~else:
+          match prompts.find_template(name, ~cwd: cwd())
+          | t :: Map: handle_input(prompts.expand(t, args))
+          | ~else: api.notify("unknown command: /" +& name +& " (try /help)")
 
 fun handle_input(input :: String):
   run_turn(~config: config,

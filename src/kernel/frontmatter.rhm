@@ -1,0 +1,59 @@
+#lang rhombus
+
+// Minimal YAML frontmatter parser: only top-level `key: value` pairs between
+// leading and closing "---" lines. Values may be single- or double-quoted.
+
+export:
+  parse
+
+fun unquote(v :: String) :: String:
+  if v.length() >= 2
+       && ((v.starts_with("\"") && v.ends_with("\""))
+             || (v.starts_with("'") && v.ends_with("'")))
+  | v.substring(1 .. v.length() - 1)
+  | v
+
+// Returns values(meta :: Map, body :: String)
+fun parse(text :: String) :: values(Map, String):
+  let lines = text.split("\n", ~trim: #false)
+  cond
+  | lines == [] || to_string(lines[0]).trim() != "---":
+      values({}, text)
+  | ~else:
+      let close:
+        for values(found = #false) (i in 1 .. lines.length()):
+          found || (to_string(lines[i]).trim() == "---" && i)
+      cond
+      | !close: values({}, text)
+      | ~else:
+          // collect indented continuation lines for block scalars (| and >)
+          fun block_value(start :: Int, folded :: Boolean) :: String:
+            let collected:
+              for List (i in start .. close):
+                let line = to_string(lines[i])
+                break_when !(line.trim() == "" || line.starts_with("  ") || line.starts_with("\t"))
+                line.trim()
+            String.join(collected, if folded | " " | "\n").trim()
+          let meta:
+            for values(m :: Map = {}) (i in 1 .. close):
+              let line = to_string(lines[i])
+              skip_when line.trim() == "" || line.starts_with("#")
+              skip_when line.starts_with(" ") || line.starts_with("\t")
+              let idx:
+                for values(found = #false) (j in 0 .. line.length()):
+                  found || (line[j] == Char":" && j)
+              skip_when !idx
+              let key = line.substring(0 .. idx).trim()
+              let raw = line.substring(idx + 1 ..).trim()
+              let value:
+                match raw
+                | ">" || ">-": block_value(i + 1, #true)
+                | "|" || "|-": block_value(i + 1, #false)
+                | _: unquote(raw)
+              skip_when key == ""
+              m ++ { key: value }
+          let body:
+            String.join((for List (i in close + 1 .. lines.length()):
+                           to_string(lines[i])),
+                        "\n")
+          values(meta, body)

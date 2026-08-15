@@ -1,0 +1,72 @@
+#lang rhombus
+
+// Agent skills (agentskills.io convention): directories containing SKILL.md
+// with YAML frontmatter (name, description). Discovery paths:
+//   ~/.rho/skills/  ~/.agents/skills/  <cwd>/.rho/skills/  <cwd>/.agents/skills/
+// plus any extra dirs (e.g. installed packages).
+//
+// Progressive disclosure: only name/description/path are injected into the
+// system prompt; the agent reads the full SKILL.md with its read tool, or
+// the user forces it with /skill:name.
+
+import:
+  rhombus/envvar
+  "config.rhm"
+  "frontmatter.rhm" as frontmatter
+
+export:
+  skill_dirs
+  discover
+  xml_section
+  find_skill
+
+fun home() :: String:
+  envvar.getenv("HOME") || "/tmp"
+
+fun skill_dirs(~cwd: cwd :: String, ~extra: extra :: List = []) :: List:
+  [config.config_dir() +& "/skills",
+   home() +& "/.agents/skills",
+   cwd +& "/.rho/skills",
+   cwd +& "/.agents/skills"]
+    ++ extra
+
+// Returns list of {"name", "description", "path"} (path = SKILL.md file).
+fun discover(~cwd: cwd :: String, ~extra: extra :: List = []) :: List:
+  def seen = MutableMap()
+  for List:
+    each dir in skill_dirs(~cwd: cwd, ~extra: extra)
+    skip_when !filesystem.directory_exists(dir)
+    each entry in filesystem.files(dir).sort()
+    def skill_file = dir +& "/" +& (entry +& "") +& "/SKILL.md"
+    skip_when !filesystem.file_exists(skill_file)
+    def (meta, _) = frontmatter.parse(filesystem.read_string(skill_file))
+    def name = meta.get("name", entry +& "")
+    skip_when seen.has_key(name)
+    seen[name] := #true
+    { "name": name,
+      "description": meta.get("description", ""),
+      "path": skill_file }
+
+fun xml_escape(s :: String) :: String:
+  let s = String.join(s.split("&"), "&amp;")
+  let s = String.join(s.split("<"), "&lt;")
+  String.join(s.split(">"), "&gt;")
+
+fun xml_section(skills :: List) :: String:
+  if skills == []
+  | ""
+  | let items:
+      for List (s in skills):
+        "  <skill>\n"
+          +& "    <name>" +& xml_escape(s["name"]) +& "</name>\n"
+          +& "    <description>" +& xml_escape(s["description"]) +& "</description>\n"
+          +& "    <location>" +& xml_escape(s["path"]) +& "</location>\n"
+          +& "  </skill>"
+    "\n\nThe following skills are available. To use one, read its SKILL.md"
+      +& " with the read_file tool and follow its instructions.\n<skills>\n"
+      +& String.join(items, "\n")
+      +& "\n</skills>"
+
+fun find_skill(name :: String, ~cwd: cwd :: String, ~extra: extra :: List = []) :: maybe(Map):
+  for values(found = #false) (s in discover(~cwd: cwd, ~extra: extra)):
+    found || (s["name"] == name && s)

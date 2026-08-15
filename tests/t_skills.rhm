@@ -1,0 +1,53 @@
+#lang rhombus
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/frontmatter.rhm" as frontmatter
+  "../src/kernel/skills.rhm" as skills
+  "../src/kernel/prompts.rhm" as prompts
+
+// frontmatter
+def (meta, body) = frontmatter.parse("---\nname: demo\ndescription: \"A demo: with colon\"\n---\nBody here\nline2")
+when meta != { "name": "demo", "description": "A demo: with colon" } | error("meta wrong: " +& to_string(meta))
+when !body.contains("Body here") | error("body wrong")
+def (m2, b2) = frontmatter.parse("no frontmatter at all")
+when m2 != {} || b2 != "no frontmatter at all" | error("plain text wrong")
+
+// skills discovery
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-sk-~a", #'directory))
+def cwd = (if tmp.substring(tmp.length() - 1 ..) == "/" | tmp.substring(0 .. tmp.length() - 1) | tmp)
+filesystem.make_directory(cwd +& "/.rho/skills/hello", ~parents: #true)
+filesystem.write_string(cwd +& "/.rho/skills/hello/SKILL.md",
+                        "---\nname: hello\ndescription: says hello\n---\nSay hello loudly.",
+                        ~exists: #'truncate)
+filesystem.make_directory(cwd +& "/.agents/skills/other", ~parents: #true)
+filesystem.write_string(cwd +& "/.agents/skills/other/SKILL.md",
+                        "---\nname: other\ndescription: other skill\n---\nBody.",
+                        ~exists: #'truncate)
+
+def found = skills.discover(~cwd: cwd)
+def names = (for List (s in found): s["name"])
+when !names.contains("hello") || !names.contains("other")
+| error("skills not discovered: " +& to_string(names))
+
+def xml = skills.xml_section(found)
+when !xml.contains("<name>hello</name>") || !xml.contains("says hello")
+| error("xml injection wrong")
+
+when !skills.find_skill("hello", ~cwd: cwd) | error("find_skill failed")
+
+// prompt templates
+filesystem.make_directory(cwd +& "/.rho/prompts", ~parents: #true)
+filesystem.write_string(cwd +& "/.rho/prompts/review.md",
+                        "---\ndescription: review code\nargument-hint: <file>\n---\nReview $ARGUMENTS carefully.",
+                        ~exists: #'truncate)
+def t = prompts.find_template("review", ~cwd: cwd)
+when !t | error("template not found")
+when prompts.expand(t, "src/main.rhm") != "Review src/main.rhm carefully."
+| error("expand wrong: " +& prompts.expand(t, "src/main.rhm"))
+
+filesystem.write_string(cwd +& "/.rho/prompts/plain.md", "Just do it.", ~exists: #'truncate)
+def t2 = prompts.find_template("plain", ~cwd: cwd)
+when prompts.expand(t2, "now") != "Just do it.\n\nnow" | error("append wrong")
+
+println("t_skills OK")

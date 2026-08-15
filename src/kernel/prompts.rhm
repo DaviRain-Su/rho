@@ -1,0 +1,49 @@
+#lang rhombus
+
+// Prompt templates: markdown files in ~/.rho/prompts/ and <cwd>/.rho/prompts/.
+// Invoked as /<filename> [args]. Frontmatter: description, argument-hint.
+// "$ARGUMENTS" in the body is replaced with the arguments; if absent and
+// arguments were given, they are appended.
+
+import:
+  "config.rhm"
+  "frontmatter.rhm" as frontmatter
+
+export:
+  prompt_dirs
+  discover
+  find_template
+  expand
+
+fun prompt_dirs(~cwd: cwd :: String, ~extra: extra :: List = []) :: List:
+  [config.config_dir() +& "/prompts", cwd +& "/.rho/prompts"] ++ extra
+
+// Returns list of {"name", "description", "argument_hint", "body"}.
+fun discover(~cwd: cwd :: String, ~extra: extra :: List = []) :: List:
+  def seen = MutableMap()
+  for List:
+    each dir in prompt_dirs(~cwd: cwd, ~extra: extra)
+    skip_when !filesystem.directory_exists(dir)
+    each entry in filesystem.files(dir).sort()
+    def fname = entry +& ""
+    skip_when !fname.ends_with(".md")
+    def name = fname.substring(0 .. fname.length() - 3)
+    skip_when seen.has_key(name)
+    seen[name] := #true
+    def (meta, body) = frontmatter.parse(filesystem.read_string(dir +& "/" +& fname))
+    { "name": name,
+      "description": meta.get("description", ""),
+      "argument_hint": meta.get("argument-hint", ""),
+      "body": body.trim() }
+
+fun find_template(name :: String, ~cwd: cwd :: String, ~extra: extra :: List = []) :: maybe(Map):
+  for values(found = #false) (t in discover(~cwd: cwd, ~extra: extra)):
+    found || (t["name"] == name && t)
+
+fun expand(template :: Map, args :: String) :: String:
+  let body = template["body"]
+  cond
+  | body.contains("$ARGUMENTS"):
+      String.join(body.split("$ARGUMENTS", ~trim: #false), args)
+  | args.trim() == "": body
+  | ~else: body +& "\n\n" +& args

@@ -1,0 +1,54 @@
+#lang rhombus
+
+// Append-only JSONL session persistence.
+// Each line: {"id": Int, "ts": Int, "kind": "message" | "meta", "data": ...}
+// "message" entries hold canonical messages (see src/ai/types.rhm).
+
+import:
+  json
+  lib("racket/base.rkt") as rkt
+  "config.rhm"
+
+export:
+  Session
+  start_session
+
+class Session(path :: String,
+              mutable entries :: List):
+
+  method append(kind :: String, data):
+    let entry = { "id": entries.length(),
+                  "ts": rkt.#{current-seconds}(),
+                  "kind": kind,
+                  "data": data }
+    entries := entries.add(entry)
+    let out = Port.Output.open_file(path, ~exists: #'append)
+    out.write_string(json.to_string(entry) +& "\n")
+    out.close()
+
+  method append_message(msg :: Map):
+    append("message", msg)
+
+  method messages() :: List:
+    for List (e in entries):
+      skip_when e.get("kind", "") != "message"
+      e["data"]
+
+  method clear():
+    entries := []
+    append("meta", { "event": "clear" })
+
+fun start_session(~resume: resume :: maybe(String) = #false) :: Session:
+  let dir = config.sessions_dir()
+  when !filesystem.directory_exists(dir)
+  | filesystem.make_directory(dir, ~parents: #true)
+  cond
+  | resume && filesystem.file_exists(resume):
+      let entries:
+        for List (line in filesystem.read_lines(resume)):
+          skip_when line.trim() == ""
+          json.from_string(line)
+      Session(resume, entries)
+  | ~else:
+      let path = dir +& "/" +& rkt.#{current-seconds}() +& "-" +& math.random(100000) +& ".jsonl"
+      Session(path, [])

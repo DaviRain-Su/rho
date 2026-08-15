@@ -1,0 +1,80 @@
+#lang rhombus/and_meta
+
+// `tool` definition macro for extensions: derives the JSON schema from
+// Rhombus-style annotations, so an extension can write
+//
+//   import: lib("pi-rhm/src/ext/tool.rhm") open
+//   export: init
+//   fun init(pi):
+//     tool pi shout(text :: String) ~desc "Uppercase with !!!":
+//       String.upcase(text) +& "!!!"
+//
+// instead of hand-writing register_tool + schema. Parameters may have
+// defaults (`n :: Int = 3`), which makes them optional in the schema.
+
+export:
+  tool
+
+meta:
+  fun json_type(t_stx):
+    match to_string(t_stx.unwrap())
+    | "String": "string"
+    | "Int": "integer"
+    | "Number": "number"
+    | "Real": "number"
+    | "Boolean": "boolean"
+    | "List": "array"
+    | "Map": "object"
+    | other: "string"
+
+  // parses one parameter group; returns [id, type_string, default_or_#false]
+  fun parse_param(p):
+    match p
+    | '$(id :: Identifier) :: $(t :: Identifier) = $dflt ...':
+        [id, json_type(t), '$dflt ...']
+    | '$(id :: Identifier) :: $(t :: Identifier)':
+        [id, json_type(t), #false]
+    | '$(id :: Identifier)':
+        [id, "string", #false]
+    | ~else:
+        syntax_meta.error("tool: bad parameter (use `name :: Type` or `name :: Type = default`)", p)
+
+defn.macro 'tool $(pi :: Identifier) $(name :: Identifier)($param, ...) ~desc $(desc :: String):
+              $body
+              ...':
+  let [[id, ty, dflt], ...] = [parse_param(param), ...]
+  let name_str = to_string(name.unwrap())
+  let [id_str, ...] = [to_string(id.unwrap()), ...]
+  // property entries: "x": {"type": "string"}
+  let [prop, ...] = ['$id_str: { "type": $ty }', ...]
+  // required = params without defaults
+  let req:
+    for List (i_str in [id_str, ...],
+              d in [dflt, ...]):
+      skip_when d
+      '$i_str'
+  let [req_entry, ...] = req
+  // binding for each param inside the tool fn
+  let [bind, ...]:
+    for List (i in [id, ...],
+              i_str in [id_str, ...],
+              d in [dflt, ...]):
+      if d
+      | 'def $i = args.get($i_str, $d)'
+      | 'def $i = get_required(args, $i_str, $name_str)'
+  '($pi).register_tool(
+     ~name: $name_str,
+     ~description: $desc,
+     ~schema: { "type": "object",
+                "properties": { $prop, ... },
+                "required": [$req_entry, ...] },
+     ~fn: fun (args :: Map):
+            $bind
+            ...
+            $body
+            ...)'
+
+fun get_required(args :: Map, key :: String, tool_name :: String):
+  if args.has_key(key)
+  | args[key]
+  | error("tool " +& tool_name +& ": missing required argument: " +& key)

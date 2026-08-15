@@ -1,0 +1,58 @@
+#lang rhombus
+
+// Line-oriented REPL (not a fullscreen TUI). Readline gives history/editing.
+
+import:
+  lib("readline/readline.rkt") as rl
+
+export:
+  run_repl
+  color
+
+fun color(code :: String, s :: String) :: String:
+  "\u001B[" +& code +& "m" +& s +& "\u001B[0m"
+
+// handle_command(name, args) is called for "/cmd args" lines; it returns
+// #'quit to exit. handle_input(line) runs an agent turn.
+fun run_repl(~banner: banner :: String,
+             ~handle_command: handle_command,
+             ~handle_input: handle_input):
+  let out = Port.Output.current()
+  out.write_string(banner)
+  out.flush()
+  recur loop():
+    let line = rl.readline("\u276F ")
+    cond
+    | line == Port.eof:
+        out.write_string("\nbye\n")
+    | ~else:
+        let line = to_string(line).trim()
+        cond
+        | line == "":
+            loop()
+        | line.starts_with("/"):
+            rl.#{add-history}(line)
+            let parts = line.substring(1..).split(" ")
+            let name = (if parts == [] | "" | to_string(parts[0]))
+            let args = (if parts.length() > 1
+                        | String.join(parts.rest, " ")
+                        | "")
+            let r = try:
+                      handle_command(name, args)
+                      ~catch e :: Exn.Fail:
+                        out.write_string(color("31", "error: ") +& e.message +& "\n")
+                        #void
+            if r == #'quit
+            | out.write_string("bye\n")
+            | loop()
+        | ~else:
+            rl.#{add-history}(line)
+            try:
+              handle_input(line)
+              ~catch:
+              | e :: Exn.Break:
+                  out.write_string("\n" +& color("33", "[interrupted]") +& "\n")
+              | e :: Exn.Fail:
+                  out.write_string("\n" +& color("31", "error: ") +& e.message +& "\n")
+            out.flush()
+            loop()

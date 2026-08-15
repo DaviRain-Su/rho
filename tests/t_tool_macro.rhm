@@ -1,0 +1,26 @@
+#lang rhombus
+import:
+  "../src/ext/tool.rhm" open
+  "../src/kernel/registry.rhm" open
+  "../src/ext/api.rhm" open
+
+def reg = make_registry()
+def api = PiAPI(reg, Port.Output.current())
+
+tool api shout(text :: String) ~desc "Uppercase with bangs":
+  String.upcase(text) +& "!!!"
+
+tool api repeat_word(word :: String, times :: Int = 2) ~desc "Repeat a word":
+  String.join(for List (_ in 0..times): word, " ")
+
+def t = reg.find_tool("shout")
+println(t.schema)
+println(t.fn({ "text": "hi" }))
+def r = reg.find_tool("repeat_word")
+println(r.schema)
+println(r.fn({ "word": "go" }))
+println(r.fn({ "word": "go", "times": 4 }))
+println(try:
+          r.fn({})
+          ~catch e :: Exn.Fail: "raised: " +& e.message)
+println("tool macro ok")

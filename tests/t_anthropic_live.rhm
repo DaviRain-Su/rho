@@ -1,0 +1,49 @@
+#lang rhombus
+import:
+  "../src/ai/anthropic.rhm"
+  "../src/kernel/config.rhm" open
+
+def c = load_config(~provider: "kimi-anthropic")
+def out = Port.Output.current()
+
+def weather_tool = {
+  "name": "get_weather",
+  "description": "Get current weather for a city",
+  "schema": { "type": "object",
+              "properties": { "city": { "type": "string" } },
+              "required": ["city"] }
+}
+
+// turn 1: model should call the tool
+def msg = anthropic.stream_chat(
+  ~base_url: c.base_url(),
+  ~api_key: c.api_key(),
+  ~model: c.model,
+  ~messages: [{ "role": "system", "content": "You are a terse assistant." },
+              { "role": "user", "content": "Weather in Beijing? Use the tool." }],
+  ~tools: [weather_tool],
+  ~on_text: fun (s):
+              out.write_string(s)
+              out.flush())
+out.write_string("\n")
+println(["tool_calls", msg["tool_calls"]])
+
+// turn 2: feed tool result back
+def tc = msg["tool_calls"][0]
+def history = [
+  { "role": "system", "content": "You are a terse assistant." },
+  { "role": "user", "content": "Weather in Beijing? Use the tool." },
+  msg,
+  { "role": "tool", "tool_call_id": tc["id"], "content": "Sunny, 25C" }
+]
+def msg2 = anthropic.stream_chat(
+  ~base_url: c.base_url(),
+  ~api_key: c.api_key(),
+  ~model: c.model,
+  ~messages: history,
+  ~tools: [weather_tool],
+  ~on_text: fun (s):
+              out.write_string(s)
+              out.flush())
+out.write_string("\n")
+println(["final", msg2["content"]])

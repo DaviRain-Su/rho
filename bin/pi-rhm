@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher for pi-rhm. Assumes racket is on PATH (or set RACKET).
+dir="$(cd "$(dirname "$0")/.." && pwd)"
+exec "${RACKET:-racket}" "$dir/src/main.rhm" "$@"

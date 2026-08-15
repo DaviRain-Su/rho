@@ -1,0 +1,33 @@
+#lang rhombus
+
+// Canonical message format: OpenAI-style JSON maps.
+// Assistant tool calls: [{"id", "name", "arguments"}, ...] where arguments is a JSON string.
+
+export:
+  system_message
+  user_message
+  assistant_message
+  tool_message
+  tool_calls_of
+  content_of
+
+fun system_message(content :: String) :: Map:
+  { "role": "system", "content": content }
+
+fun user_message(content :: String) :: Map:
+  { "role": "user", "content": content }
+
+fun assistant_message(content :: String, tool_calls :: List) :: Map:
+  { "role": "assistant", "content": content, "tool_calls": tool_calls }
+
+fun tool_message(tool_call_id :: String, content :: String) :: Map:
+  { "role": "tool", "tool_call_id": tool_call_id, "content": content }
+
+fun tool_calls_of(msg :: Map) :: List:
+  msg.get("tool_calls", [])
+
+fun content_of(msg :: Map) :: String:
+  match msg.get("content", "")
+  | s :: String: s
+  | #'null: ""
+  | ~else: ""

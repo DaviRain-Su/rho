@@ -1,0 +1,32 @@
+#lang rhombus
+
+// ExtensionAPI: the `pi` object handed to each extension's init(pi).
+
+export:
+  PiAPI
+
+class PiAPI(registry, out):
+
+  method register_tool(~name: name :: String,
+                       ~description: description :: String,
+                       ~schema: schema :: Map,
+                       ~fn: fn):
+    registry.register_tool(~name: name, ~description: description,
+                           ~schema: schema, ~fn: fn)
+
+  method register_command(~name: name :: String,
+                          ~description: description :: String,
+                          ~handler: handler):
+    registry.register_command(~name: name, ~description: description,
+                              ~handler: handler)
+
+  method on(event :: String, fn):
+    registry.on(event, fn)
+
+  // Mutable key-value store owned by the kernel; survives /reload.
+  property state:
+    registry.state
+
+  method notify(msg :: String):
+    out.write_string("\u001B[36m[pi]\u001B[0m " +& msg +& "\n")
+    out.flush()

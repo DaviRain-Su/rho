@@ -1,0 +1,129 @@
+#lang rhombus
+
+// Anthropic Messages API client with SSE streaming.
+
+import:
+  json
+  net/http
+  "sse.rhm"
+
+export:
+  stream_chat
+
+fun tools_payload(tools :: List) :: List:
+  for List (t in tools):
+    { "name": t["name"],
+      "description": t["description"],
+      "input_schema": t["schema"] }
+
+// Split canonical messages into (system_text, anthropic_messages).
+// Consecutive tool results merge into a single user message, as Anthropic requires.
+fun convert_messages(messages :: List):
+  def mutable system_text = ""
+  def mutable out :: List = []
+  def mutable pending_results :: List = []
+  fun flush_results():
+    when pending_results != []
+    | out := out.add({ "role": "user", "content": pending_results })
+      pending_results := []
+  for (m in messages):
+    match m.get("role", "")
+    | "system":
+        system_text := (if system_text == ""
+                        | m.get("content", "")
+                        | system_text +& "\n\n" +& m.get("content", ""))
+    | "user":
+        flush_results()
+        out := out.add({ "role": "user", "content": m.get("content", "") })
+    | "assistant":
+        flush_results()
+        let blocks:
+          let text = m.get("content", "")
+          let base :: List = (if text is_a String && text != ""
+                              | [{ "type": "text", "text": text }]
+                              | [])
+          for values(bs = base) (tc in m.get("tool_calls", [])):
+            let input = try:
+                          json.from_string(tc["arguments"])
+                          ~catch _: {}
+            bs.add({ "type": "tool_use",
+                     "id": tc["id"],
+                     "name": tc["name"],
+                     "input": if input is_a Map | input | {} })
+        out := out.add({ "role": "assistant", "content": blocks })
+    | "tool":
+        pending_results := pending_results.add(
+          { "type": "tool_result",
+            "tool_use_id": m.get("tool_call_id", ""),
+            "content": m.get("content", "") })
+    | ~else: #void
+  flush_results()
+  values(system_text, out)
+
+// Returns canonical assistant message (same shape as openai.stream_chat).
+fun stream_chat(~base_url: base_url :: String,
+                ~api_key: api_key :: String,
+                ~model: model :: String,
+                ~messages: messages :: List,
+                ~tools: tools :: List = [],
+                ~on_text: on_text = fun (s): #void,
+                ~max_tokens: max_tokens :: Int = 8192) :: Map:
+  let (system_text, converted) = convert_messages(messages)
+  let body:
+    let base = { "model": model,
+                 "max_tokens": max_tokens,
+                 "messages": converted,
+                 "stream": #true }
+    let base = (if system_text == "" | base | base ++ { "system": system_text })
+    if tools == []
+    | base
+    | base ++ { "tools": tools_payload(tools) }
+  let resp = http.post(base_url +& "/v1/messages",
+                       ~headers: { "x-api-key": api_key,
+                                   "anthropic-version": "2023-06-01" },
+                       ~data: http.payload.json(body),
+                       ~stream: #true,
+                       ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))
+  when resp.status_code < 200 || resp.status_code >= 300
+  | let err_body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+    resp.close()
+    error("anthropic: HTTP " +& resp.status_code +& ": " +& err_body)
+  def mutable content = ""
+  def blocks = MutableMap()  // index -> {"type", "id", "name", "arguments"}
+  fun handle(_event, data :: String):
+    let msg = try:
+                json.from_string(data)
+                ~catch _: #false
+    when msg is_a Map
+    | match msg.get("type", "")
+      | "content_block_start":
+          let idx = msg.get("index", 0)
+          let cb = msg.get("content_block", {})
+          when cb.get("type", "") == "tool_use"
+          | blocks[idx] := { "type": "tool_use",
+                             "id": cb.get("id", ""),
+                             "name": cb.get("name", ""),
+                             "arguments": "" }
+      | "content_block_delta":
+          let idx = msg.get("index", 0)
+          let delta = msg.get("delta", {})
+          match delta.get("type", "")
+          | "text_delta":
+              let s = delta.get("text", "")
+              content := content +& s
+              on_text(s)
+          | "input_json_delta":
+              let prev = blocks.get(idx, { "type": "tool_use", "id": "", "name": "", "arguments": "" })
+              blocks[idx] := prev ++ { "arguments": prev["arguments"] +& delta.get("partial_json", "") }
+          | ~else: #void
+      | "error":
+          error("anthropic: stream error: " +& json.to_string(msg.get("error", {})))
+      | ~else: #void
+  sse.each_event(resp.output(), handle)
+  resp.close()
+  let tool_calls:
+    for List (idx in blocks.keys().sort()):
+      let b = blocks[idx]
+      { "id": b["id"], "name": b["name"],
+        "arguments": if b["arguments"] == "" | "{}" | b["arguments"] }
+  { "role": "assistant", "content": content, "tool_calls": tool_calls }

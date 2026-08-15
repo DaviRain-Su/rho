@@ -1,0 +1,36 @@
+#lang rhombus
+import:
+  "../src/ai/openai.rhm"
+  "../src/kernel/config.rhm" open
+
+def c = load_config()
+def out = Port.Output.current()
+
+// 1. plain streaming chat
+def msg = openai.stream_chat(
+  ~base_url: c.base_url(),
+  ~api_key: c.api_key(),
+  ~model: c.model,
+  ~messages: [{ "role": "user", "content": "Reply with exactly: hello rhombus" }],
+  ~on_text: fun (s):
+              out.write_string(s)
+              out.flush())
+out.write_string("\n")
+println(["content", msg["content"]])
+println(["tool_calls", msg["tool_calls"]])
+
+// 2. tool calling
+def weather_tool = {
+  "name": "get_weather",
+  "description": "Get current weather for a city",
+  "schema": { "type": "object",
+              "properties": { "city": { "type": "string", "description": "City name" } },
+              "required": ["city"] }
+}
+def msg2 = openai.stream_chat(
+  ~base_url: c.base_url(),
+  ~api_key: c.api_key(),
+  ~model: c.model,
+  ~messages: [{ "role": "user", "content": "What is the weather in Beijing? Use the tool." }],
+  ~tools: [weather_tool])
+println(["tool_calls2", msg2["tool_calls"]])

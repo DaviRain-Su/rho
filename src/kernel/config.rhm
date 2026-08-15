@@ -1,0 +1,109 @@
+#lang rhombus
+
+// Configuration: provider profiles + current selection.
+// Config file: ~/.pi-rhm/config.json (optional). Env vars supply API keys.
+
+import:
+  json
+  rhombus/envvar
+
+export:
+  Config
+  load_config
+  config_dir
+  sessions_dir
+  global_extensions_dir
+  project_extensions_dir
+
+fun home() :: String:
+  envvar.getenv("HOME") || "/tmp"
+
+fun config_dir() :: String:
+  home() +& "/.pi-rhm"
+
+fun sessions_dir() :: String:
+  config_dir() +& "/sessions"
+
+fun global_extensions_dir() :: String:
+  config_dir() +& "/extensions"
+
+fun project_extensions_dir() :: String:
+  ".pi-rhm/extensions"
+
+class Config(mutable provider :: String,
+             mutable model :: String,
+             providers :: Map):
+  method profile() :: Map:
+    providers.get(provider, {})
+  method base_url() :: String:
+    profile().get("base_url", "")
+  method api_key() :: String:
+    let env_name = profile().get("api_key_env", "")
+    if env_name == ""
+    | ""
+    | envvar.getenv(env_name) || ""
+  method kind() :: String:
+    // "openai" (chat completions) or "anthropic" (messages API)
+    profile().get("kind", "openai")
+
+def default_providers :: Map:
+  {
+    "kimi": {
+      "kind": "openai",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "api_key_env": "KIMI_API_KEY",
+      "default_model": "kimi-k2-turbo-preview"
+    },
+    "kimi-anthropic": {
+      "kind": "anthropic",
+      "base_url": "https://api.kimi.com/coding",
+      "api_key_env": "KIMI_API_KEY",
+      "default_model": "kimi-k2-turbo-preview"
+    },
+    "openai": {
+      "kind": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "default_model": "gpt-5.2"
+    },
+    "openrouter": {
+      "kind": "openai",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "default_model": "anthropic/claude-sonnet-4.5"
+    },
+    "ollama": {
+      "kind": "openai",
+      "base_url": "http://localhost:11434/v1",
+      "api_key_env": "",
+      "default_model": "qwen3:8b"
+    },
+    "anthropic": {
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "default_model": "claude-sonnet-4-5"
+    }
+  }
+
+fun read_config_file() :: Map:
+  let path = config_dir() +& "/config.json"
+  if filesystem.file_exists(path)
+  | try:
+      json.from_string(filesystem.read_string(path))
+      ~catch _:
+        {}
+  | {}
+
+fun load_config(~provider: provider_arg :: maybe(String) = #false,
+                ~model: model_arg :: maybe(String) = #false) :: Config:
+  let file_cfg = read_config_file()
+  let providers:
+    let extra = file_cfg.get("providers", {})
+    // file config entries override / extend defaults
+    for values(m = default_providers) ((k, v) in extra):
+      m ++ { k: v }
+  let provider = provider_arg || file_cfg.get("provider", "kimi")
+  let prof = providers.get(provider, {})
+  let model = model_arg || file_cfg.get("model", prof.get("default_model", ""))
+  Config(provider, model, providers)

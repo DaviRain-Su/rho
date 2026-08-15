@@ -1,0 +1,71 @@
+#lang rhombus
+
+// Mechanism test for hot reload: load v1 of an extension, mutate the file,
+// reload, and check that behavior changed while kernel state survived.
+
+import:
+  "../src/kernel/registry.rhm" open
+  "../src/ext/api.rhm" open
+  "../src/ext/loader.rhm" as loader
+  "../src/kernel/reload.rkt" as reload
+  rhombus/thread open
+
+def ext_dir = "/tmp/pi-tests/ext-home/extensions"
+def ext_path = ext_dir +& "/counter.rhm"
+
+when !filesystem.directory_exists(ext_dir)
+| filesystem.make_directory(ext_dir, ~parents: #true)
+
+def v1 = @str{#lang rhombus
+              export: init
+              fun init(pi):
+                pi.state["hits"] := pi.state.get("hits", 0)
+                pi.register_tool(
+                  ~name: "counter",
+                  ~description: "count",
+                  ~schema: {"type": "object", "properties": {}, "required": []},
+                  ~fn: fun (args):
+                         pi.state["hits"] := pi.state["hits"] + 1
+                         "v1 count=" +& pi.state["hits"])
+             }
+
+def v2 = @str{#lang rhombus
+              export: init
+              fun init(pi):
+                pi.state["hits"] := pi.state.get("hits", 0)
+                pi.register_tool(
+                  ~name: "counter",
+                  ~description: "count",
+                  ~schema: {"type": "object", "properties": {}, "required": []},
+                  ~fn: fun (args):
+                         pi.state["hits"] := pi.state["hits"] + 10
+                         "v2 count=" +& pi.state["hits"])
+             }
+
+def reg = make_registry()
+def out = Port.Output.current()
+def api = PiAPI(reg, out)
+
+fun load_one():
+  reg.clear_extensions()
+  reload.rerequire_path(ext_path)
+  let init = reload.get_export(ext_path, "init")
+  reg.current_source := ext_path
+  init(api)
+  reg.current_source := "builtin"
+
+filesystem.write_string(ext_path, v1, ~exists: #'truncate)
+load_one()
+println(reg.find_tool("counter").fn({}))  // v1 count=1
+println(reg.find_tool("counter").fn({}))  // v1 count=2
+
+// mtime granularity: make sure the rewrite is visible
+Thread.sleep(1.1)
+filesystem.write_string(ext_path, v2, ~exists: #'truncate)
+load_one()
+println(reg.find_tool("counter").fn({}))  // v2 count=12 (state survived!)
+
+def t = reg.find_tool("counter")
+if t.fn({}) == "v2 count=22"
+| println("reload ok: behavior changed, state survived")
+| error("reload test failed")

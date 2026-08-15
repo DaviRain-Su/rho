@@ -1,0 +1,31 @@
+#lang rhombus
+import:
+  "../src/kernel/config.rhm" open
+  "../src/kernel/registry.rhm" open
+  "../src/kernel/session.rhm" open
+  "../src/kernel/loop.rhm" open
+  "../src/tools/core.rhm" open
+
+def c = load_config()
+def reg = make_registry()
+install_core_tools(reg)
+def sess = start_session()
+def out = Port.Output.current()
+
+run_turn(
+  ~config: c,
+  ~registry: reg,
+  ~session: sess,
+  ~system_prompt: "You are a coding agent. Use tools. Be terse.",
+  ~input: "Run `uname -sr` with bash, then read /tmp/pi-tests/secret.txt, then answer: what OS and what magic word?",
+  ~on_text: fun (s):
+              out.write_string(s)
+              out.flush(),
+  ~on_tool: fun (name, args): println("\n[tool] " +& name),
+  ~on_tool_result: fun (name, r): #void)
+out.write_string("\n")
+for (m in sess.messages()):
+  when m.get("role", "") == "assistant"
+  | println(["assistant", m.get("finish_reason", "?"),
+             "text_len", m.get("content", "").length(),
+             "tools", (for List (tc in m.get("tool_calls", [])): tc["name"])])

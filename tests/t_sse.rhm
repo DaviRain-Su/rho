@@ -1,0 +1,13 @@
+#lang rhombus
+import: "../src/ai/sse.rhm"
+
+def input = Port.Input.open_string(
+  "event: message_start\ndata: {\"a\":1}\n\ndata: line1\ndata: line2\n\n: comment\ndata: [DONE]\n\n"
+)
+def mutable seen :: List = []
+sse.each_event(input, fun (ev, data): seen := seen.add([ev, data]))
+println(seen)
+def expected = [["message_start", "{\"a\":1}"], [#false, "line1\nline2"], [#false, "[DONE]"]]
+if seen == expected
+| println("sse ok")
+| error("sse mismatch")

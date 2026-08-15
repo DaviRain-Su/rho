@@ -1,0 +1,47 @@
+#lang rhombus
+
+// Extension discovery and (re)loading.
+//
+// Extensions are Rhombus modules exporting `init(pi)`. They are loaded via
+// dynamic-rerequire so that /reload picks up source changes; registry entries
+// contributed by extensions are wiped and rebuilt on each load pass.
+
+import:
+  "../kernel/reload.rkt" as reload
+  "../kernel/config.rhm"
+
+export:
+  discover_extensions
+  load_extensions
+
+fun rhm_files(dir :: String) :: List:
+  if filesystem.directory_exists(dir)
+  | for List (f in filesystem.files(dir).sort()):
+      let name = to_string(f)
+      skip_when !name.ends_with(".rhm")
+      dir +& "/" +& name
+  | []
+
+fun discover_extensions() :: List:
+  rhm_files(config.global_extensions_dir())
+    ++ rhm_files(config.project_extensions_dir())
+
+// Loads (or reloads) all extensions. Returns [loaded_count, error_count].
+fun load_extensions(registry, api, ~notify: notify = fun (s): println(s)) :: List:
+  registry.clear_extensions()
+  def mutable ok = 0
+  def mutable failed = 0
+  for (path in discover_extensions()):
+    try:
+      let changed = reload.rerequire_path(path)
+      when changed != []
+      | notify("loaded " +& path)
+      let init = reload.get_export(path, "init")
+      registry.current_source := path
+      init(api)
+      ok := ok + 1
+      ~catch e :: Exn.Fail:
+        failed := failed + 1
+        notify("extension error in " +& path +& ": " +& e.message)
+  registry.current_source := "builtin"
+  [ok, failed]

@@ -1,0 +1,193 @@
+#lang rhombus
+
+// pi-rhm: a Pi-style hot-reloadable coding agent in Rhombus.
+// Usage: racket src/main.rhm [-p provider] [-m model] [--resume session.jsonl]
+
+import:
+  lib("racket/base.rkt") as rkt
+  "kernel/config.rhm" open
+  "kernel/registry.rhm" open
+  "kernel/session.rhm" open
+  "kernel/loop.rhm" open
+  "tools/core.rhm" open
+  "ext/api.rhm" open
+  "ext/loader.rhm" as loader
+  "ui/repl.rhm" open
+
+def out = Port.Output.current()
+
+// ---- command line ----
+fun parse_args() :: Map:
+  let args = [& rkt.#{vector->list}(rkt.#{current-command-line-arguments}())]
+  recur parse(rest = (for List (a in args): to_string(a)), acc :: Map = {}):
+    match rest
+    | []: acc
+    | ["-p", v, & more]: parse(more, acc ++ { "provider": v })
+    | ["--provider", v, & more]: parse(more, acc ++ { "provider": v })
+    | ["-m", v, & more]: parse(more, acc ++ { "model": v })
+    | ["--model", v, & more]: parse(more, acc ++ { "model": v })
+    | ["--resume", v, & more]: parse(more, acc ++ { "resume": v })
+    | [a, & more]:
+        println("warning: ignoring argument " +& a)
+        parse(more, acc)
+
+def opts = parse_args()
+def config = load_config(~provider: opts.get("provider", #false),
+                         ~model: opts.get("model", #false))
+def registry = make_registry()
+install_core_tools(registry)
+def session = start_session(~resume: opts.get("resume", #false))
+def api = PiAPI(registry, out)
+
+fun cwd() :: String:
+  to_string(rkt.#{current-directory}())
+
+fun agents_md() :: String:
+  // AGENTS.md from cwd, injected into the system prompt when present
+  let path = cwd() +& "AGENTS.md"
+  if filesystem.file_exists(path)
+  | "\n\n## Project instructions (AGENTS.md)\n\n" +& filesystem.read_string(path)
+  | ""
+
+fun system_prompt() :: String:
+  "You are pi-rhm, a coding agent written in Rhombus, running in a terminal.\n"
+    +& "Working directory: " +& cwd() +& "\n"
+    +& "Use the available tools to read, write, and edit files and to run shell commands.\n"
+    +& "You can extend yourself: write a Rhombus extension module exporting `init(pi)` into "
+    +& project_extensions_dir() +& "/ or " +& global_extensions_dir() +& "/, "
+    +& "then call the reload_extensions tool to activate it immediately.\n"
+    +& "Extension template (Rhombus is indentation-sensitive; follow it exactly):\n"
+    +& "```\n"
+    +& "#lang rhombus\n"
+    +& "export: init\n"
+    +& "fun init(pi):\n"
+    +& "  pi.register_tool(\n"
+    +& "    ~name: \"my_tool\",\n"
+    +& "    ~description: \"what it does\",\n"
+    +& "    ~schema: { \"type\": \"object\",\n"
+    +& "               \"properties\": { \"x\": { \"type\": \"string\" } },\n"
+    +& "               \"required\": [\"x\"] },\n"
+    +& "    ~fn: fun (args):\n"
+    +& "           \"result: \" +& args.get(\"x\", \"\"))\n"
+    +& "```\n"
+    +& "Also available: pi.register_command(~name, ~description, ~handler), "
+    +& "pi.on(event, fn) for events (tool_call may return {\"block\": #true, \"reason\": ...}), "
+    +& "pi.state (a mutable map that survives reloads), pi.notify(msg).\n"
+    +& "Shorthand: `import: lib(\"pi-rhm/src/ext/tool.rhm\") open` provides a `tool` macro:\n"
+    +& "  tool pi greet(name :: String, times :: Int = 1) ~desc \"Greet\":\n"
+    +& "    \"Hello \" +& name\n"
+    +& "which derives the JSON schema from the annotations (defaults become optional).\n"
+    +& "Be concise. Prefer tools over guessing."
+    +& agents_md()
+
+// ---- built-in commands ----
+fun show_help(_args):
+  out.write_string("commands:\n")
+  for (c in registry.command_list()):
+    out.write_string("  /" +& c.name +& "  \u2014 " +& c.description +& "\n")
+  out.write_string("tools:\n")
+  for (t in registry.tool_list()):
+    out.write_string("  " +& t.name +& " [" +& t.source +& "]\n")
+
+fun do_reload(notify = #true):
+  let [ok, failed] = loader.load_extensions(registry, api,
+                                            ~notify: fun (s): api.notify(s))
+  when notify
+  | api.notify("extensions: " +& ok +& " loaded, " +& failed +& " failed")
+
+registry.register_command(
+  ~name: "help", ~description: "list commands and tools",
+  ~handler: show_help)
+registry.register_command(
+  ~name: "reload", ~description: "hot-reload extensions (picks up changed files)",
+  ~handler: fun (_args): do_reload())
+registry.register_command(
+  ~name: "model", ~description: "show or set model: /model [name]",
+  ~handler: fun (args):
+              if args == ""
+              | api.notify("provider=" +& config.provider +& " model=" +& config.model)
+              | config.model := args
+                api.notify("model set to " +& args))
+registry.register_command(
+  ~name: "provider", ~description: "switch provider: /provider [name]",
+  ~handler: fun (args):
+              cond
+              | args == "":
+                  api.notify("provider=" +& config.provider
+                               +& " (available: " +& String.join(config.providers.keys().sort(), ", ") +& ")")
+              | config.providers.has_key(args):
+                  config.provider := args
+                  config.model := config.profile().get("default_model", config.model)
+                  api.notify("switched to " +& args +& " model=" +& config.model)
+              | ~else:
+                  api.notify("unknown provider: " +& args))
+registry.register_command(
+  ~name: "session", ~description: "show session file and entry count",
+  ~handler: fun (_args):
+              api.notify(session.path +& " (" +& session.entries.length() +& " entries)"))
+registry.register_command(
+  ~name: "clear", ~description: "clear conversation history",
+  ~handler: fun (_args):
+              session.clear()
+              api.notify("history cleared"))
+registry.register_command(
+  ~name: "quit", ~description: "exit",
+  ~handler: fun (_args): #'quit)
+
+// Also expose reload as a tool so the agent can activate its own extensions.
+registry.register_tool(
+  ~name: "reload_extensions",
+  ~description: "Hot-reload agent extensions from the extension directories. Call after writing or editing an extension file to activate it.",
+  ~schema: { "type": "object", "properties": {}, "required": [] },
+  ~fn: fun (_args):
+         let [ok, failed] = loader.load_extensions(registry, api,
+                                                   ~notify: fun (s): api.notify(s))
+         "extensions reloaded: " +& ok +& " ok, " +& failed +& " failed")
+
+// ---- wire up ----
+fun handle_command(name :: String, args :: String):
+  match registry.find_command(name)
+  | c :: Command: c.handler(args)
+  | ~else:
+      api.notify("unknown command: /" +& name +& " (try /help)")
+
+fun handle_input(input :: String):
+  run_turn(~config: config,
+           ~registry: registry,
+           ~session: session,
+           ~system_prompt: system_prompt(),
+           ~input: input,
+           ~on_text: fun (s):
+                       out.write_string(s)
+                       out.flush(),
+           ~on_tool: fun (name, args):
+                       out.write_string("\n" +& color("2", "\u25CF " +& name +& " "
+                                                        +& summarize(args)) +& "\n")
+                       out.flush(),
+           ~on_tool_result: fun (name, r):
+                              out.write_string(color("2", "  \u21B3 " +& first_line(r)) +& "\n")
+                              out.flush())
+  out.write_string("\n")
+
+fun summarize(args :: Map) :: String:
+  let s = to_string(args)
+  if s.length() > 80 | s.substring(0..80) +& "\u2026" | s
+
+fun first_line(s :: String) :: String:
+  let lines = s.split("\n")
+  cond
+  | lines == []: ""
+  | lines.length() == 1: to_string(lines[0])
+  | ~else: to_string(lines[0]) +& " \u2026"
+
+def banner:
+  color("1;35", "pi-rhm") +& " \u2014 hot-reloadable Rhombus coding agent\n"
+    +& "provider=" +& config.provider +& " model=" +& config.model +& "\n"
+    +& "session=" +& session.path +& "\n"
+    +& "type /help for commands\n\n"
+
+module main:
+  do_reload(#false)
+  run_repl(~banner: banner,
+           ~handle_command: handle_command,
+           ~handle_input: handle_input)

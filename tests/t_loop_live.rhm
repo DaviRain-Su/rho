@@ -1,0 +1,35 @@
+#lang rhombus
+import:
+  "../src/kernel/config.rhm" open
+  "../src/kernel/registry.rhm" open
+  "../src/kernel/session.rhm" open
+  "../src/kernel/loop.rhm" open
+  "../src/tools/core.rhm" open
+
+filesystem.write_string("/tmp/pi-tests/secret.txt", "the magic word is PLUM\n", ~exists: #'truncate)
+
+def c = load_config()
+def reg = make_registry()
+install_core_tools(reg)
+def sess = start_session()
+def out = Port.Output.current()
+
+run_turn(
+  ~config: c,
+  ~registry: reg,
+  ~session: sess,
+  ~system_prompt: "You are a coding agent. Use tools to complete tasks. Be terse.",
+  ~input: "Read /tmp/pi-tests/secret.txt and tell me the magic word.",
+  ~on_text: fun (s):
+              out.write_string(s)
+              out.flush(),
+  ~on_tool: fun (name, args):
+              println("\n[tool] " +& name +& " " +& to_string(args)),
+  ~on_tool_result: fun (name, r):
+                     println("[result] " +& r))
+out.write_string("\n")
+println(["entries", sess.entries.length(), "file", sess.path])
+
+// resume round-trip
+def sess2 = start_session(~resume: sess.path)
+println(["resumed", sess2.entries.length() == sess.entries.length()])

@@ -1,0 +1,138 @@
+#lang rhombus
+
+// Built-in tools: read_file, write_file, edit_file, bash.
+
+import:
+  rhombus/subprocess
+  rhombus/thread open
+
+export:
+  install_core_tools
+
+def MAX_OUTPUT = 32 * 1024
+
+fun truncate(s :: String) :: String:
+  if s.length() > MAX_OUTPUT
+  | s.substring(0 .. MAX_OUTPUT) +& "\n... [output truncated]"
+  | s
+
+fun tool_read_file(args :: Map):
+  let path = args.get("path", "")
+  cond
+  | !filesystem.file_exists(path):
+      "error: file not found: " +& path
+  | ~else:
+      let content = filesystem.read_string(path)
+      let lines = content.split("\n", ~trim: #false)
+      let offset = args.get("offset", 1)
+      let limit = args.get("limit", 2000)
+      let numbered:
+        for List (i in offset .. math.min(offset + limit, lines.length() + 1)):
+          i +& "| " +& lines[i - 1]
+      truncate(String.join(numbered, "\n"))
+
+fun tool_write_file(args :: Map):
+  let path = args.get("path", "")
+  let content = args.get("content", "")
+  let dir = Path(path).parent()
+  when dir is_a Path && !filesystem.directory_exists(dir)
+  | filesystem.make_directory(dir, ~parents: #true)
+  filesystem.write_string(path, content, ~exists: #'truncate)
+  "wrote " +& content.length() +& " chars to " +& path
+
+fun tool_edit_file(args :: Map):
+  let path = args.get("path", "")
+  let old_str = args.get("old_string", "")
+  let new_str = args.get("new_string", "")
+  cond
+  | !filesystem.file_exists(path):
+      "error: file not found: " +& path
+  | old_str == "":
+      "error: old_string must not be empty"
+  | ~else:
+      let content = filesystem.read_string(path)
+      let pieces = content.split(old_str, ~trim: #false)
+      cond
+      | pieces.length() == 1:
+          "error: old_string not found in " +& path
+      | pieces.length() > 2:
+          "error: old_string occurs " +& (pieces.length() - 1)
+            +& " times in " +& path +& "; make it unique"
+      | ~else:
+          filesystem.write_string(path, String.join(pieces, new_str),
+                                  ~exists: #'truncate)
+          "edited " +& path
+
+fun tool_bash(args :: Map):
+  let cmd = args.get("command", "")
+  let timeout = args.get("timeout", 120)
+  let sp = subprocess.run_shell(cmd,
+                                ~in: Port.Input.open_string(""),
+                                ~out: #'pipe,
+                                ~err: #'out)
+  let buf = Port.Output.open_string()
+  let reader:
+    thread:
+      sp.out.copy_to(buf)
+  let status:
+    recur poll_loop(ticks = timeout * 10):
+      cond
+      | ticks <= 0:
+          sp.kill()
+          #'timeout
+      | ~else:
+          match sp.poll()
+          | #false:
+              Thread.sleep(0.1)
+              poll_loop(ticks - 1)
+          | code: code
+  reader.wait()
+  let output = truncate(buf.get_string().to_string())
+  match status
+  | #'timeout: "error: command timed out after " +& timeout +& "s\n" +& output
+  | 0: (if output == "" | "(no output)" | output)
+  | code: "exit code " +& code +& "\n" +& output
+
+fun install_core_tools(registry):
+  registry.register_tool(
+    ~name: "read_file",
+    ~description: "Read a file from the filesystem with line numbers. Returns up to `limit` lines starting at line `offset` (1-based).",
+    ~schema: { "type": "object",
+               "properties": {
+                 "path": { "type": "string", "description": "Path to the file" },
+                 "offset": { "type": "integer", "description": "1-based first line to read (default 1)" },
+                 "limit": { "type": "integer", "description": "Max number of lines (default 2000)" }
+               },
+               "required": ["path"] },
+    ~fn: tool_read_file)
+  registry.register_tool(
+    ~name: "write_file",
+    ~description: "Write content to a file, creating parent directories as needed. Overwrites existing files.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "path": { "type": "string", "description": "Path to the file" },
+                 "content": { "type": "string", "description": "Full file content" }
+               },
+               "required": ["path", "content"] },
+    ~fn: tool_write_file)
+  registry.register_tool(
+    ~name: "edit_file",
+    ~description: "Replace an exact string in a file. old_string must occur exactly once; include enough context to make it unique.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "path": { "type": "string", "description": "Path to the file" },
+                 "old_string": { "type": "string", "description": "Exact text to replace" },
+                 "new_string": { "type": "string", "description": "Replacement text" }
+               },
+               "required": ["path", "old_string", "new_string"] },
+    ~fn: tool_edit_file)
+  registry.register_tool(
+    ~name: "bash",
+    ~description: "Run a shell command and return its combined stdout/stderr output.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "command": { "type": "string", "description": "Shell command to run" },
+                 "timeout": { "type": "integer", "description": "Timeout in seconds (default 120)" }
+               },
+               "required": ["command"] },
+    ~fn: tool_bash)

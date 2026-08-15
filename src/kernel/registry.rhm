@@ -1,0 +1,91 @@
+#lang rhombus
+
+// Central registry: tools, commands, event handlers, extension state.
+// Entries are tagged with a source ("builtin" or extension path) so that
+// extension-contributed entries can be wiped and rebuilt on /reload.
+
+export:
+  Tool
+  Command
+  Registry
+  make_registry
+
+class Tool(name :: String,
+           description :: String,
+           schema :: Map,
+           fn,
+           source :: String):
+  method wire() :: Map:
+    // shape consumed by provider clients
+    { "name": name, "description": description, "schema": schema }
+
+class Command(name :: String,
+              description :: String,
+              handler,
+              source :: String)
+
+class Registry(tools :: MutableMap,
+               commands :: MutableMap,
+               handlers :: MutableMap,
+               state :: MutableMap,
+               mutable current_source :: String):
+
+  method register_tool(~name: name :: String,
+                       ~description: description :: String,
+                       ~schema: schema :: Map,
+                       ~fn: fn):
+    tools[name] := Tool(name, description, schema, fn, current_source)
+
+  method register_command(~name: name :: String,
+                          ~description: description :: String,
+                          ~handler: handler):
+    commands[name] := Command(name, description, handler, current_source)
+
+  method on(event :: String, fn):
+    handlers[event] := handlers.get(event, []).add([current_source, fn])
+
+  // Runs all handlers for event; returns first Map result that is not #false
+  // (used for tool_call interception: {"block": #true, "reason": ...}).
+  method emit(event :: String, data :: Map):
+    for values(result = #false) (entry in handlers.get(event, [])):
+      let [_, fn] = entry
+      let r = try:
+                fn(data)
+                ~catch e :: Exn.Fail:
+                  println("[pi] handler error for " +& event +& ": " +& e.message)
+                  #false
+      result || (r is_a Map && r)
+
+  method find_tool(name :: String) :: maybe(Tool):
+    tools.get(name, #false)
+
+  method tool_list() :: List:
+    for List (name in tools.keys().sort()):
+      tools[name]
+
+  method tools_wire() :: List:
+    for List (t in tool_list()):
+      t.wire()
+
+  method command_list() :: List:
+    for List (name in commands.keys().sort()):
+      commands[name]
+
+  method find_command(name :: String) :: maybe(Command):
+    commands.get(name, #false)
+
+  // Remove everything not contributed by "builtin" (used before reload).
+  method clear_extensions():
+    for (name in tools.keys()):
+      when (tools[name] :: Tool).source != "builtin"
+      | tools.remove(name)
+    for (name in commands.keys()):
+      when (commands[name] :: Command).source != "builtin"
+      | commands.remove(name)
+    for (event in handlers.keys()):
+      handlers[event] := (for List (entry in handlers[event]):
+                            skip_when entry[0] != "builtin"
+                            entry)
+
+fun make_registry() :: Registry:
+  Registry(MutableMap(), MutableMap(), MutableMap(), MutableMap(), "builtin")

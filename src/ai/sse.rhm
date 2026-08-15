@@ -1,0 +1,28 @@
+#lang rhombus
+
+// Server-Sent Events parser over an input port.
+// Calls handle(event_name :: maybe(String), data :: String) per event frame.
+
+export:
+  each_event
+
+fun each_event(port, handle):
+  recur loop(event = #false, data_lines :: List = []):
+    fun dispatch():
+      when data_lines != []
+      | handle(event, String.join(data_lines, "\n"))
+    let line = port.read_line()
+    cond
+    | line == Port.eof:
+        dispatch()
+    | line == "":
+        dispatch()
+        loop(#false, [])
+    | line.starts_with("data:"):
+        let payload = line.substring(5..).trim()
+        loop(event, data_lines.add(payload))
+    | line.starts_with("event:"):
+        loop(line.substring(6..).trim(), data_lines)
+    | ~else:
+        // comment or unknown field
+        loop(event, data_lines)

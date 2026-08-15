@@ -1,0 +1,4 @@
+#lang rhombus
+import: "../src/kernel/config.rhm" open
+def c = load_config()
+println([c.provider, c.model, c.base_url(), c.kind(), c.api_key() != ""])

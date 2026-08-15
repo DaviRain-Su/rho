@@ -844,7 +844,8 @@ registry.register_command(
   ~name: "hotkeys", ~description: "list TUI keyboard shortcuts",
   ~handler: fun (_args):
               out.write_string("Enter submit \u00B7 Ctrl-J newline \u00B7 Tab complete path (@token fuzzy)\n"
-                                 +& "Up/Down history or cursor \u00B7 PgUp/PgDn scroll \u00B7 Ctrl-C interrupt/clear/quit\n"
+                                 +& "Up/Down history or cursor \u00B7 PgUp/PgDn or mouse wheel scroll (Shift+drag to select text)\n"
+                                 +& "Ctrl-C interrupt/clear/quit\n"
                                  +& "Esc interrupt turn \u00B7 Ctrl-P cycle provider \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
                                  +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"))
 

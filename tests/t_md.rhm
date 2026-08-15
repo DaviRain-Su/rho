@@ -1,0 +1,90 @@
+#lang rhombus
+
+// markdown span rendering + span wrapping unit tests
+
+import:
+  "../src/ui/tui.rhm" as tui
+
+def mutable failures = 0
+
+fun check(label :: String, got, want):
+  if got == want
+  | println("ok   " +& label)
+  | println("FAIL " +& label +& "\n  got:  " +& to_string(got)
+              +& "\n  want: " +& to_string(want))
+    failures := failures + 1
+
+fun tcolor(kind :: String):
+  let c = tui.default_theme.get(kind, "default")
+  if c == "default" | #false | c
+
+// headers: whole line bold + md_head color
+check("header",
+      tui.md_line_spans("## Title", #false, tcolor),
+      [["cyan", #false, "bold", "## Title"]])
+
+// fence marker line
+check("fence marker",
+      tui.md_line_spans("```python", #false, tcolor),
+      [["brblack", #false, "dim", "```python"]])
+
+// inside a fence: code color, no inline parsing
+check("fence body",
+      tui.md_line_spans("x = **1**", #true, tcolor),
+      [["yellow", #false, #false, "x = **1**"]])
+
+// bullet marker styled, rest inline-parsed
+check("bullet with bold",
+      tui.md_line_spans("- a **b** c", #false, tcolor),
+      [["magenta", #false, "bold", "- "],
+       [#false, #false, #false, "a "],
+       [#false, #false, "bold", "b"],
+       [#false, #false, #false, " c"]])
+
+// numbered list
+check("numbered list",
+      tui.md_line_spans("12. item", #false, tcolor),
+      [["magenta", #false, "bold", "12. "],
+       [#false, #false, #false, "item"]])
+
+// inline code
+check("inline code",
+      tui.md_line_spans("run `make` now", #false, tcolor),
+      [[#false, #false, #false, "run "],
+       ["yellow", #false, #false, "make"],
+       [#false, #false, #false, " now"]])
+
+// unclosed markers stay literal
+check("unclosed bold literal",
+      tui.md_line_spans("a ** b", #false, tcolor),
+      [[#false, #false, #false, "a ** b"]])
+
+// blockquote
+check("quote",
+      tui.md_line_spans("> hi", #false, tcolor),
+      [["brblack", #false, "italic", "> hi"]])
+
+// plain text passes through
+check("plain",
+      tui.md_line_spans("hello", #false, tcolor),
+      [[#false, #false, #false, "hello"]])
+
+// span wrapping: cuts across spans by display width (CJK = 2 cols)
+check("wrap across spans",
+      tui.wrap_spans([[#false, #false, #false, "abcd"],
+                      [#false, #false, "bold", "efgh"]], 6),
+      [[[#false, #false, #false, "abcd"], [#false, #false, "bold", "ef"]],
+       [[#false, #false, "bold", "gh"]]])
+
+check("wrap wide chars",
+      tui.wrap_spans([[#false, #false, #false, "一二三四"]], 6),
+      [[[#false, #false, #false, "一二三"]],
+       [[#false, #false, #false, "四"]]])
+
+check("wrap empty",
+      tui.wrap_spans([[#false, #false, #false, ""]], 10),
+      [[[#false, #false, #false, ""]]])
+
+if failures == 0
+| println("ALL PASS")
+| error("md tests failed: " +& failures)

@@ -30,7 +30,10 @@
          racket/string
          racket/port
          lux/chaos
-         raart/lux-chaos)
+         raart/lux-chaos
+         (only-in ansi/lcd-terminal
+                  any-mouse-event? mouse-event? mouse-event-type
+                  mouse-event-button))
 
 (provide term-start!
          term-stop!
@@ -88,7 +91,9 @@
     [_ #f]))
 
 (define (term-start!)
-  (set! C (make-raart))
+  ;; mouse? enables SGR mouse reporting so wheel scrolling works in the
+  ;; alternate screen (hold Shift for native terminal text selection)
+  (set! C (make-raart #:mouse? #t))
   (chaos-start! C)
   (set! OP (current-output-port))
   (match (stty-size)
@@ -126,6 +131,10 @@
      (apply-size! (screen-size-report-rows e)
                   (screen-size-report-columns e))
      (treelist 'resize ROWS COLS)]
+    [(and (mouse-event? e) (eq? (mouse-event-type e) 'scroll))
+     ;; wheel up = button 4 (scroll toward older lines), down = button 5
+     (treelist 'wheel (if (= (mouse-event-button e) 4) 3 -3))]
+    [(any-mouse-event? e) 'skip]     ; clicks, motion, focus: ignored
     [(string? e) (treelist 'key (string->immutable-string e))]
     [(eof-object? e) 'eof]
     [else (treelist 'key (string->immutable-string (format "~a" e)))]))
@@ -143,9 +152,14 @@
     [(brblue) 94] [(brmagenta) 95] [(brcyan) 96] [(brwhite) 97]
     [else #f]))
 
+(define (style-code s)
+  (case (->sym s)
+    [(bold) 1] [(dim) 2] [(italic) 3] [(underline) 4]
+    [else #f]))
+
 (define (span-sgr f b s)
   (define codes
-    (append (if (memq (->sym s) '(bold)) '(1) '())
+    (append (let ([sc (and s (style-code s))]) (if sc (list sc) '()))
             (let ([fc (and f (color-code f))]) (if fc (list fc) '()))
             (let ([bc (and b (color-code b))]) (if bc (list (+ bc 10)) '()))))
   (if (null? codes)

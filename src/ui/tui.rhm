@@ -6,9 +6,11 @@
 // editor / footer. The status line (spinner + activity + elapsed) is its own
 // row above the editor, so it never covers the footer stats.
 // Keys: Enter submit, Ctrl-J newline, Tab path completion, Up/Down history
-// (or cursor movement in multi-line input), PgUp/PgDn scroll, Ctrl-C
-// interrupt turn (or clear input / quit), Escape interrupt, Ctrl-P cycle
-// model, Ctrl-L redraw, Ctrl-D quit.
+// (or cursor movement in multi-line input), PgUp/PgDn or mouse wheel scroll,
+// Ctrl-C interrupt turn (or clear input / quit), Escape interrupt, Ctrl-P
+// cycle model, Ctrl-L redraw, Ctrl-D quit.
+// Assistant output is rendered with lightweight markdown styling (headers,
+// bold, `code`, ``` fences, lists, quotes).
 //
 // While a turn runs, typed lines steer (same mailbox protocol as the line
 // REPL); "/follow <msg>" queues a follow-up turn. "!cmd" runs a shell
@@ -24,6 +26,8 @@ export:
   push_delta
   set_activity
   default_theme
+  md_line_spans
+  wrap_spans
 
 // ---- shared transcript state (written by turn threads, read by render) ----
 def mutable lines :: List = []       // [kind, text] finalized lines
@@ -101,7 +105,9 @@ def default_theme :: Map:
   { "user": "cyan", "assistant": "default", "tool": "yellow",
     "tool_result": "brblack", "notify": "blue", "steer": "magenta",
     "error": "red", "shell": "green", "sep": "brblack",
-    "footer_fg": "black", "footer_bg": "white", "prompt": "magenta" }
+    "footer_fg": "black", "footer_bg": "white", "prompt": "magenta",
+    "md_head": "cyan", "md_code": "yellow", "md_quote": "brblack",
+    "md_bullet": "magenta" }
 
 // ---- helpers ----
 
@@ -124,28 +130,123 @@ fun display_width(s :: String) :: Int:
   for values(w = 0) (c in s):
     w + char_width(c)
 
-// Wrap by display columns, not characters.
-fun wrap_line(s :: String, w :: Int) :: List:
-  cond
-  | s == "": [""]
-  | ~else:
-      recur go(rest = s, acc :: List = []):
-        let len = rest.length()
+// Wrap a row of spans ([fg, bg, style, text]) into rows of at most w columns.
+fun wrap_spans(spans :: List, w :: Int) :: List:
+  recur go(pending = spans, cur :: List = [], cur_w = 0, acc :: List = []):
+    match pending
+    | []: acc.add(cur)
+    | [span, & rest]:
+        let [f, b, st, text0] = span
+        let text = to_string(text0)
+        let len = text.length()
+        let avail = w - cur_w
         let cut:
           recur scan(i = 0, tot = 0):
             cond
             | i >= len: i
             | ~else:
-                let cw = char_width(rest[i])
-                if tot + cw > w | i | scan(i + 1, tot + cw)
-        if cut >= len
-        | acc.add(rest)
-        | (block:
-             let cut = math.max(1, cut)
-             go(rest.substring(cut ..), acc.add(rest.substring(0 .. cut))))
+                let cw = char_width(text[i])
+                if tot + cw > avail | i | scan(i + 1, tot + cw)
+        cond
+        | cut >= len:
+            go(rest, cur.add([f, b, st, text]), cur_w + display_width(text), acc)
+        | cut == 0 && cur != []:
+            go(pending, [], 0, acc.add(cur))
+        | ~else:
+            let cut = math.max(1, cut)
+            go([[f, b, st, text.substring(cut ..)]] ++ rest, [], 0,
+               acc.add(cur.add([f, b, st, text.substring(0 .. cut)])))
 
 fun clamp(x, lo, hi):
   math.max(lo, math.min(x, hi))
+
+// ---- lightweight markdown styling for assistant output ----
+
+fun find_str(s :: String, sub :: String, from :: Int):
+  let n = s.length()
+  let m = sub.length()
+  recur go(i = from):
+    cond
+    | i + m > n: #false
+    | s.substring(i .. i + m) == sub: i
+    | ~else: go(i + 1)
+
+// index just past "# ".."###### " when the line is a header
+fun md_header_end(s :: String):
+  recur go(i = 0):
+    cond
+    | i < s.length() && i < 6 && s[i] == Char"#": go(i + 1)
+    | i > 0 && i < s.length() && s[i] == Char" ": i
+    | ~else: #false
+
+// index just past a list marker ("- ", "* ", "+ ", "12. "), or #false
+fun md_bullet_end(s :: String):
+  let n = s.length()
+  fun digit(c :: Char):
+    c.to_int() >= 48 && c.to_int() <= 57
+  recur sp(i = 0):
+    cond
+    | i < n && s[i] == Char" ": sp(i + 1)
+    | ~else:
+        cond
+        | i + 1 < n && (s[i] == Char"-" || s[i] == Char"*" || s[i] == Char"+")
+            && s[i + 1] == Char" ":
+            i + 2
+        | ~else:
+            recur dg(j = i):
+              cond
+              | j < n && digit(s[j]): dg(j + 1)
+              | j > i && j + 1 < n && s[j] == Char"." && s[j + 1] == Char" ":
+                  j + 2
+              | ~else: #false
+
+// inline `code` and **bold** within a normal text line
+fun md_inline(s :: String, code_color) :: List:
+  recur go(rest = s, acc :: List = []):
+    cond
+    | rest == "":
+        if acc == [] | [[#false, #false, #false, ""]] | acc
+    | ~else:
+        let bt = find_str(rest, "`", 0)
+        let bd = find_str(rest, "**", 0)
+        cond
+        | bt is_a Int && (!(bd is_a Int) || bt < bd):
+            match find_str(rest, "`", bt + 1)
+            | j :: Int:
+                let acc2:
+                  if bt > 0
+                  | acc.add([#false, #false, #false, rest.substring(0 .. bt)])
+                  | acc
+                go(rest.substring(j + 1 ..),
+                   acc2.add([code_color, #false, #false, rest.substring(bt + 1 .. j)]))
+            | ~else: acc.add([#false, #false, #false, rest])
+        | bd is_a Int:
+            match find_str(rest, "**", bd + 2)
+            | j :: Int:
+                let acc2:
+                  if bd > 0
+                  | acc.add([#false, #false, #false, rest.substring(0 .. bd)])
+                  | acc
+                go(rest.substring(j + 2 ..),
+                   acc2.add([#false, #false, "bold", rest.substring(bd + 2 .. j)]))
+            | ~else: acc.add([#false, #false, #false, rest])
+        | ~else: acc.add([#false, #false, #false, rest])
+
+// One logical assistant line -> styled spans. in_fence: inside a ``` block.
+fun md_line_spans(text :: String, in_fence, tcolor) :: List:
+  let t = text.trim()
+  cond
+  | t.starts_with("```"): [[tcolor("sep"), #false, "dim", text]]
+  | in_fence: [[tcolor("md_code"), #false, #false, text]]
+  | md_header_end(text) is_a Int: [[tcolor("md_head"), #false, "bold", text]]
+  | t == "---" || t == "***" || t == "___": [[tcolor("sep"), #false, "dim", text]]
+  | t.starts_with(">"): [[tcolor("md_quote"), #false, "italic", text]]
+  | ~else:
+      match md_bullet_end(text)
+      | m :: Int:
+          [[tcolor("md_bullet"), #false, "bold", text.substring(0 .. m)]]
+            ++ md_inline(text.substring(m ..), tcolor("md_code"))
+      | ~else: md_inline(text, tcolor("md_code"))
 
 fun list_dir_safe(dir :: String) :: List:
   if filesystem.directory_exists(dir)
@@ -212,6 +313,7 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable spin_i = 0
   def mutable turn_started = 0
   def mutable last_size_poll = rkt.#{current-inexact-milliseconds}()
+  def mutable last_trans_h = 20      // visible transcript height from last render
 
   // autocomplete popup (pi-style): opens while typing /command or @file
   def mutable ac_open = #false
@@ -550,10 +652,10 @@ fun run_tui(~theme: theme_in :: Map = {},
         | ~else: #void
         dirty := #true
     | k == "<page-up>":
-        scroll := scroll + 10
+        scroll := scroll + math.max(3, last_trans_h - 2)
         dirty := #true
     | k == "<page-down>":
-        scroll := math.max(0, scroll - 10)
+        scroll := math.max(0, scroll - math.max(3, last_trans_h - 2))
         dirty := #true
     | k == "C-C":
         cond
@@ -586,18 +688,30 @@ fun run_tui(~theme: theme_in :: Map = {},
     let popup_h = (if ac_open && ac_items != [] | math.min(5, ac_items.length()) | 0)
     // rows = transcript + status(1) + separator(1) + editor + popup + footer(1)
     let trans_h = math.max(3, rows - input_h - 3 - popup_h)
+    last_trans_h := trans_h
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
     let all_lines = (if partial == "" | lines | lines.add(["assistant", partial]))
     let need = trans_h + scroll + 4
     let tail_start = math.max(0, all_lines.length() - need)
+    // assistant lines get markdown styling; ``` fences are tracked while
+    // walking the tail (a fence opened before the window is missed — rare)
+    def mutable fence = #false
     let wrapped:
       for List:
         each i in tail_start .. all_lines.length()
         let [kind, text] = all_lines[i]
-        let shown = tool_line(kind, text) || text
-        each piece in wrap_line(to_string(shown), cols)
-        [kind, piece]
+        let shown = to_string(tool_line(kind, text) || text)
+        let spans:
+          cond
+          | kind == "assistant":
+              let was = fence
+              when shown.trim().starts_with("```")
+              | fence := !fence
+              md_line_spans(shown, was, tcolor)
+          | ~else: [[tcolor(kind), #false, #false, shown]]
+        each row in wrap_spans(spans, cols)
+        row
     let max_scroll:
       if tail_start > 0
       | scroll  // older lines exist beyond the wrapped tail; allow scrolling on
@@ -605,21 +719,21 @@ fun run_tui(~theme: theme_in :: Map = {},
     let off = clamp(scroll, 0, max_scroll)
     scroll := off
     let first = math.max(0, wrapped.length() - trans_h - off)
-    let visible:
-      for List (i in first .. math.min(wrapped.length(), first + trans_h)):
-        wrapped[i]
     let trans_rows:
       let real:
-        for List (entry in visible):
-          let [kind, text] = entry
-          [[tcolor(kind), #false, #false, text]]
+        for List (i in first .. math.min(wrapped.length(), first + trans_h)):
+          wrapped[i]
       let pad:
-        for List (i in 0 .. trans_h - visible.length()):
+        for List (i in 0 .. trans_h - real.length()):
           [[#false, #false, #false, ""]]
       real ++ pad
-    // separator
-    let sep = [[tcolor("sep"), #false, #false,
-                String.make(cols, Char"\u2500")]]
+    // separator; shows position while scrolled back
+    let sep_text:
+      if off > 0
+      | let tag = "\u2500\u2500 \u2193 " +& off +& " (PgDn/wheel to return) "
+        tag +& String.make(math.max(0, cols - display_width(tag)), Char"\u2500")
+      | String.make(cols, Char"\u2500")
+    let sep = [[tcolor("sep"), #false, #false, sep_text]]
     // editor window containing the cursor
     let win_start = clamp(cur_line - input_h + 1, 0, math.max(0, input_lines.length() - input_h))
     let input_rows:
@@ -708,8 +822,12 @@ fun run_tui(~theme: theme_in :: Map = {},
         match e
         | #'timeout: #void
         | #'wake: #void
+        | #'skip: #void
         | #'eof: running := #false
         | [#'resize, _, _]: dirty := #true
+        | [#'wheel, d]:
+            scroll := math.max(0, scroll + d)
+            dirty := #true
         | [#'key, k]:
             dlog("key " +& k)
             try:

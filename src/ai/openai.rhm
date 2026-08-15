@@ -59,9 +59,11 @@ fun stream_chat(~base_url: base_url :: String,
     | base
     | base ++ { "tools": tools_payload(tools) }
   let headers:
+    // identity: gzip streaming adds buffering that delays SSE deltas
+    let base = { "Accept-Encoding": "identity" }
     if api_key == ""
-    | {}
-    | { "Authorization": "Bearer " +& api_key }
+    | base
+    | base ++ { "Authorization": "Bearer " +& api_key }
   let resp = http.post(base_url +& "/chat/completions",
                        ~headers: headers,
                        ~data: http.payload.json(body),
@@ -99,8 +101,11 @@ fun stream_chat(~base_url: base_url :: String,
           let delta = choices[0].get("delta", {})
           match delta.get("content", #'null)
           | s :: String:
-              content := content +& s
-              on_text(s)
+              // skip the empty role-announcement chunk so callers don't flip
+              // to "responding" seconds before any text is visible
+              when s != ""
+              | content := content +& s
+                on_text(s)
           | ~else: #void
           for (tc in delta.get("tool_calls", [])):
             let idx = tc.get("index", 0)

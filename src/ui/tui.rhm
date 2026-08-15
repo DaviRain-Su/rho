@@ -38,6 +38,13 @@ fun set_activity(s):
   activity := s
   dirty := #true
 
+// module-level debug log (enabled by RHO_TUI_DEBUG=/path in run_tui)
+def mutable debug_port = #false
+fun dlog(msg :: String):
+  when debug_port
+  | rkt.#{write-string}(msg +& "\n", debug_port)
+    rkt.#{flush-output}(debug_port)
+
 fun strip_ansi(s :: String) :: String:
   // remove \e[...m style sequences
   recur go(rest = s, acc = ""):
@@ -60,6 +67,7 @@ fun push(kind :: String, text :: String):
   dirty := #true
 
 fun push_delta(s :: String):
+  dlog("delta " +& s.length() +& " at " +& math.exact(math.round(rkt.#{current-inexact-milliseconds}())))
   partial := partial +& s
   recur split():
     let idx:
@@ -468,6 +476,12 @@ fun run_tui(~theme: theme_in :: Map = {},
                        [cursor_row, cursor_col])
     dirty := #false
 
+  // optional render-loop profiling: RHO_TUI_DEBUG=/path/to/log
+  match rkt.getenv("RHO_TUI_DEBUG")
+  | s :: ReadableString:
+      debug_port := rkt.#{open-output-file}(to_string(s), ~exists: #'truncate)
+  | ~else: #void
+
   // main loop
   term.#{term-start!}()
   try:
@@ -489,13 +503,19 @@ fun run_tui(~theme: theme_in :: Map = {},
         when turn_thread
         | dirty := #true
         when dirty
-        | render()
+        | let t0 = rkt.#{current-inexact-milliseconds}()
+          render()
+          let t1 = rkt.#{current-inexact-milliseconds}()
+          dlog("render " +& math.exact(math.round(t1 - t0)) +& "ms at " +& math.exact(math.round(t1)))
         // periodically re-check the terminal size via stty (works even when
         // the terminal ignores CSI size queries)
         size_tick := size_tick + 1
         when size_tick mod (if turn_thread | 25 | 2) == 0
-        | when term.#{term-poll-size!}()
+        | let p0 = rkt.#{current-inexact-milliseconds}()
+          when term.#{term-poll-size!}()
           | dirty := #true
+          let p1 = rkt.#{current-inexact-milliseconds}()
+          dlog("poll-size " +& math.exact(math.round(p1 - p0)) +& "ms")
         let e = term.#{term-wait-event}(if turn_thread | 0.05 | 0.5)
         match e
         | #'timeout: #void

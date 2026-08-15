@@ -1,0 +1,49 @@
+#lang rhombus
+
+// Measures streaming latency of the OpenAI client directly (no TUI):
+// time-to-first-token and inter-delta gaps.
+
+import:
+  lib("racket/base.rkt") as rkt
+  "../src/kernel/config.rhm" as config
+  "../src/ai/openai.rhm" as openai
+
+def cfg = config.load_config()
+def t0 = rkt.#{current-inexact-milliseconds}()
+def mutable stamps :: List = []
+def mutable nchars = 0
+
+def result:
+  openai.stream_chat(~base_url: cfg.base_url(),
+                     ~api_key: cfg.api_key(),
+                     ~model: cfg.model,
+                     ~messages: [{ "role": "user",
+                                   "content": "Count from 1 to 60 as words, one per line." }],
+                     ~on_text: fun (s :: String):
+                                 stamps := stamps.add(rkt.#{current-inexact-milliseconds}())
+                                 nchars := nchars + s.length())
+
+def tend = rkt.#{current-inexact-milliseconds}()
+fun ms(x): math.exact(math.round(x))
+
+println("deltas: " +& stamps.length() +& "  chars: " +& nchars)
+when stamps != []
+| println("ttft: " +& ms(stamps[0] - t0) +& " ms")
+  println("total: " +& ms(tend - t0) +& " ms  stream span: "
+            +& ms(stamps[stamps.length() - 1] - stamps[0]) +& " ms")
+  // gap histogram
+  def mutable maxgap = 0
+  def mutable maxat = 0
+  def mutable over100 = 0
+  def mutable over500 = 0
+  for (i in 1 .. stamps.length()):
+    let gap = stamps[i] - stamps[i - 1]
+    when gap > maxgap | maxgap := gap
+                        maxat := i
+    when gap > 100 | over100 := over100 + 1
+    when gap > 500 | over500 := over500 + 1
+  println("max gap: " +& ms(maxgap) +& " ms at delta " +& maxat +& "/" +& stamps.length()
+            +& "  gaps>100ms: " +& over100 +& "  gaps>500ms: " +& over500)
+  let span = stamps[stamps.length() - 1] - stamps[0]
+  when span > 0
+  | println("throughput: " +& ms(nchars * 1000 / span) +& " chars/s")

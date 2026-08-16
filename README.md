@@ -1,9 +1,14 @@
 # rho (ρ)
 
-A [Pi](https://pi.dev)-style, hot-reloadable coding agent written in
-[Rhombus](https://rhombus-lang.org/). Minimal harness, everything else is an
-extension — and the agent can write, reload, and use its own extensions in the
-same session.
+[![CI](https://github.com/DaviRain-Su/rho/actions/workflows/ci.yml/badge.svg)](https://github.com/DaviRain-Su/rho/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/DaviRain-Su/rho)](https://github.com/DaviRain-Su/rho/releases)
+[![License: MIT](https://img.shields.io/github/license/DaviRain-Su/rho)](LICENSE)
+
+A [Pi](https://pi.dev)-style **coding agent** for the terminal, written in
+[Rhombus](https://rhombus-lang.org/) (Racket). The kernel stays small; MCP,
+tools, dashboard, sandbox, and the nested `agent` tool load as extensions —
+and the agent can write, hot-reload, and use its own extensions in the same
+session.
 
 ```
 ❯ Create a tool named shout that uppercases text, activate it, then use it.

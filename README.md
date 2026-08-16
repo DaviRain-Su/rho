@@ -26,6 +26,7 @@ same session.
 raco pkg install --link --name rho /path/to/this/repo   # enables lib("rho/...") imports
 racket src/main.rhm                                     # TUI on a terminal
 racket src/main.rhm --tui-mode plain                    # readline REPL
+sh tests/run.sh                                         # offline tests (same as CI)
 ```
 
 ## CLI
@@ -353,7 +354,7 @@ src/
     term.rkt          raart lux-chaos shim
 examples/extensions/  greet.rhm (tool macro), guard.rhm (tool_call veto)
 examples/themes/      solarized.json
-tests/                runnable test modules (t_*.rhm)
+tests/                runnable test modules (t_*.rhm); `sh tests/run.sh` is CI
 ```
 
 ## MCP

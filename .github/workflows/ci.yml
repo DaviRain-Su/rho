@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Bogdanp/setup-racket@v1.15
+        with:
+          version: "9.3"
+          distribution: full
+          packages: rhombus,rhombus-json,rhombus-http,raart
+
+      - name: Link rho
+        run: raco pkg install --batch --auto --skip-installed --link --name rho .
+
+      - name: Compile
+        run: raco make src/main.rhm
+
+      - name: Test
+        run: sh tests/run.sh

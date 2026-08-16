@@ -4,7 +4,8 @@
 (define deps '("base"
                "rhombus"
                "rhombus-json"
-               "rhombus-http"))
+               "rhombus-http"
+               "raart"))
 (define pkg-desc "rho: a Pi-style hot-reloadable coding agent written in Rhombus")
 (define version "0.2.0")
 (define pkg-authors '(davirain))

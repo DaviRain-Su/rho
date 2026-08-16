@@ -1,4 +1,57 @@
 #lang rhombus
-import: "../src/kernel/config.rhm" open
-def c = load_config()
-println([c.provider, c.model, c.base_url(), c.kind(), c.api_key() != ""])
+
+import:
+  rhombus/envvar open
+  "../src/kernel/config.rhm" as config
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+// Use a temp HOME so no real config.json or auth.json is read
+def _ = putenv("HOME", "/tmp/rho-config-test-home")
+try:
+  filesystem.make_directory("/tmp/rho-config-test-home", ~parents: #true)
+  ~catch _: #void
+
+// load_config with default provider returns "kimi"
+def c = config.load_config()
+check("default provider is kimi", c.provider == "kimi")
+check("default model from profile", c.model == "kimi-k2-turbo-preview")
+
+// load_config with ~provider: "openai" returns Config with provider "openai"
+def c2 = config.load_config(~provider: "openai")
+check("explicit provider openai", c2.provider == "openai")
+check("openai model", c2.model == "gpt-5.2")
+check("openai base_url", c2.base_url() == "https://api.openai.com/v1")
+check("openai kind", c2.kind() == "openai")
+
+// credentials_ok for ollama (empty env_name) returns #true — no key needed
+check("ollama credentials_ok", config.credentials_ok("ollama", "") == #true)
+
+// Config.api_key() returns "" when no key is set (no auth.json, no env var)
+// Unset the OPENAI_API_KEY env var to be safe
+def _ = putenv("OPENAI_API_KEY", "")
+check("api_key empty when no key", c2.api_key() == "")
+
+// credentials_ok for a provider with env_name but no env set returns #false
+def _ = putenv("DEEPSEEK_API_KEY", "")
+check("deepseek credentials not ok", config.credentials_ok("deepseek", "DEEPSEEK_API_KEY") == #false)
+
+// credentials_ok with api_key_override set returns #true
+config.set_api_key_override("test-key-123")
+check("override makes credentials ok", config.credentials_ok("deepseek", "DEEPSEEK_API_KEY") == #true)
+config.set_api_key_override("")  // reset (empty string → not a String override)
+// After setting override to "", api_key_override is a String so it still counts
+// Actually set_api_key_override stores the string; let's test api_key returns it
+// when override is set
+config.set_api_key_override("override-key")
+def c3 = config.load_config(~provider: "kimi")
+check("api_key returns override", c3.api_key() == "override-key")
+
+if failures == 0
+| println("ALL PASS")
+| error("config tests failed: " +& failures)

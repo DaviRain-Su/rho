@@ -11,6 +11,7 @@ import:
   net/http
   lib("racket/base.rkt") as rkt
   "sse.rhm"
+  "http_util.rhm" as http_util
   "../kernel/oauth.rhm" as oauth
   "../kernel/sync.rkt" as sync
 
@@ -332,10 +333,7 @@ fun stream_responses(~base_url: base_url :: String,
                        ~data: http.payload.json(body),
                        ~stream: #true,
                        ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))
-  when resp.status_code < 200 || resp.status_code >= 300
-  | let err_body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
-    resp.close()
-    error("codex: HTTP " +& resp.status_code +& ": " +& err_body)
+  http_util.check_response("codex", resp)
   def mutable content = ""
   def mutable reasoning = ""
   def mutable finish_reason = ""

@@ -1,0 +1,21 @@
+#lang rhombus
+
+// Shared HTTP response checking for AI provider clients.
+// Raises a structured ProviderError on non-2xx responses.
+
+import:
+  json
+  net/http
+  "provider_error.rhm" as perr
+
+export:
+  check_response
+
+/// Check an HTTP response: if the status code is outside the 2xx range,
+/// read the body, close the response, and raise a classified ProviderError.
+/// On success (2xx) the response is left open for the caller to consume.
+fun check_response(provider :: String, resp):
+  when resp.status_code < 200 || resp.status_code >= 300
+  | let err_body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+    resp.close()
+    perr.raise_provider_error(provider, resp.status_code, err_body)

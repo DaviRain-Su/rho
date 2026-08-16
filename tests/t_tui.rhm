@@ -85,6 +85,12 @@ check("layout with ask card fits exactly",
         + 3 + tui.ASK_CARD_H,
       20)
 
+def pane_layout = tui.fit_tui_layout(20, 2, 0, 0, 0, 0, 0, ~pane_want: 4)
+check("layout pane height", pane_layout["pane"], 4)
+check("layout with pane fits exactly",
+      pane_layout["editor"] + pane_layout["pane"] + pane_layout["transcript"] + 3,
+      20)
+
 if failures == 0
 | println("ALL PASS")
 | error("tui tests failed: " +& failures)

@@ -186,12 +186,16 @@ check("agent empty prompt",
       to_string(reg.find_tool("agent").fn({})).contains("prompt is required"))
 check("agent no config",
       to_string(reg.find_tool("agent").fn({ "prompt": "hi" })).contains("no live config"))
+check("tasks pane registered",
+      match reg.state.get("panes", #false)
+      | m :: MutableMap: m.has_key("tasks")
+      | ~else: #false)
 
 load_one("dashboard.rhm")
 check("dashboard command", reg.find_command("dashboard") && #true)
 reg.find_command("dashboard").handler("")
 check("dashboard snapshot",
-      notes.get_string().to_string().contains("permission:"))
+      to_string(reg.state.get("dashboard_snap", "")).contains("permission:"))
 
 load_one("sandbox.rhm")
 check("sandbox command", reg.find_command("sandbox") && #true)
@@ -217,6 +221,10 @@ check("todo toggle",
       to_string(reg.find_tool("todo").fn({ "action": "toggle", "id": 1 }))
         .contains("[x]"))
 check("todos command", reg.find_command("todos") && #true)
+check("todos pane registered",
+      match reg.state.get("panes", #false)
+      | m :: MutableMap: m.has_key("todos")
+      | ~else: #false)
 reg.find_command("todos").handler("")
 check("todos notified", notes.get_string().to_string().contains("ship plan"))
 

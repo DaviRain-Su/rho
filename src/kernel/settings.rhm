@@ -7,6 +7,7 @@
 
 import:
   json
+  lib("racket/base.rkt") as rkt
   "config.rhm" as config
   "errors.rhm" as errors
 
@@ -51,6 +52,10 @@ fun set_global(key :: String, v):
   | filesystem.make_directory(config.config_dir(), ~parents: #true)
   filesystem.write_string(global_path(), json.to_string(global_map),
                           ~exists: #'truncate)
+  try:
+    rkt.#{file-or-directory-permissions}(Path(global_path()), 0o600)
+    ~catch _:
+      errors.warn("settings", "could not set permissions on settings.json")
 
 fun keybinding(action :: String, default :: String) :: String:
   to_string(keys_map.get(action, default))

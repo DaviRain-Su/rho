@@ -1,0 +1,486 @@
+#lang rhombus
+
+// Pure pager helpers for the Grok-like TUI shell. No terminal I/O.
+
+export:
+  apply_hover_row
+  shortcuts_bar
+  split_chips
+  chip_hits
+  entry_blocks
+  block_at_index
+  fold_tool_line
+  task_status_text
+  focus_for_hit
+  question_card_rows
+  question_card_hits
+  plan_review_rows
+  plan_review_hits
+  palette_filter
+  palette_rows
+  palette_page_items
+  resume_rows
+  resume_page_items
+  frame_page_items
+  queue_pane_lines
+  todos_pane_lines
+  tasks_pane_lines
+  dashboard_overlay_rows
+  dashboard_page_items
+  settings_page_items
+  settings_group_defs
+  next_setting_value
+  model_page_items
+  theme_page_items
+  help_page_items
+  extensions_page_items
+  page_frame
+  page_hits
+  OTHER_OPTION
+
+def OTHER_OPTION = "Type something."
+
+fun apply_hover_row(row :: List, hovered :: Boolean) :: List:
+  if !hovered
+  | row
+  | for List (sp in row):
+      let style = (if sp[2] | sp[2] | "underline")
+      [sp[0], sp[1], (if hovered | "underline" | style), sp[3]]
+
+fun shortcuts_bar(focus :: String, running :: Boolean, selected_kind :: String) :: String:
+  cond
+  | running && focus == "prompt":
+      "Esc interrupt \u00B7 type steer \u00B7 Alt-Enter queue"
+  | focus == "scrollback" && selected_kind == "user":
+      "Enter fork \u00B7 y copy \u00B7 Tab prompt"
+  | focus == "scrollback" && selected_kind == "tool_result":
+      "Enter fold \u00B7 y copy \u00B7 Tab prompt"
+  | focus == "scrollback":
+      "Tab prompt \u00B7 y copy \u00B7 \u2191\u2193 select"
+  | ~else:
+      "Enter send \u00B7 Ctrl-J newline \u00B7 Ctrl-P model"
+
+fun split_chips(footer :: String) :: List:
+  for List (part in footer.split("\u2502")):
+    let t = part.trim()
+    skip_when t == ""
+    t
+
+fun chip_hits(y :: Int, chips :: List, cols :: Int, ~x0: x0 :: Int = 1) :: List:
+  fun go(i, col, acc):
+    cond
+    | i >= chips.length(): acc
+    | ~else:
+        let lab = to_string(chips[i])
+        let w = lab.length() + 2
+        let id:
+          cond
+          | i == 0: "chip_cwd"
+          | i == 1: "chip_model"
+          | lab.foldcase().contains("ask"): "chip_perm"
+          | ~else: "chip_" +& i
+        let next = col + w + 3
+        go(i + 1, next, acc.add({ "row": y, "c0": col, "c1": math.min(cols, col + w),
+                                  "id": id, "data": lab }))
+  go(0, x0, [])
+
+fun entry_blocks(lines :: List) :: List:
+  // lines: [[kind, text], ...] -> [{id, kind, start, end}]
+  fun go(i, start, kind, acc):
+    cond
+    | i >= lines.length():
+        acc.add({ "id": start, "kind": kind, "start": start, "end": i })
+    | to_string(lines[i][0]) != kind:
+        go(i + 1, i, to_string(lines[i][0]),
+           acc.add({ "id": start, "kind": kind, "start": start, "end": i }))
+    | ~else:
+        go(i + 1, start, kind, acc)
+  if lines == []
+  | []
+  | go(1, 0, to_string(lines[0][0]), [])
+
+fun block_at_index(blocks :: List, idx :: Int):
+  for values(found = #false) (b in blocks):
+    if idx >= b["start"] && idx < b["end"] | b | found
+
+fun fold_tool_line(text :: String, expanded :: Boolean) :: String:
+  if !text.contains("\n") || expanded
+  | text
+  | let parts = text.split("\n", ~trim: #false)
+    to_string(parts[0]) +& " \u2026(+" +& (parts.length() - 1) +& " lines)"
+
+fun task_status_text(n_sub :: Int, queued :: Int) :: String:
+  cond
+  | n_sub == 0 && queued == 0: ""
+  | n_sub == 0: "\u25CE " +& queued +& " queued"
+  | queued == 0: "\u25CE " +& n_sub +& " subagent still running"
+  | ~else: "\u25CE " +& n_sub +& " subagent \u00B7 " +& queued +& " queued still running"
+
+fun focus_for_hit(id :: String) :: String:
+  cond
+  | id == "editor" || id == "ac_pick": "prompt"
+  | id == "entry" || id == "tool_fold" || id == "scrollback": "scrollback"
+  | ~else: ""
+
+fun question_card_rows(prompt :: String, options :: List, cols :: Int, tcolor) :: List:
+  let head = [[[tcolor("prompt"), #false, "bold",
+                (if prompt.length() <= cols | prompt | prompt.substring(0 .. cols))]]]
+  let body:
+    for List (i in 0 .. options.length()):
+      let lab = "  [" +& (i + 1) +& "] " +& to_string(options[i])
+      [[tcolor("tool_result"), #false, #false,
+        (if lab.length() <= cols | lab | lab.substring(0 .. cols))]]
+  head ++ body
+
+fun question_card_hits(y0 :: Int, options :: List) :: List:
+  for List (i in 0 .. options.length()):
+    { "row": y0 + 1 + i, "c0": 2, "c1": 40, "id": "question_opt", "data": i }
+
+fun plan_review_rows(items :: List, cols :: Int, tcolor) :: List:
+  let head = [[[tcolor("prompt"), #false, "bold", " Plan review  [a] approve  [s] stay  [q] quit"]]]
+  let body:
+    if items == []
+    | [[[tcolor("tool_result"), #false, #false, "  (no Plan: steps)"]]]
+    | for List (t in items):
+        let line:
+          cond
+          | t is_a Map:
+              let mark = (if t.get("done", #false) | "[x]" | "[ ]")
+              "  " +& mark +& " " +& to_string(t.get("step", t.get("id", "")))
+                +& ". " +& to_string(t.get("text", ""))
+          | ~else: "  " +& to_string(t)
+        [[tcolor("tool_result"), #false, #false,
+          (if line.length() <= cols | line | line.substring(0 .. cols))]]
+  head ++ body
+
+fun plan_review_hits(y0 :: Int) :: List:
+  [{ "row": y0, "c0": 16, "c1": 27, "id": "plan_approve", "data": "a" },
+   { "row": y0, "c0": 29, "c1": 37, "id": "plan_stay", "data": "s" },
+   { "row": y0, "c0": 39, "c1": 47, "id": "plan_quit", "data": "q" }]
+
+fun palette_filter(items :: List, query :: String) :: List:
+  let q = query.foldcase().trim()
+  if q == ""
+  | items
+  | for List (it in items):
+      let name = to_string(if it is_a List | it[0] | it)
+      let desc = to_string(if it is_a List && it.length() > 1 | it[1] | "")
+      skip_when !(name.foldcase().contains(q) || desc.foldcase().contains(q))
+      it
+
+fun palette_rows(items :: List, sel :: Int, cols :: Int, tcolor) :: List:
+  let head = [[[tcolor("prompt"), #false, "bold", " commands  type to filter  Enter run  Esc close"]]]
+  let body:
+    for List (i in 0 .. items.length()):
+      let name = to_string(if items[i] is_a List | items[i][0] | items[i])
+      let desc = to_string(if items[i] is_a List && items[i].length() > 1 | items[i][1] | "")
+      let line = "  /" +& name +& "  " +& desc
+      let line = (if line.length() <= cols | line | line.substring(0 .. cols))
+      if i == sel
+      | [[tcolor("footer_fg"), tcolor("footer_bg"), "bold", line]]
+      | [[tcolor("tool_result"), #false, #false, line]]
+  head ++ body
+
+fun palette_page_items(commands :: List, query :: String) :: List:
+  let items = palette_filter(commands, query)
+  if items == []
+  | [{ "text": "  (no matches)", "id": "palette_noop", "data": -1, "name": "" }]
+  | for List (i in 0 .. items.length()):
+      let name = to_string(if items[i] is_a List | items[i][0] | items[i])
+      let desc = to_string(if items[i] is_a List && items[i].length() > 1 | items[i][1] | "")
+      { "text": "  /" +& name +& "  " +& desc,
+        "id": "palette_pick",
+        "data": i,
+        "name": name }
+
+fun resume_page_items(sessions :: List) :: List:
+  if sessions == []
+  | [{ "text": "  (no sessions)", "id": "resume_pick", "data": -1 }]
+  | for List (i in 0 .. sessions.length()):
+      let s = sessions[i]
+      let line:
+        cond
+        | s is_a Map:
+            "  " +& to_string(s.get("name", s.get("path", "")))
+              +& "  " +& to_string(s.get("preview", ""))
+        | s is_a List: "  " +& to_string(s[0])
+        | ~else: "  " +& to_string(s)
+      { "text": line, "id": "resume_pick", "data": i }
+
+fun frame_page_items(text :: String) :: List:
+  let lines = text.split("\n")
+  if lines == [] || (lines.length() == 1 && lines[0] == "")
+  | [{ "text": "  (empty)", "id": "frame_line", "data": 0 }]
+  | for List (i in 0 .. lines.length()):
+      { "text": "  " +& lines[i], "id": "frame_line", "data": i }
+
+fun resume_rows(sessions :: List, sel :: Int, cols :: Int, tcolor) :: List:
+  let head = [[[tcolor("prompt"), #false, "bold", " resume  Enter open  Esc close"]]]
+  let body:
+    if sessions == []
+    | [[[tcolor("tool_result"), #false, #false, "  (no sessions)"]]]
+    | for List (i in 0 .. sessions.length()):
+        let s = sessions[i]
+        let line:
+          cond
+          | s is_a Map:
+              "  " +& to_string(s.get("name", s.get("path", "")))
+                +& "  " +& to_string(s.get("preview", ""))
+          | s is_a List: "  " +& to_string(s[0])
+          | ~else: "  " +& to_string(s)
+        let line = (if line.length() <= cols | line | line.substring(0 .. cols))
+        if i == sel
+        | [[tcolor("footer_fg"), tcolor("footer_bg"), "bold", line]]
+        | [[tcolor("tool_result"), #false, #false, line]]
+  head ++ body
+
+fun queue_pane_lines(followups :: List) :: List:
+  if followups == []
+  | [{ "text": "  (empty queue)", "id": "queue_noop", "data": -1 }]
+  | for List (i in 0 .. followups.length()):
+      let t = String.join(to_string(followups[i]).split("\n"), " ")
+      { "text": "  " +& (i + 1) +& ". " +& t +& "   [edit] [send] [cancel]",
+        "id": "queue_row",
+        "data": i }
+
+fun todos_pane_lines(items :: List) :: List:
+  if items == []
+  | [{ "text": "  (no todos)", "id": "todo_noop", "data": -1 }]
+  | for List (t in items):
+      let done = t is_a Map && t.get("done", #false)
+      let id = if t is_a Map | t.get("id", 0) | 0
+      let text = if t is_a Map | to_string(t.get("text", "")) | to_string(t)
+      { "text": "  " +& (if done | "[x]" | "[ ]") +& " #" +& id +& " " +& text,
+        "id": "todo_toggle",
+        "data": id }
+
+fun tasks_pane_lines(tasks :: List) :: List:
+  if tasks == []
+  | [{ "text": "  (no live tasks)", "id": "task_noop", "data": "" }]
+  | for List (t in tasks):
+      { "text": "  \u25CE " +& to_string(t.get("kind", "task"))
+                  +& "  " +& to_string(t.get("label", "")),
+        "id": "task_open",
+        "data": t.get("label", "") }
+
+fun dashboard_overlay_rows(snap :: String, cols :: Int, tcolor) :: List:
+  let head = [[[tcolor("prompt"), #false, "bold",
+                " dashboard  (single attached session)  Esc close"]]]
+  let body:
+    for List (ln in snap.split("\n")):
+      let line = "  " +& ln
+      [[tcolor("tool_result"), #false, #false,
+        (if line.length() <= cols | line | line.substring(0 .. cols))]]
+  head ++ body
+
+fun clip_cols(s :: String, cols :: Int) :: String:
+  if s.length() <= cols | s | s.substring(0 .. math.max(0, cols))
+
+fun pad_cols(s :: String, cols :: Int) :: String:
+  let t = clip_cols(s, cols)
+  t +& String.make(math.max(0, cols - t.length()), Char" ")
+
+fun item_text(item) :: String:
+  if item is_a Map | to_string(item.get("text", "")) | to_string(item)
+
+fun dashboard_page_items(snap :: String) :: List:
+  let info:
+    for List (ln in snap.split("\n")):
+      skip_when ln == ""
+      { "text": "  " +& ln, "id": "dash_info", "data": "" }
+  info
+    ++ [{ "text": "", "id": "dash_info", "data": "" },
+        { "text": "  [open session file]", "id": "dash_open", "data": "" },
+        { "text": "  [resume other]", "id": "dash_resume", "data": "" }]
+
+fun settings_group_defs() :: List:
+  [["Appearance", ["theme", "tui_mode", "quiet_startup", "default_thinking"]],
+   ["Agent", ["permission_mode", "default_project_trust", "steering_mode",
+              "followup_mode", "auto_compaction", "auto_retry", "max_steps",
+              "max_agent_depth"]],
+   ["Defaults", ["default_provider", "default_model", "enabled_models"]]]
+
+fun settings_row_item(r :: Map, drafts :: Map, i :: Int) :: Map:
+  let key = to_string(r.get("key", ""))
+  let val = to_string(if drafts.has_key(key)
+                      | drafts[key]
+                      | r.get("value", ""))
+  let desc = to_string(r.get("desc", ""))
+  let kind = r.get("kind", "string")
+  { "text": "  " +& key +& " = " +& val +& "  \u2014 " +& desc,
+    "id": "settings_row",
+    "data": i,
+    "key": key,
+    "kind": kind,
+    "value": val }
+
+fun settings_page_items(rows :: List, drafts :: Map) :: List:
+  if rows == []
+  | [{ "text": "  (no settings)", "id": "settings_noop", "data": -1,
+       "key": "", "kind": "string" }]
+  | let by_key = for values(acc = {}) (r in rows):
+                   if r is_a Map
+                   | acc ++ { to_string(r.get("key", "")): r }
+                   | acc
+    let grouped = for List (g in settings_group_defs()):
+                    each k in g[1]
+                    k
+    let leftover:
+      for List (r in rows):
+        skip_when !(r is_a Map)
+        let key = to_string(r.get("key", ""))
+        skip_when grouped.contains(key) || key == ""
+        r
+    let grouped_rows = for values(acc = []) (g in settings_group_defs()):
+                         let keys_rows:
+                           for List (k in g[1]):
+                             skip_when !by_key.has_key(k)
+                             by_key[k]
+                         if keys_rows == []
+                         | acc
+                         | acc ++ [{ "header": to_string(g[0]) }] ++ keys_rows
+    let raw = grouped_rows
+                ++ (if leftover == []
+                    | []
+                    | [{ "header": "Advanced" }] ++ leftover)
+    for List (i in 0 .. raw.length()):
+      let r = raw[i]
+      if r is_a Map && r.get("header", #false)
+      | { "text": "── " +& to_string(r["header"]) +& " ──",
+          "id": "settings_header",
+          "data": i,
+          "key": "",
+          "kind": "header" }
+      | settings_row_item(r, drafts, i)
+
+fun model_page_items(entries :: List, query :: String, current :: String) :: List:
+  let q = query.foldcase().trim()
+  let filtered:
+    for List (e in entries):
+      let id = to_string(if e is_a List | e[0] | e)
+      let desc = to_string(if e is_a List && e.length() > 1 | e[1] | "")
+      skip_when q != "" && !id.foldcase().contains(q) && !desc.foldcase().contains(q)
+      [id, desc]
+  if filtered == []
+  | [{ "text": "  (no models)", "id": "model_noop", "data": -1, "name": "" }]
+  | for List (i in 0 .. filtered.length()):
+      let id = to_string(filtered[i][0])
+      let desc = to_string(filtered[i][1])
+      let mark = if id == current | "* " | "  "
+      { "text": mark +& id +& (if desc == "" | "" | "  " +& desc),
+        "id": "model_pick",
+        "data": i,
+        "name": id }
+
+fun theme_page_items(names :: List, current :: String) :: List:
+  let all = [""] ++ names
+  for List (i in 0 .. all.length()):
+    let name = to_string(all[i])
+    let label = if name == "" | "(default)" | name
+    let mark = if name == current | "* " | "  "
+    { "text": mark +& label, "id": "theme_pick", "data": i, "name": name }
+
+fun help_page_items(text :: String) :: List:
+  let lines = text.split("\n")
+  if lines == []
+  | [{ "text": "  (no shortcuts)", "id": "help_line", "data": 0 }]
+  | for List (i in 0 .. lines.length()):
+      skip_when lines[i] == "" && i == lines.length() - 1
+      { "text": "  " +& lines[i], "id": "help_line", "data": i }
+
+fun extensions_page_items(tab :: String, mcp_rows :: List, skill_rows :: List) :: List:
+  let head = [{ "text": (if tab == "skills"
+                         | "  [MCP]  [Skills]*"
+                         | "  [MCP]*  [Skills]"),
+                "id": "ext_tabs",
+                "data": -1 }]
+  let body:
+    cond
+    | tab == "skills":
+        if skill_rows == []
+        | [{ "text": "  (no skills)", "id": "ext_skill", "data": -1, "name": "" }]
+        | for List (i in 0 .. skill_rows.length()):
+            let s = skill_rows[i]
+            let name = to_string(if s is_a Map | s.get("name", "") | s)
+            let desc = to_string(if s is_a Map | s.get("desc", s.get("description", "")) | "")
+            { "text": "  " +& name +& (if desc == "" | "" | "  — " +& desc),
+              "id": "ext_skill",
+              "data": i,
+              "name": name }
+    | ~else:
+        if mcp_rows == []
+        | [{ "text": "  (no MCP servers)", "id": "ext_mcp", "data": -1, "name": "" }]
+        | for List (i in 0 .. mcp_rows.length()):
+            let r = mcp_rows[i]
+            let name = to_string(if r is_a List | r[0] | (if r is_a Map | r.get("name", "") | r))
+            let detail = to_string(if r is_a List && r.length() > 1
+                                   | r[1]
+                                   | (if r is_a Map | r.get("detail", "") | ""))
+            { "text": "  " +& name +& "  " +& detail +& " tools",
+              "id": "ext_mcp",
+              "data": i,
+              "name": name }
+  head ++ body
+
+fun next_setting_value(kind, current :: String, dir :: Int) :: String:
+  cond
+  | kind == "bool":
+      if current == "true" | "false" | "true"
+  | kind is_a List && kind.length() > 0:
+      let n = kind.length()
+      let cur = for values(found = -1) (i in 0 .. n):
+                  if to_string(kind[i]) == current | i | found
+      let i0 = if cur is_a Int && cur >= 0 | cur | 0
+      let j = i0 + dir
+      let wrapped:
+        cond
+        | j < 0: n - 1
+        | j >= n: 0
+        | ~else: j
+      to_string(kind[wrapped])
+  | ~else: current
+
+fun page_frame(~title: title :: String,
+               ~body: body :: List,
+               ~hints: hints :: String,
+               ~rows: rows :: Int,
+               ~cols: cols :: Int,
+               ~sel: sel :: Int = 0) :: List:
+  let bar:
+    cond
+    | hints == "": "Esc close"
+    | hints.contains("Esc close"): hints
+    | ~else: hints +& " · Esc close"
+  let title_row = [[#false, #false, "bold", pad_cols(" " +& title, cols)]]
+  let hint_row = [[#false, #false, "dim", pad_cols(" " +& bar, cols)]]
+  cond
+  | rows <= 0: []
+  | rows == 1: [title_row]
+  | ~else:
+      let body_h = math.max(0, rows - 2)
+      let n = body.length()
+      let sel_i = math.max(0, math.min(sel, math.max(0, n - 1)))
+      let first = math.max(0, sel_i - body_h + 1)
+      let body_rows:
+        for List (i in 0 .. body_h):
+          let idx = first + i
+          cond
+          | idx >= n:
+              [[#false, #false, #false, ""]]
+          | idx == sel_i:
+              [[#false, #false, "invert", pad_cols(item_text(body[idx]), cols)]]
+          | ~else:
+              [[#false, #false, #false, pad_cols(item_text(body[idx]), cols)]]
+      [title_row] ++ body_rows ++ [hint_row]
+
+fun page_hits(items :: List, sel :: Int, cols :: Int, ~body_h: body_h :: Int) :: List:
+  let n = items.length()
+  let sel_i = math.max(0, math.min(sel, math.max(0, n - 1)))
+  let first = math.max(0, sel_i - body_h + 1)
+  for List (i in 0 .. body_h):
+    let idx = first + i
+    skip_when idx >= n
+    let item = items[idx]
+    let id = if item is_a Map | to_string(item.get("id", "page_row")) | "page_row"
+    let data = if item is_a Map | item.get("data", idx) | idx
+    { "row": 1 + i, "c0": 0, "c1": cols, "id": id, "data": data }

@@ -10,6 +10,7 @@ import:
   "../ai/gemini.rhm"
   "../ai/codex.rhm" as codex
   "../ai/modelsdev.rhm" as modelsdev
+  "../ai/provider_error.rhm" as perr
   "../ai/types.rhm" open
   "oauth.rhm" as oauth
 
@@ -118,14 +119,19 @@ fun call_provider(config, messages, tools, on_text,
     try:
       do_call_provider(config, messages, tools, on_text, on_thinking, headers)
       ~catch e :: Exn.Fail:
-        let transient:
-          (e.message.contains("timed out") || e.message.contains("connection")
-             || e.message.contains("HTTP 429") || e.message.contains("HTTP 5"))
-            && !e.message.contains("billing_not_active")
-        if transient && n < retries
-        | rkt.sleep(math.min(8, rkt.expt(2, n)))
-          attempt(n + 1)
-        | throw e
+        let transient = perr.is_transient(e)
+        // billing_not_active is a 4xx that arrives as a provider error — never retry
+        let transient = transient && !e.message.contains("billing_not_active")
+        if !(transient && n < retries)
+        | throw(e)
+        | block:
+            let ra = perr.retry_after(e)
+            let delay:
+              match ra
+              | s :: Int: math.min(60, s)
+              | ~else: math.min(8, rkt.expt(2, n))
+            rkt.sleep(delay)
+            attempt(n + 1)
 
 fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: Map):
   oauth.ensure_fresh(config)

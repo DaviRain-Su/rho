@@ -1,0 +1,77 @@
+#lang rhombus
+
+// Structured provider error type so the retry logic in loop.rhm does not
+// rely on fragile string matching of exception messages.
+//
+// Categories:
+//   #'transient   — network timeout, connection reset, HTTP 429, HTTP 5xx
+//   #'auth        — HTTP 401/403 (bad key, expired token)
+//   #'client      — HTTP 4xx other than 429 (bad request, invalid model)
+//   #'parse       — malformed SSE/JSON in the stream
+//   #'unknown     — anything else
+
+import:
+  json
+
+export:
+  ProviderError
+  raise_provider_error
+  is_transient
+  retry_after
+  classify_status
+
+class ProviderError(message :: String,
+                    category :: Symbol,
+                    status_code :: maybe(Int) = #false,
+                    retry_after_secs :: maybe(Int) = #false)
+
+// Build a ProviderError from an HTTP status code and response body.
+fun classify_status(provider :: String, status :: Int, body :: String) :: ProviderError:
+  let cat:
+    cond
+    | status == 429: #'transient
+    | status >= 500: #'transient
+    | status == 401 || status == 403: #'auth
+    | status >= 400: #'client
+    | ~else: #'unknown
+  // Try to extract Retry-After from the error body (some providers include it
+  // as a top-level field or inside an error sub-object).
+  def mutable ra = #false
+  try:
+    let parsed = json.from_string(body)
+    when parsed is_a Map
+    | let candidate = parsed.get("retry_after", parsed.get("retry-after", #false))
+      match candidate
+      | n :: Int: ra := n
+      | s :: String:
+          match String.maybe_to_int(s.trim())
+          | n :: Int: ra := n
+          | ~else: #void
+      | ~else: #void
+    ~catch _: #void
+  let msg = provider +& ": HTTP " +& status +& ": " +& body
+  ProviderError(msg, cat, status, ra)
+
+// Convenience: raise a classified provider error.
+fun raise_provider_error(provider :: String, status :: Int, body :: String):
+  let e = classify_status(provider, status, body)
+  error(e.message)
+
+// Check if an exception is a transient provider error worth retrying.
+// Handles ProviderError, and falls back to message inspection for plain
+// Exn.Fail (network errors that don't go through raise_provider_error).
+fun is_transient(e) :: Boolean:
+  cond
+  | e is_a ProviderError: e.category == #'transient
+  | e is_a Exn.Fail:
+      let m = e.message
+      m.contains("timed out") || m.contains("connection")
+        || m.contains("Connection") || m.contains("reset by peer")
+        || m.contains("HTTP 429") || m.contains("HTTP 5")
+  | ~else: #false
+
+// Extract retry-after delay (seconds) from a provider error, if available.
+fun retry_after(e) :: maybe(Int):
+  match e
+  | pe :: ProviderError: pe.retry_after_secs
+  | ~else: #false

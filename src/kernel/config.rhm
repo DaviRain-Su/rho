@@ -114,7 +114,8 @@ fun write_auth(m :: Map):
   filesystem.write_string(auth_path(), json.to_string(m), ~exists: #'truncate)
   try:
     rkt.#{file-or-directory-permissions}(Path(auth_path()), 0o600)
-    ~catch _: #void
+    ~catch _:
+      errors.warn("auth", "could not set 0600 permissions on auth.json")
   sync.#{with-lock}(auth_lock, fun (): write_auth_locked(m))
 
 fun auth_list() :: List:

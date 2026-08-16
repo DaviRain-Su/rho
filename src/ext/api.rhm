@@ -223,6 +223,46 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
           mm
     m[id] := fn
 
+  method register_pane(~id: id :: String,
+                       ~title: title :: String = "",
+                       ~lines: lines,
+                       ~on_click: on_click = fun (_d): #void):
+    let m:
+      match registry.state.get("panes", #false)
+      | mm :: MutableMap: mm
+      | ~else:
+          let mm = MutableMap()
+          registry.state["panes"] := mm
+          mm
+    m[id] := { "title": title, "lines": lines, "on_click": on_click }
+
+  method toggle_pane(id :: String):
+    match ui_hooks.get("toggle_pane", #false)
+    | #false: #void
+    | h: h(id)
+
+  method open_overlay(id :: String, data = #false):
+    match ui_hooks.get("open_overlay", #false)
+    | #false: #void
+    | h: h(id, data)
+
+  method open_page(id :: String, data = #false) :: Boolean:
+    match ui_hooks.get("open_page", #false)
+    | #false: #false
+    | h:
+        h(id, data)
+        #true
+
+  method ask_card(prompt :: String, options :: List) :: String:
+    match ui_hooks.get("ask_card", #false)
+    | #false: ui.select(prompt, options)
+    | h: to_string(h(prompt, options))
+
+  method review_plan(items :: List) :: String:
+    match ui_hooks.get("review_plan", #false)
+    | #false: "a"
+    | h: to_string(h(items))
+
   // Register a markdown transformer; TUI applies them in order.
   method register_markdown_transformer(~fn: fn):
     let xs = registry.state.get("markdown_transformers", [])

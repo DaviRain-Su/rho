@@ -1,0 +1,74 @@
+#lang rhombus
+
+import:
+  json
+  "../src/ai/gemini.rhm" as gem
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+// System messages are extracted into system_text
+let (sys1, contents1) = gem.convert_messages([{"role": "system", "content": "You are helpful"}])
+check("system extracted", sys1 == "You are helpful")
+check("system produces no contents", contents1 == [])
+
+// Multiple system messages are concatenated
+let (sys2, contents2) = gem.convert_messages([{"role": "system", "content": "Rule 1"},
+                                              {"role": "system", "content": "Rule 2"}])
+check("multi system joined", sys2 == "Rule 1\n\nRule 2")
+
+// User messages become {role: "user", parts: [{text: ...}]}
+let (sys3, contents3) = gem.convert_messages([{"role": "user", "content": "hello"}])
+check("user role", contents3[0]["role"] == "user")
+check("user parts text", contents3[0]["parts"][0]["text"] == "hello")
+
+// Assistant messages become {role: "model", parts: [...]}
+let (sys4, contents4) = gem.convert_messages([{"role": "assistant", "content": "hi there"}])
+check("assistant → model role", contents4[0]["role"] == "model")
+check("assistant parts text", contents4[0]["parts"][0]["text"] == "hi there")
+
+// Tool messages become functionResponse
+let (sys5, contents5) = gem.convert_messages([{"role": "tool", "content": "{\"result\": 42}"}])
+check("tool → user role", contents5[0]["role"] == "user")
+check("tool → functionResponse",
+      contents5[0]["parts"][0].has_key("functionResponse"))
+check("tool response result",
+      contents5[0]["parts"][0]["functionResponse"]["response"]["result"]["result"] == 42)
+
+// Images in user messages become inline_data parts
+let (sys6, contents6) = gem.convert_messages([
+  {"role": "user", "content": "look",
+   "images": [{"media_type": "image/png", "data": "base64data"}]},
+])
+check("user with image: role", contents6[0]["role"] == "user")
+check("user with image: text part", contents6[0]["parts"][0]["text"] == "look")
+check("user with image: inline_data",
+      contents6[0]["parts"][1]["inline_data"]["data"] == "base64data")
+check("user with image: mime_type",
+      contents6[0]["parts"][1]["inline_data"]["mime_type"] == "image/png")
+
+// Assistant message with tool_calls → functionCall parts
+let (sys7, contents7) = gem.convert_messages([
+  {"role": "assistant", "content": "",
+   "tool_calls": [{"name": "get_weather", "arguments": "{\"city\": \"SF\"}"}]},
+])
+check("assistant tool_call → functionCall",
+      contents7[0]["parts"][0].has_key("functionCall"))
+check("assistant tool_call name",
+      contents7[0]["parts"][0]["functionCall"]["name"] == "get_weather")
+
+// Empty assistant content → no text part, just functionCall
+let (sys8, contents8) = gem.convert_messages([
+  {"role": "assistant", "content": "",
+   "tool_calls": [{"name": "do_thing", "arguments": "{}"}]},
+])
+check("empty assistant content: only functionCall",
+      contents8[0]["parts"].length() == 1)
+
+if failures == 0
+| println("ALL PASS")
+| error("gemini tests failed: " +& failures)

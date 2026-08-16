@@ -5,6 +5,7 @@
 
 import:
   "../../kernel/subagent.rhm" as subagent
+  "../../kernel/tasks.rhm" as tasks
 
 export:
   init
@@ -90,3 +91,30 @@ fun init(rho):
            if phase == "call" && data is_a Map
            | "\u25CF agent " +& to_string(data.get("label", "subagent"))
            | #false)
+  rho.on("subagent_start",
+         fun (e :: Map):
+           tasks.note_start("subagent", to_string(e.get("label", "subagent")))
+           #false)
+  rho.on("subagent_end",
+         fun (e :: Map):
+           let lab = to_string(e.get("label", "subagent"))
+           rho.state["last_subagent"] := to_string(e.get("result", ""))
+           tasks.note_end(lab)
+           #false)
+  rho.register_pane(
+    ~id: "tasks",
+    ~title: "tasks",
+    ~lines: fun ():
+              let live = tasks.live()
+              if live == []
+              | [{ "text": "  (no live tasks)", "id": "task_noop", "data": "" }]
+              | for List (t in live):
+                  { "text": "  \u25CE " +& to_string(t.get("kind", "task"))
+                              +& "  " +& to_string(t.get("label", "")),
+                    "id": "task_open",
+                    "data": t.get("label", "") },
+    ~on_click: fun (data):
+                 let body = to_string(rho.state.get("last_subagent",
+                                                    "(no sub-agent transcript yet)"))
+                 rho.open_page("frame",
+                               "sub-agent " +& to_string(data) +& "\n" +& body))

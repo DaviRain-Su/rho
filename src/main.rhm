@@ -53,6 +53,7 @@ import:
   rhombus/envvar open
   "tools/core.rhm" open
   "ext/api.rhm" open
+  "ext/mcp.rhm" as mcp
   "ext/loader.rhm" as loader
   "ui/repl.rhm" open
   "ui/tui.rhm" as tui
@@ -357,6 +358,20 @@ fun settings_value_str(key :: String) :: String:
   | l :: List: String.join((for List (x in l): to_string(x)), ",")
   | v: to_string(v)
 
+fun extensions_page_snap() :: Map:
+  { "mcp": mcp.status(),
+    "skills":
+      for List (s in discover_skills()):
+        { "name": to_string(s.get("name", "")),
+          "desc": to_string(s.get("description", "")) } }
+
+fun settings_page_rows() :: List:
+  for List (key in settings.known_keys.keys().sort()):
+    let spec = settings.known_keys[key]
+    let desc = if spec is_a List | to_string(spec[0]) | ""
+    let kind = if spec is_a List && spec.length() > 1 | spec[1] | "string"
+    { "key": key, "value": settings_value_str(key), "desc": desc, "kind": kind }
+
 // returns [#'ok, value] or [#'err, message]
 fun parse_setting(key :: String, raw :: String) :: List:
   let spec = settings.known_keys.get(key, #false)
@@ -389,10 +404,14 @@ registry.register_command(
               let parts = args.trim().split(" ")
               cond
               | args.trim() == "":
-                  for (key in settings.known_keys.keys().sort()):
-                    let [desc, _] = settings.known_keys[key]
-                    out.write_string("  " +& key +& " = " +& settings_value_str(key)
-                                       +& "  \u2014 " +& desc +& "\n")
+                  match ui_hooks.get("open_page", #false)
+                  | fn:
+                      fn("settings", #false)
+                  | ~else:
+                      for (key in settings.known_keys.keys().sort()):
+                        let [desc, _] = settings.known_keys[key]
+                        out.write_string("  " +& key +& " = " +& settings_value_str(key)
+                                           +& "  \u2014 " +& desc +& "\n")
               | parts.length() == 1:
                   let key = to_string(parts[0])
                   match settings.known_keys.get(key, #false)
@@ -696,9 +715,46 @@ fun drain_pending_fit() :: String:
 registry.register_command(
   ~name: "model", ~description: "switch model: /model [provider/model | name] (compacts first when the target window is smaller)",
   ~handler: fun (args):
-              if args == ""
-              | api.notify("provider=" +& config.provider +& " model=" +& config.model)
-              | api.notify(set_model(args.trim())))
+              cond
+              | args == "":
+                  match ui_hooks.get("open_page", #false)
+                  | fn: fn("models", #false)
+                  | ~else:
+                      api.notify("provider=" +& config.provider +& " model=" +& config.model)
+              | ~else: api.notify(set_model(args.trim())))
+fun list_theme_names() :: List:
+  let dir = config_dir() +& "/themes"
+  if !filesystem.directory_exists(dir)
+  | []
+  | for List (f in filesystem.files(dir).sort()):
+      let n = to_string(f)
+      skip_when !n.ends_with(".json")
+      n.substring(0 .. n.length() - 5)
+
+registry.register_command(
+  ~name: "theme",
+  ~description: "TUI theme: /theme [name | default]",
+  ~handler: fun (args):
+              let a = args.trim()
+              cond
+              | a == "":
+                  match ui_hooks.get("open_page", #false)
+                  | fn: fn("theme", #false)
+                  | ~else:
+                      let cur = settings.get("theme", #false)
+                      api.notify("theme = " +& (if cur is_a String | cur | "(default)"))
+                      let names = list_theme_names()
+                      when names != []
+                      | api.notify("available: " +& String.join(names, ", "))
+              | a == "default" || a == "clear":
+                  settings.set_global("theme", "")
+                  apply_settings()
+                  api.notify("theme = (default)")
+              | ~else:
+                  settings.set_global("theme", a)
+                  apply_settings()
+                  api.notify("theme = " +& a))
+
 registry.register_command(
   ~name: "provider", ~description: "switch provider: /provider [name]",
   ~handler: fun (args):
@@ -961,13 +1017,17 @@ registry.register_command(
                       session := start_session(~cwd: cwd(), ~resume: a)
                       api.notify("resumed " +& a)
               | ~else:
-                  match pick_session()
-                  | path :: String:
-                      if session_event_ok("session_before_switch", { "path": path })
-                      | session := start_session(~cwd: cwd(), ~resume: path)
-                        api.notify("resumed " +& path)
-                      | api.notify("switch cancelled by extension")
-                  | ~else: api.notify("unchanged"))
+                  match ui_hooks.get("open_page", #false)
+                  | fn:
+                      fn("resume", #false)
+                  | ~else:
+                      match pick_session()
+                      | path :: String:
+                          if session_event_ok("session_before_switch", { "path": path })
+                          | session := start_session(~cwd: cwd(), ~resume: path)
+                            api.notify("resumed " +& path)
+                          | api.notify("switch cancelled by extension")
+                      | ~else: api.notify("unchanged"))
 
 registry.register_command(
   ~name: "sessions",
@@ -1249,12 +1309,25 @@ registry.register_tool(
 registry.register_command(
   ~name: "skills", ~description: "list discovered skills",
   ~handler: fun (_args):
-              let found = discover_skills()
-              if found == []
-              | api.notify("no skills found (put SKILL.md dirs in .rho/skills or ~/.rho/skills)")
-              | for (s in found):
-                  out.write_string("  " +& s["name"] +& " \u2014 " +& s["description"]
-                                     +& " (" +& s["path"] +& ")\n"))
+              match ui_hooks.get("open_page", #false)
+              | fn: fn("extensions", "skills")
+              | ~else:
+                  let found = discover_skills()
+                  if found == []
+                  | api.notify("no skills found (put SKILL.md dirs in .rho/skills or ~/.rho/skills)")
+                  | for (s in found):
+                      out.write_string("  " +& s["name"] +& " \u2014 " +& s["description"]
+                                         +& " (" +& s["path"] +& ")\n"))
+
+registry.register_command(
+  ~name: "extensions",
+  ~description: "TUI extensions page (MCP and skills)",
+  ~handler: fun (_args):
+              match ui_hooks.get("open_page", #false)
+              | fn: fn("extensions", "mcp")
+              | ~else:
+                  handle_command("mcp", "list")
+                  handle_command("skills", ""))
 registry.register_command(
   ~name: "prompts", ~description: "list prompt templates (run one with /<name>)",
   ~handler: fun (_args):
@@ -1462,15 +1535,18 @@ fun run_headless():
 fun load_theme() :: Map:
   match opts.get("theme", config.settings.get("theme", #false))
   | name :: String:
-      let path = config_dir() +& "/themes/" +& name +& ".json"
-      if filesystem.file_exists(path)
-      | let parsed = try:
-                       json.from_string(filesystem.read_string(path))
-                       ~catch _: {}
-        if parsed is_a Map | parsed | {}
-      | (block:
-           println("warning: theme not found: " +& path)
-           {})
+      cond
+      | name == "": {}
+      | ~else:
+          let path = config_dir() +& "/themes/" +& name +& ".json"
+          if filesystem.file_exists(path)
+          | let parsed = try:
+                           json.from_string(filesystem.read_string(path))
+                           ~catch _: {}
+            if parsed is_a Map | parsed | {}
+          | (block:
+               println("warning: theme not found: " +& path)
+               {})
   | ~else: {}
 
 fun renderer_for(name :: String):
@@ -1702,20 +1778,30 @@ fun handle_input_tui(input :: String):
                                                || "  \u21B3 " +& to_string(r)))
   auto_compact()
 
+fun hotkeys_text() :: String:
+  "Enter submit · Ctrl-J newline · Alt-Enter queue follow-up · Tab complete path (@token fuzzy)\n"
+    +& "click scrollback to focus · click prompt to type · hover underlines hits\n"
+    +& "Ctrl-T todos pane · Ctrl-G tasks pane · Ctrl-; queue pane\n"
+    +& "? command palette · F2 settings · Ctrl-\\ dashboard · Ctrl-. shortcuts\n"
+    +& "Esc closes a page (does not interrupt) · click model chip for picker\n"
+    +& "/model /theme /extensions · Ctrl-P cycle models · Ctrl-L redraw\n"
+    +& "Ctrl-E show/hide thinking · Alt-E external editor\n"
+    +& "Up/Down history or cursor · PgUp/PgDn or mouse wheel scroll\n"
+    +& "mouse drag selects + copies on release (Shift+drag for native terminal selection)\n"
+    +& "Ctrl-C interrupt/clear/quit · Esc interrupt (queued follow-ups return to editor)\n"
+    +& "Ctrl-X copy last reply · Ctrl-O expand/fold tool output\n"
+    +& "Shift-Tab or /thinking cycle thinking level\n"
+    +& "Ctrl-K kill to EOL · Ctrl-W kill word · Ctrl-Y yank · Alt-Y yank-pop · Ctrl-U kill line\n"
+    +& "Ctrl-D quit · permission/question/plan cards: click or number keys\n"
+    +& "!cmd run shell · !!cmd run shell + add to context · /follow queue follow-up\n"
+    +& "remap: ~/.rho/keybindings.json (external_editor, copy_last, toggle_tool_output, toggle_thinking, cycle_thinking, queue_followup, kill_line, yank, kill_word, yank_pop)\n"
+
 registry.register_command(
   ~name: "hotkeys", ~description: "list TUI keyboard shortcuts",
   ~handler: fun (_args):
-              out.write_string("Enter submit \u00B7 Ctrl-J newline \u00B7 Alt-Enter queue follow-up \u00B7 Tab complete path (@token fuzzy)\n"
-                                 +& "Up/Down history or cursor \u00B7 PgUp/PgDn or mouse wheel scroll\n"
-                                 +& "mouse drag selects + copies on release (Shift+drag for native terminal selection)\n"
-                                 +& "Ctrl-C interrupt/clear/quit \u00B7 Esc interrupt (queued follow-ups return to editor)\n"
-                                 +& "Ctrl-G external editor \u00B7 Ctrl-X copy last reply \u00B7 Ctrl-O expand/fold tool output\n"
-                                 +& "Ctrl-T show/hide chain of thought \u00B7 Shift-Tab or /thinking cycle thinking level\n"
-                                 +& "Ctrl-K kill to EOL \u00B7 Ctrl-W kill word \u00B7 Ctrl-Y yank \u00B7 Alt-Y yank-pop \u00B7 Ctrl-U kill line\n"
-                                 +& "Ctrl-P cycle scoped models/providers \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
-                                 +& "permission card: 1/y/Enter allow \u00B7 2/n/Esc deny \u00B7 click [1]/[2]\n"
-                                 +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"
-                                 +& "remap: ~/.rho/keybindings.json (external_editor, copy_last, toggle_tool_output, toggle_thinking, cycle_thinking, queue_followup, kill_line, yank, kill_word, yank_pop)\n"))
+              match ui_hooks.get("open_page", #false)
+              | fn: fn("help", #false)
+              | ~else: out.write_string(hotkeys_text()))
 
 // command menu entries: registered commands + prompt templates + quit/exit
 fun tui_commands() :: List:
@@ -1831,6 +1917,11 @@ fun run_tui_mode():
   ui_hooks["set_status"] := fun (s): tui.set_activity(s)
   ui_hooks["set_widget"] := fun (id, text): tui.set_widget(to_string(id), text)
   ui_hooks["set_footer"] := fun (s): tui.set_footer_extra(to_string(s))
+  ui_hooks["toggle_pane"] := fun (id): tui.toggle_pane(to_string(id))
+  ui_hooks["open_overlay"] := fun (id, data): tui.open_overlay(to_string(id), data)
+  ui_hooks["open_page"] := fun (id, data): tui.open_page(to_string(id), data)
+  ui_hooks["ask_card"] := fun (p, opts): tui.begin_question(to_string(p), opts)
+  ui_hooks["review_plan"] := fun (items): tui.begin_plan_review(items)
   // route notify/command prints into the TUI transcript
   let (pin, pout) = rkt.#{make-pipe}()
   out := pout
@@ -1867,7 +1958,24 @@ fun run_tui_mode():
               ~markdown_transformers: fun (): registry.state.get("markdown_transformers", []),
               ~clicks: fun (): registry.state.get("clicks", #false),
               ~pending_ask: pending_ask_state,
-              ~bind_ask: bind_ask_state)
+              ~bind_ask: bind_ask_state,
+              ~panes: fun (): registry.state.get("panes", #false),
+              ~list_sessions: fun (): list_sessions(cwd()),
+              ~on_resume: fun (path): handle_command("resume", to_string(path)),
+              ~on_fork: fun (): handle_command("fork", ""),
+              ~dashboard_snap: fun ():
+                                 to_string(registry.state.get("dashboard_snap", "")),
+              ~settings_rows: settings_page_rows,
+              ~model_rows: available_model_entries,
+              ~current_model: fun ():
+                                to_string(config.provider) +& "/" +& to_string(config.model),
+              ~theme_rows: list_theme_names,
+              ~current_theme_name: fun ():
+                                     match settings.get("theme", #false)
+                                     | s :: String: s
+                                     | ~else: "",
+              ~help_text: hotkeys_text,
+              ~extensions_rows: extensions_page_snap)
 
 fun install_repl_ask():
   def mutable ask_sema = #false

@@ -28,6 +28,10 @@ export:
   disconnect_all
   reload
   status
+  list_resources
+  list_prompts
+  read_resource
+  get_prompt
   PROTOCOL
 
 def PROTOCOL = "2024-11-05"
@@ -35,6 +39,8 @@ def PROTOCOL = "2024-11-05"
 def mutable sessions :: Map = {}
 def mutable next_ids :: Map = {}
 def mutable last_status :: List = []
+def mutable resources :: Map = {}
+def mutable prompts :: Map = {}
 
 def ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 
@@ -140,6 +146,8 @@ fun disconnect_all():
   sessions := {}
   next_ids := {}
   last_status := []
+  resources := {}
+  prompts := {}
 
 fun register_mcp_tool(registry, server :: String, tool :: Map, conn):
   let remote = to_string(tool.get("name", ""))
@@ -187,6 +195,22 @@ fun connect_one(registry, server :: String, spec :: Map, notify_fn):
     sessions := sessions ++ { server: conn }
     last_status := last_status.add([server, tools.length()])
     notify_fn("mcp " +& server +& ": " +& tools.length() +& " tools")
+    try:
+      let res_listed = rpc(conn, server, "resources/list", {})
+      let res:
+        match (if res_listed is_a Map | res_listed.get("resources", []) | [])
+        | l :: List: l
+        | ~else: []
+      resources := resources ++ { server: res }
+      ~catch _: #void
+    try:
+      let p_listed = rpc(conn, server, "prompts/list", {})
+      let ps:
+        match (if p_listed is_a Map | p_listed.get("prompts", []) | [])
+        | l :: List: l
+        | ~else: []
+      prompts := prompts ++ { server: ps }
+      ~catch _: #void
     ~catch e :: Exn.Fail:
       try:
         wire.#{mcp-close}(conn)
@@ -220,3 +244,37 @@ fun reload(registry,
 
 fun status() :: List:
   last_status
+
+fun list_resources() :: Map:
+  resources
+
+fun list_prompts() :: Map:
+  prompts
+
+fun read_resource(server :: String, uri :: String):
+  let conn = sessions.get(server, #false)
+  cond
+  | !(conn):
+      error("mcp " +& server +& ": not connected")
+  | ~else:
+      let result = rpc(conn, server, "resources/read", { "uri": uri })
+      let parts:
+        match (if result is_a Map | result.get("contents", []) | [])
+        | l :: List:
+            for List (c in l):
+              skip_when !(c is_a Map)
+              to_string(c.get("text", ""))
+        | ~else: []
+      String.join(parts, "\n")
+
+fun get_prompt(server :: String, name :: String, args :: Map = {}):
+  let conn = sessions.get(server, #false)
+  cond
+  | !(conn):
+      error("mcp " +& server +& ": not connected")
+  | ~else:
+      let result = rpc(conn, server, "prompts/get",
+                       { "name": name, "arguments": args })
+      match (if result is_a Map | result.get("messages", []) | [])
+      | l :: List: l
+      | ~else: []

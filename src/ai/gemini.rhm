@@ -7,6 +7,7 @@ import:
   json
   net/http
   "sse.rhm"
+  "http_util.rhm" as http_util
 
 export:
   stream_chat
@@ -100,17 +101,17 @@ fun stream_chat(~base_url: base_url :: String,
                                 { "name": t["name"],
                                   "description": t["description"],
                                   "parameters": t["schema"] } }] }
-  let headers = { "Content-Type": "application/json" } ++ extra_headers
-  let url = base_url +& "/models/" +& model +& ":streamGenerateContent?alt=sse&key=" +& api_key
+  let headers:
+    let base = { "Content-Type": "application/json" }
+    let base = (if api_key == "" | base | base ++ { "x-goog-api-key": api_key })
+    base ++ extra_headers
+  let url = base_url +& "/models/" +& model +& ":streamGenerateContent?alt=sse"
   let resp = http.post(url,
                        ~headers: headers,
                        ~data: http.payload.json(body),
                        ~stream: #true,
                        ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))
-  when resp.status_code < 200 || resp.status_code >= 300
-  | let err_body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
-    resp.close()
-    error("gemini: HTTP " +& resp.status_code +& ": " +& err_body)
+  http_util.check_response("gemini", resp)
   def mutable content = ""
   def mutable finish_reason = ""
   def mutable tool_calls :: List = []

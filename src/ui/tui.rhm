@@ -37,7 +37,9 @@ import:
   json
   "term.rkt" as term
   "style.rhm" open
+  "pager.rhm" as pager
   "../kernel/sync.rkt" as sync
+  "../kernel/tasks.rhm" as tasks
 
 export:
   run_tui
@@ -66,6 +68,16 @@ export:
   ask_card_rows
   ask_card_hits
   ASK_CARD_H
+  toggle_pane
+  open_overlay
+  close_overlay
+  open_page
+  close_page
+  begin_question
+  begin_plan_review
+  active_pane
+  overlay_kind
+  page_kind
 
 // Images pasted from the clipboard (Ctrl-V / Alt-V) while the TUI is
 // running.  Each entry is an attachment map shaped like encode_image's
@@ -135,6 +147,109 @@ fun set_title(s :: String):
 def wake_sema = rkt.#{make-semaphore}(0)
 fun wake():
   rkt.#{semaphore-post}(wake_sema)
+
+// ---- pager chrome (panes / overlays / blocking cards) ----
+def mutable active_pane = #false
+def mutable overlay_kind = #false
+def mutable overlay_sel = 0
+def mutable overlay_query :: String = ""
+def mutable overlay_data = #false
+
+fun toggle_pane(id :: String):
+  active_pane := (if active_pane == id | #false | id)
+  dirty := #true
+  wake()
+
+fun open_overlay(id :: String, data = #false):
+  overlay_kind := id
+  overlay_sel := 0
+  overlay_query := ""
+  overlay_data := data
+  dirty := #true
+  wake()
+
+fun close_overlay():
+  overlay_kind := #false
+  overlay_query := ""
+  overlay_data := #false
+  dirty := #true
+  wake()
+
+def mutable page_kind = #false
+def mutable page_data = #false
+def mutable page_sel = 0
+def mutable page_query :: String = ""
+def mutable page_drafts :: Map = {}
+
+fun open_page(id :: String, data = #false):
+  page_kind := id
+  page_data := data
+  page_sel := 0
+  page_query := ""
+  page_drafts := {}
+  dirty := #true
+  wake()
+
+fun close_page():
+  page_kind := #false
+  page_data := #false
+  page_sel := 0
+  page_query := ""
+  page_drafts := {}
+  dirty := #true
+  wake()
+
+def mutable q_sema = #false
+def mutable q_result :: String = ""
+def mutable q_waiting = #false
+def mutable q_prompt :: String = ""
+def mutable q_options :: List = []
+
+fun begin_question(prompt :: String, options :: List) :: String:
+  q_prompt := prompt
+  q_options := options
+  q_result := ""
+  q_waiting := #true
+  q_sema := rkt.#{make-semaphore}(0)
+  dirty := #true
+  wake()
+  rkt.#{semaphore-wait}(q_sema)
+  q_result
+
+fun answer_question(s :: String):
+  when q_waiting
+  | q_waiting := #false
+    q_result := s
+    match q_sema
+    | #false: #void
+    | sema: rkt.#{semaphore-post}(sema)
+    dirty := #true
+    wake()
+
+def mutable plan_sema = #false
+def mutable plan_result :: String = ""
+def mutable plan_waiting = #false
+def mutable plan_items_ui :: List = []
+
+fun begin_plan_review(items :: List) :: String:
+  plan_items_ui := items
+  plan_result := "s"
+  plan_waiting := #true
+  plan_sema := rkt.#{make-semaphore}(0)
+  dirty := #true
+  wake()
+  rkt.#{semaphore-wait}(plan_sema)
+  plan_result
+
+fun answer_plan(s :: String):
+  when plan_waiting
+  | plan_waiting := #false
+    plan_result := s
+    match plan_sema
+    | #false: #void
+    | sema: rkt.#{semaphore-post}(sema)
+    dirty := #true
+    wake()
 
 fun set_activity(s):
   fun go():
@@ -361,7 +476,8 @@ fun fit_tui_layout(rows :: Int,
                    queue_want :: Int,
                    popup_want :: Int,
                    search_h :: Int,
-                   ~ask_h: ask_h :: Int = 0) :: Map:
+                   ~ask_h: ask_h :: Int = 0,
+                   ~pane_want: pane_want :: Int = 0) :: Map:
   let fixed_h = 3 + search_h + ask_h
   let editor_h = math.min(editor_want, math.max(0, rows - fixed_h - 1))
   def mutable budget = math.max(0, rows - fixed_h - editor_h - 1)
@@ -369,16 +485,19 @@ fun fit_tui_layout(rows :: Int,
   budget := budget - popup_h
   let header_h = math.min(header_want, budget)
   budget := budget - header_h
+  let pane_h = math.min(pane_want, budget)
+  budget := budget - pane_h
   let queue_h = math.min(queue_want, budget)
   budget := budget - queue_h
   let widget_h = math.min(widget_want, budget)
   let trans_h = math.max(0, rows - fixed_h - editor_h - popup_h
-                            - header_h - queue_h - widget_h)
+                            - header_h - queue_h - widget_h - pane_h)
   { "editor": editor_h,
     "header": header_h,
     "widget": widget_h,
     "queue": queue_h,
     "popup": popup_h,
+    "pane": pane_h,
     "transcript": trans_h }
 
 def ASK_CARD_H = 3
@@ -488,7 +607,19 @@ fun run_tui(~theme: theme_in :: Map = {},
             ~theme_loader: theme_loader = fun (): theme_in,
             ~clicks: clicks = fun (): #false,
             ~pending_ask: pending_ask = fun (): #false,
-            ~bind_ask: bind_ask = fun (w): #void):
+            ~bind_ask: bind_ask = fun (w): #void,
+            ~panes: panes_cb = fun (): #false,
+            ~list_sessions: list_sessions = fun (): [],
+            ~on_resume: on_resume = fun (p): #void,
+            ~on_fork: on_fork = fun (): #void,
+            ~dashboard_snap: dashboard_snap = fun (): "",
+            ~settings_rows: settings_rows = fun (): [],
+            ~model_rows: model_rows = fun (): [],
+            ~current_model: current_model = fun (): "",
+            ~theme_rows: theme_rows = fun (): [],
+            ~current_theme_name: current_theme_name = fun (): "",
+            ~help_text: help_text = fun (): "",
+            ~extensions_rows: extensions_rows = fun (): { "mcp": [], "skills": [] }):
   def mutable current_theme = default_theme ++ theme_in
   def mutable last_theme_json = json.to_string(theme_in)
   fun tcolor(kind :: String):
@@ -558,6 +689,13 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable last_trans_h = 20      // visible transcript height from last render
   def mutable last_trans_y = 0       // first transcript screen row
   def mutable last_hits :: List = [] // click regions from the last render
+  def mutable focus :: String = "prompt"
+  def mutable hover_hit = #false
+  def mutable selected_block = #false
+  def mutable expanded_tools :: Map = {}
+  def mutable last_ed_y = 0
+  def mutable last_pane_y = 0
+  def mutable last_selected_kind :: String = ""
   def mutable ask_sema = #false
   def mutable ask_answer = "deny"
   def mutable ask_waiting = #false
@@ -637,6 +775,13 @@ fun run_tui(~theme: theme_in :: Map = {},
     input_lines := [""]
     cur_line := 0
     cur_col := 0
+
+  fun fill_prompt(s :: String):
+    input_lines := [s]
+    cur_line := 0
+    cur_col := s.length()
+    focus := "prompt"
+    dirty := #true
 
   fun insert(s :: String):
     let t = cur_text()
@@ -899,16 +1044,159 @@ fun run_tui(~theme: theme_in :: Map = {},
 
   fun dispatch_hit(h :: Map, col :: Int):
     let id = to_string(h.get("id", ""))
+    let foc = pager.focus_for_hit(id)
+    when foc != ""
+    | focus := foc
     cond
     | id == "ask_allow": answer_ask("allow")
     | id == "ask_deny": answer_ask("deny")
-    | id == "stop": interrupt_turn()
-    | id == "tool_fold":
-        tools_expanded := !tools_expanded
-        push("notify", (if tools_expanded
-                        | "[tool output expanded]"
-                        | "[tool output folded]"))
+    | id == "question_opt":
+        match h.get("data", #false)
+        | i :: Int:
+            let opts = q_options.add(pager.OTHER_OPTION)
+            when i >= 0 && i < opts.length()
+            | let choice = to_string(opts[i])
+              if choice == pager.OTHER_OPTION
+              | focus := "prompt"
+                answer_question(pager.OTHER_OPTION)
+              | answer_question(choice)
+        | ~else: #void
+    | id == "plan_approve":
+        if plan_waiting
+        | answer_plan("a")
+        | block:
+            close_overlay()
+            handle_command("plan", "approve")
+    | id == "plan_stay":
+        if plan_waiting | answer_plan("s") | close_overlay()
+    | id == "plan_quit":
+        if plan_waiting
+        | answer_plan("q")
+        | block:
+            close_overlay()
+            handle_command("plan", "off")
+    | id == "palette_pick":
+        let items = pager.palette_filter(commands(), page_query)
+        match h.get("data", #false)
+        | i :: Int:
+            when i >= 0 && i < items.length()
+            | let name = to_string(if items[i] is_a List | items[i][0] | items[i])
+              close_page()
+              handle_command(name, "")
+        | ~else: #void
+    | id == "resume_pick":
+        let ss = list_sessions()
+        match h.get("data", #false)
+        | i :: Int:
+            when i >= 0 && i < ss.length()
+            | let s = ss[i]
+              let path:
+                cond
+                | s is_a Map: to_string(s.get("path", ""))
+                | s is_a List: to_string(s[0])
+                | ~else: to_string(s)
+              close_page()
+              when path != "" | on_resume(path)
+        | ~else: #void
+    | id == "chip_model":
+        open_page("models")
+    | id == "model_pick":
+        let name = to_string(h.get("name", ""))
+        match h.get("data", #false)
+        | i :: Int:
+            page_sel := i
+            activate_page()
+        | ~else:
+            when name != ""
+            | close_page()
+              handle_command("model", name)
+    | id == "theme_pick":
+        match h.get("data", #false)
+        | i :: Int:
+            page_sel := i
+            activate_page()
+        | ~else: #void
+    | id == "ext_skill":
+        match h.get("data", #false)
+        | i :: Int:
+            page_sel := i
+            activate_page()
+        | ~else: #void
+    | id == "ext_tabs":
+        page_data := (if to_string(page_data || "mcp") == "skills" | "mcp" | "skills")
+        page_sel := 0
         dirty := #true
+    | id == "tasks_open":
+        toggle_pane("tasks")
+    | id == "todo_toggle":
+        match pane_spec("todos")
+        | spec :: Map:
+            match spec.get("on_click", #false)
+            | fn :: Function: fn(h.get("data", #false))
+            | ~else: #void
+        | ~else: #void
+    | id == "task_open":
+        match pane_spec("tasks")
+        | spec :: Map:
+            match spec.get("on_click", #false)
+            | fn :: Function: fn(h.get("data", #false))
+            | ~else: #void
+        | ~else:
+            open_page("dashboard")
+    | id == "queue_row":
+        match h.get("data", #false)
+        | i :: Int:
+            when i >= 0 && i < followups.length()
+            | // click left = edit, rightish = cancel; default send
+              cond
+              | col > 50:
+                  followups := for List (j in 0 .. followups.length()):
+                                 skip_when j == i
+                                 followups[j]
+              | col > 40:
+                  let text = to_string(followups[i])
+                  followups := for List (j in 0 .. followups.length()):
+                                 skip_when j == i
+                                 followups[j]
+                  start_turn(text)
+              | ~else:
+                  input_lines := [to_string(followups[i])]
+                  followups := for List (j in 0 .. followups.length()):
+                                 skip_when j == i
+                                 followups[j]
+                  cur_line := 0
+                  cur_col := cur_text().length()
+                  focus := "prompt"
+              dirty := #true
+        | ~else: #void
+    | id == "dash_resume":
+        open_page("resume")
+    | id == "dash_open":
+        handle_command("session", "")
+    | id == "settings_row":
+        match h.get("data", #false)
+        | i :: Int:
+            page_sel := i
+            activate_page()
+        | ~else: #void
+    | id == "stop": interrupt_turn()
+    | id == "entry":
+        selected_block := h.get("data", #false)
+        focus := "scrollback"
+        dirty := #true
+    | id == "scrollback":
+        focus := "scrollback"
+        dirty := #true
+    | id == "tool_fold":
+        match h.get("data", #false)
+        | bid :: Int:
+            expanded_tools := (if expanded_tools.has_key(bid)
+                               | expanded_tools.remove(bid)
+                               | expanded_tools ++ { bid: #true })
+            dirty := #true
+        | ~else:
+            tools_expanded := !tools_expanded
+            dirty := #true
     | id == "ac_pick":
         match h.get("data", #false)
         | i :: Int:
@@ -1000,6 +1288,7 @@ fun run_tui(~theme: theme_in :: Map = {},
         followups := followups.add(text)
         history := history.add(text)
         reset_input()
+        active_pane := "queue"
         dirty := #true
 
   fun start_turn(input :: String):
@@ -1154,7 +1443,360 @@ fun run_tui(~theme: theme_in :: Map = {},
     | #void
     | handle_key_main(k)
 
+  fun pane_table():
+    match panes_cb()
+    | mm :: MutableMap: mm
+    | m :: Map: m
+    | ~else: {}
+
+  fun pane_spec(id):
+    let tab = pane_table()
+    cond
+    | tab is_a MutableMap: tab.get(id, #false)
+    | tab is_a Map: tab.get(id, #false)
+    | ~else: #false
+
+  fun page_items() :: List:
+    cond
+    | page_kind == "dashboard":
+        pager.dashboard_page_items(to_string(dashboard_snap()))
+    | page_kind == "settings":
+        pager.settings_page_items(settings_rows(), page_drafts)
+    | page_kind == "models":
+        pager.model_page_items(model_rows(), page_query, to_string(current_model()))
+    | page_kind == "theme":
+        pager.theme_page_items(theme_rows(), to_string(current_theme_name()))
+    | page_kind == "help":
+        pager.help_page_items(to_string(help_text()))
+    | page_kind == "extensions":
+        let snap = extensions_rows()
+        let mcp = if snap is_a Map | snap.get("mcp", []) | []
+        let sk = if snap is_a Map | snap.get("skills", []) | []
+        pager.extensions_page_items(to_string(page_data || "mcp"), mcp, sk)
+    | page_kind == "resume":
+        pager.resume_page_items(list_sessions())
+    | page_kind == "palette":
+        pager.palette_page_items(commands(), page_query)
+    | page_kind == "frame":
+        pager.frame_page_items(to_string(page_data || "(empty)"))
+    | ~else:
+        match page_data
+        | s :: String: pager.dashboard_page_items(s)
+        | ~else: []
+
+  fun page_title() :: String:
+    cond
+    | page_kind == "dashboard": "rho · Dashboard"
+    | page_kind == "settings": "rho · Settings"
+    | page_kind == "models":
+        if page_query == ""
+        | "rho · Models"
+        | "rho · Models  [" +& page_query +& "]"
+    | page_kind == "theme": "rho · Theme"
+    | page_kind == "help": "rho · Shortcuts"
+    | page_kind == "extensions": "rho · Extensions"
+    | page_kind == "resume": "rho · Resume"
+    | page_kind == "palette":
+        if page_query == ""
+        | "rho · Commands"
+        | "rho · Commands  [" +& page_query +& "]"
+    | page_kind == "frame": "rho · Sub-agent"
+    | page_kind is_a String: "rho · " +& to_string(page_kind)
+    | ~else: "rho"
+
+  fun page_hints() :: String:
+    cond
+    | page_kind == "settings":
+        "↑↓ select · ←→ flip · Enter edit/save · Esc close"
+    | page_kind == "models":
+        "type to filter · Enter switch · Esc close"
+    | page_kind == "theme":
+        "↑↓ select · Enter apply · Esc close"
+    | page_kind == "help":
+        "↑↓ scroll · Esc close"
+    | page_kind == "extensions":
+        "Tab switch · Enter open · r reload · s stop · Esc close"
+    | page_kind == "dashboard":
+        "↑↓ select · Enter open · Esc close"
+    | page_kind == "palette":
+        "type to filter · Enter run · Esc close"
+    | page_kind == "resume":
+        "↑↓ select · Enter open · Esc close"
+    | ~else: "Esc close"
+
+  fun selected_page_item():
+    let items = page_items()
+    if items == [] || page_sel < 0 || page_sel >= items.length()
+    | #false
+    | items[page_sel]
+
+  fun activate_page():
+    let item = selected_page_item()
+    if !(item is_a Map)
+    | #void
+    | let id = to_string(item.get("id", ""))
+      cond
+      | id == "dash_resume":
+          open_page("resume")
+      | id == "dash_open":
+          handle_command("session", "")
+      | id == "palette_pick":
+          let name = to_string(item.get("name", ""))
+          close_page()
+          when name != "" | handle_command(name, "")
+      | id == "resume_pick":
+          let ss = list_sessions()
+          match item.get("data", #false)
+          | i :: Int:
+              when i >= 0 && i < ss.length()
+              | let path:
+                  let s = ss[i]
+                  cond
+                  | s is_a Map: to_string(s.get("path", ""))
+                  | s is_a List: to_string(s[0])
+                  | ~else: to_string(s)
+                close_page()
+                when path != "" | on_resume(path)
+          | ~else: #void
+      | id == "settings_row":
+          let key = to_string(item.get("key", ""))
+          let kind = item.get("kind", "string")
+          let shown = to_string(item.get("value", ""))
+          cond
+          | key == "": #void
+          | key == "theme":
+              open_page("theme")
+          | key == "default_model":
+              open_page("models")
+          | kind == "bool" || kind is_a List:
+              handle_command("settings", key +& " " +& shown)
+              page_drafts := page_drafts.remove(key)
+              dirty := #true
+          | ~else:
+              fill_prompt("/settings " +& key +& " ")
+              close_page()
+      | id == "model_pick":
+          let name = to_string(item.get("name", ""))
+          close_page()
+          when name != "" | handle_command("model", name)
+      | id == "theme_pick":
+          let name = to_string(item.get("name", ""))
+          close_page()
+          handle_command("theme", (if name == "" | "default" | name))
+      | id == "ext_skill":
+          let name = to_string(item.get("name", ""))
+          when name != ""
+          | close_page()
+            handle_command("skill:" +& name, "")
+      | ~else: #void
+
+  fun flip_selected_setting(dir :: Int):
+    let item = selected_page_item()
+    if !(item is_a Map)
+    | #void
+    | let key = to_string(item.get("key", ""))
+      let kind = item.get("kind", "string")
+      when key != "" && (kind == "bool" || kind is_a List)
+      | let cur = to_string(item.get("value", ""))
+        page_drafts := page_drafts ++ { key: pager.next_setting_value(kind, cur, dir) }
+        dirty := #true
+
+  fun page_row_skip(id :: String) :: Boolean:
+    id == "settings_header" || id == "ext_tabs"
+
+  fun page_move(dir :: Int):
+    let items = page_items()
+    let n = items.length()
+    recur go(i = page_sel + dir):
+      cond
+      | i < 0 || i >= n:
+          dirty := #true
+      | page_row_skip(to_string(items[i].get("id", ""))):
+          go(i + dir)
+      | ~else:
+          page_sel := i
+          dirty := #true
+
+  fun handle_page_key(k :: String) :: Boolean:
+    if page_kind == #false
+    | #false
+    | cond
+      | k == "<escape>" || k == "C-[":
+          close_page()
+          #true
+      | k == "<up>":
+          page_move(-1)
+          #true
+      | k == "<down>":
+          page_move(1)
+          #true
+      | k == "<left>":
+          flip_selected_setting(-1)
+          #true
+      | k == "<right>":
+          flip_selected_setting(1)
+          #true
+      | k == "C-M":
+          activate_page()
+          #true
+      | page_kind == "extensions" && (k == "C-I" || k == "<tab>"):
+          page_data := (if to_string(page_data || "mcp") == "skills" | "mcp" | "skills")
+          page_sel := 0
+          dirty := #true
+          #true
+      | page_kind == "extensions" && to_string(page_data || "mcp") != "skills"
+          && (k == "r" || k == "R"):
+          handle_command("mcp", "reload")
+          dirty := #true
+          #true
+      | page_kind == "extensions" && to_string(page_data || "mcp") != "skills"
+          && (k == "s" || k == "S"):
+          handle_command("mcp", "stop")
+          dirty := #true
+          #true
+      | (page_kind == "palette" || page_kind == "models")
+          && (k == "<backspace>" || k == "C-H"):
+          when page_query.length() > 0
+          | page_query := page_query.substring(0 .. page_query.length() - 1)
+            page_sel := 0
+          dirty := #true
+          #true
+      | (page_kind == "palette" || page_kind == "models") && k.length() == 1:
+          page_query := page_query +& k
+          page_sel := 0
+          dirty := #true
+          #true
+      | k == "C-C" || k == "C-D" || k == "C-L"
+          || k == "C-\\" || k == "C-\\\\"
+          || k == "C-."
+          || k == "<f2>" || k == "F2" || k == "<F2>":
+          #false
+      | ~else: #true
+
+  fun render_page(rows :: Int, cols :: Int):
+    let items = page_items()
+    let n = items.length()
+    when page_sel >= n
+    | page_sel := math.max(0, n - 1)
+    when n > 0 && page_sel < n
+         && page_row_skip(to_string(items[page_sel].get("id", "")))
+    | page_move(1)
+    let body_h = math.max(0, rows - 2)
+    let frame = pager.page_frame(~title: page_title(),
+                                 ~body: items,
+                                 ~hints: page_hints(),
+                                 ~rows: rows,
+                                 ~cols: cols,
+                                 ~sel: page_sel)
+    last_hits := pager.page_hits(items, page_sel, cols, ~body_h: body_h)
+    last_trans_y := -1
+    last_trans_h := 0
+    last_ed_y := rows
+    term.#{term-draw!}(frame, #false)
+
+  fun handle_overlay_key(k :: String) :: Boolean:
+    cond
+    | overlay_kind == #false: #false
+    | k == "<escape>" || k == "C-[":
+        close_overlay()
+        #true
+    | overlay_kind == "plan_pending":
+        cond
+        | k == "a" || k == "A":
+            close_overlay()
+            handle_command("plan", "approve")
+            #true
+        | k == "s" || k == "S":
+            close_overlay()
+            #true
+        | k == "q" || k == "Q":
+            close_overlay()
+            handle_command("plan", "off")
+            #true
+        | ~else: #true
+    | ~else: #true
+
+  fun handle_question_key(k :: String) :: Boolean:
+    if !q_waiting
+    | #false
+    | cond
+      | k == "<escape>" || k == "C-[":
+          answer_question("error: cancelled")
+          #true
+      | k == "z" || k == "Z":
+          answer_question(pager.OTHER_OPTION)
+          #true
+      | ~else:
+          match String.maybe_to_int(k)
+          | n :: Int:
+              when n >= 1 && n <= q_options.length()
+              | answer_question(to_string(q_options[n - 1]))
+              #true
+          | ~else: #true
+
+  fun handle_plan_key(k :: String) :: Boolean:
+    if !plan_waiting
+    | #false
+    | cond
+      | k == "a" || k == "A":
+          answer_plan("a")
+          #true
+      | k == "s" || k == "S":
+          answer_plan("s")
+          #true
+      | k == "q" || k == "Q" || k == "<escape>" || k == "C-[":
+          answer_plan("q")
+          #true
+      | ~else: #true
+
+  fun handle_scrollback_key(k :: String) :: Boolean:
+    if focus != "scrollback"
+    | #false
+    | cond
+      | k == "C-I":
+          focus := "prompt"
+          dirty := #true
+          #true
+      | k == "<up>":
+          selected_block := (if selected_block is_a Int
+                             | math.max(0, selected_block - 1)
+                             | 0)
+          dirty := #true
+          #true
+      | k == "<down>":
+          selected_block := (if selected_block is_a Int
+                             | selected_block + 1
+                             | 0)
+          dirty := #true
+          #true
+      | k == "y" || k == "Y":
+          do_copy()
+          #true
+      | k == "C-M":
+          cond
+          | last_selected_kind == "user":
+              on_fork()
+              #true
+          | last_selected_kind == "tool_result" && selected_block is_a Int:
+              expanded_tools := (if expanded_tools.has_key(selected_block)
+                                 | expanded_tools.remove(selected_block)
+                                 | expanded_tools ++ { selected_block: #true })
+              dirty := #true
+              #true
+          | ~else: #true
+      | k.length() == 1:
+          focus := "prompt"
+          insert(k)
+          #true
+      | ~else: #false
+
   fun handle_key_main(k :: String):
+    if handle_page_key(k) || handle_overlay_key(k) || handle_question_key(k)
+       || handle_plan_key(k) || handle_scrollback_key(k)
+    | #void
+    | handle_key_chrome(k)
+
+  fun handle_key_chrome(k :: String):
     let killish = k == "C-K" || k == "C-W" || k == "C-U"
                     || k == kb("kill_line", "C-K") || k == kb("kill_word", "C-W")
     let yankish = k == "C-Y" || k == "M-Y" || k == "M-y"
@@ -1194,18 +1836,48 @@ fun run_tui(~theme: theme_in :: Map = {},
     | k == "M-C-M" || k == "M-<return>" || k == kb("queue_followup", "M-C-M"):
         queue_followup()
     | k == "C-J": insert_newline()
-    | k == kb("external_editor", "C-G"): external_edit()
+    | k == "C-T":
+        if pane_spec("todos")
+        | toggle_pane("todos")
+        | block:
+            thinking_shown := !thinking_shown
+            push("notify", (if thinking_shown
+                            | "[thinking shown]"
+                            | "[thinking hidden]"))
+    | k == "C-G":
+        if pane_spec("tasks")
+        | toggle_pane("tasks")
+        | external_edit()
+    | k == kb("external_editor", "M-E"): external_edit()
     | k == kb("copy_last", "C-X"): do_copy()
     | k == kb("toggle_tool_output", "C-O"):
         tools_expanded := !tools_expanded
         push("notify", (if tools_expanded
                         | "[tool output expanded]"
                         | "[tool output collapsed]"))
-    | k == kb("toggle_thinking", "C-T"):
+    | k == kb("toggle_thinking", "C-E") || k == "C-E":
         thinking_shown := !thinking_shown
         push("notify", (if thinking_shown
                         | "[thinking shown]"
                         | "[thinking hidden]"))
+    | k == "<f2>" || k == "F2" || k == "<F2>":
+        if page_kind == "settings"
+        | close_page()
+        | open_page("settings")
+    | k == "C-\\" || k == "C-\\\\":
+        if page_kind == "dashboard"
+        | close_page()
+        | handle_command("dashboard", "")
+    | k == "C-.":
+        if page_kind == "help"
+        | close_page()
+        | open_page("help")
+    | k == "?":
+        if page_kind == "palette"
+        | close_page()
+        | open_page("palette")
+    | k == "C-;":
+        toggle_pane("queue")
     | k == "C-S-I" || k == "S-<tab>" || k == kb("cycle_thinking", "M-T"):
         let msg = to_string(cycle_thinking())
         when msg != "" | push("notify", msg)
@@ -1324,7 +1996,26 @@ fun run_tui(~theme: theme_in :: Map = {},
     let cols = term.#{term-cols}()
     let input_h_want = math.min(input_lines.length(), 8)
     let popup_h_want = (if ac_open && ac_items != [] | math.min(5, ac_items.length()) | 0)
-    let queue_h_want = math.min(followups.length(), 3)
+    let queue_h_want = 0
+    fun ext_pane_lines(id :: String) :: List:
+      match pane_spec(id)
+      | spec :: Map:
+          match spec.get("lines", #false)
+          | fn :: Function:
+              try:
+                fn()
+                ~catch _: []
+          | ~else: []
+      | ~else: []
+    let pane_lines:
+      cond
+      | active_pane == "queue": pager.queue_pane_lines(followups)
+      | active_pane is_a String: ext_pane_lines(to_string(active_pane))
+      | ~else: []
+    let pane_h_want:
+      if active_pane
+      | math.min(8, math.max(1, pane_lines.length() + 1))
+      | 0
     // extension widgets, one row per line (total capped at 4 rows)
     let widget_lines:
       for List:
@@ -1346,23 +2037,30 @@ fun run_tui(~theme: theme_in :: Map = {},
     let header_h_want = header_rows.length()
     let search_h = (if search_active | 1 | 0)
     let ask = pending_ask()
-    let ask_h:
-      cond
-      | ask is_a Map: ASK_CARD_H
-      | ~else: 0
-    let ask_rows:
+    let overlay_rows:
       cond
       | ask is_a Map: ask_card_rows(ask, tcolor, cols)
+      | q_waiting:
+          pager.question_card_rows(q_prompt, q_options.add(pager.OTHER_OPTION),
+                                   cols, tcolor)
+      | plan_waiting:
+          pager.plan_review_rows(plan_items_ui, cols, tcolor)
+      | overlay_kind == "plan_pending":
+          let items = if overlay_data is_a List | overlay_data | []
+          pager.plan_review_rows(items, cols, tcolor)
       | ~else: []
+    let ask_h = overlay_rows.length()
+    let ask_rows = overlay_rows
     let editor_h_want = (if fullscreen_mode | 1 | input_h_want)
     let layout = fit_tui_layout(rows, editor_h_want, header_h_want,
                                 widget_h_want, queue_h_want, popup_h_want,
-                                search_h, ~ask_h: ask_h)
+                                search_h, ~ask_h: ask_h, ~pane_want: pane_h_want)
     let ed_h = layout["editor"]
     let header_h = layout["header"]
     let widget_h = layout["widget"]
     let queue_h = layout["queue"]
     let popup_h = layout["popup"]
+    let pane_h = layout["pane"]
     let trans_h = layout["transcript"]
     let header_rows = list_prefix(header_rows, header_h)
     last_trans_h := trans_h
@@ -1370,6 +2068,7 @@ fun run_tui(~theme: theme_in :: Map = {},
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
     let all_lines = (if partial == "" | lines | lines.add([partial_kind, partial]))
+    let blocks = pager.entry_blocks(all_lines)
     let need = trans_h + scroll + 4
     // A search target must be included before wrapped-row coordinates can be
     // calculated. Normal scrolling still wraps only the needed transcript tail.
@@ -1398,9 +2097,11 @@ fun run_tui(~theme: theme_in :: Map = {},
         each sub:
           if shown.contains("\n")
           | let parts = shown.split("\n", ~trim: #false)
-            if kind == "tool_result" && !tools_expanded
+            let blk = pager.block_at_index(blocks, i)
+            let bid = if blk is_a Map | blk["id"] | i
+            if kind == "tool_result" && !tools_expanded && !expanded_tools.has_key(bid)
             | [to_string(parts[0])
-                 +& " \u2026(+" +& (parts.length() - 1) +& " lines, ctrl-o)"]
+                 +& " \u2026(+" +& (parts.length() - 1) +& " lines, click/enter)"]
             | for List (p in parts): to_string(p)
           | [shown]
         let spans:
@@ -1478,6 +2179,28 @@ fun run_tui(~theme: theme_in :: Map = {},
       | trans_rows
       | for List (r in 0 .. trans_rows.length()):
           highlight_search_row(trans_rows[r], search_query)
+    last_selected_kind := (match selected_block
+                           | id :: Int:
+                               match pager.block_at_index(blocks, id)
+                               | b :: Map: to_string(b["kind"])
+                               | ~else: ""
+                           | ~else: "")
+    let trans_rows:
+      for List (r in 0 .. trans_rows.length()):
+        let src:
+          if first + r < wrapped_sources.length()
+          | wrapped_sources[first + r]
+          | -1
+        let blk = pager.block_at_index(blocks, src)
+        let selected = blk is_a Map && selected_block == blk["id"]
+        let hovered = hover_hit is_a Map && hover_hit.get("row", -1) == header_h + r
+        let row = trans_rows[r]
+        let row:
+          if selected
+          | for List (sp in row):
+              [sp[0], tcolor("footer_bg"), (if sp[2] | sp[2] | #false), sp[3]]
+          | row
+        if hovered | pager.apply_hover_row(row, #true) | row
     // separator; shows position while scrolled back
     let total_visible = wrapped.length()
     let sep_text:
@@ -1517,19 +2240,39 @@ fun run_tui(~theme: theme_in :: Map = {},
           let f = (if f.length() > cols - 12 | f.substring(0 .. cols - 12) +& "\u2026" | f)
           [[tcolor("steer"), #false, "dim",
             " \u29D6 queued " +& (i + 1) +& "/" +& followups.length() +& ": " +& f]]
+    let pane_rows:
+      if pane_h == 0
+      | []
+      | let title = " " +& to_string(active_pane) +& "  (Ctrl-T todos \u00B7 Ctrl-G tasks \u00B7 Ctrl-; queue)"
+        let title_row = [[tcolor("prompt"), #false, "bold",
+                          (if title.length() <= cols | title | title.substring(0 .. cols))]]
+        let body:
+          for List (i in 0 .. math.max(0, pane_h - 1)):
+            if i >= pane_lines.length()
+            | [[#false, #false, #false, ""]]
+            | let line = to_string(pane_lines[i].get("text", ""))
+              let line = (if line.length() <= cols | line | line.substring(0 .. cols))
+              [[tcolor("steer"), #false, #false, line]]
+        [title_row] ++ body
     // status line (pi-style): its own row between transcript and editor;
     // blank when idle so the layout doesn't jump. Footer below stays intact.
+    let live_n = tasks.live().length()
+    let still = tasks.status_text(~queued: followups.length())
     let status_row:
-      if turn_thread
-      | spin_i := spin_i + 1
-        let frames = (if spinner_frames_custom | spinner_frames_custom | spinner_frames)
-        let frame = frames[spin_i mod frames.length()]
-        let secs = math.exact(math.floor((rkt.#{current-inexact-milliseconds}() - turn_started) / 1000))
-        let msg = (if activity | to_string(activity) | "working") +& "..."
-        [[tcolor("prompt"), #false, "bold", " " +& frame +& " "],
-         [tcolor("tool_result"), #false, #false,
-          msg +& " " +& secs +& "s (esc to interrupt \u00B7 type to steer)"]]
-      | [[#false, #false, #false, ""]]
+      cond
+      | turn_thread:
+          spin_i := spin_i + 1
+          let frames = (if spinner_frames_custom | spinner_frames_custom | spinner_frames)
+          let frame = frames[spin_i mod frames.length()]
+          let secs = math.exact(math.floor((rkt.#{current-inexact-milliseconds}() - turn_started) / 1000))
+          let msg = (if activity | to_string(activity) | "working") +& "..."
+          [[tcolor("prompt"), #false, "bold", " " +& frame +& " "],
+           [tcolor("tool_result"), #false, #false,
+            msg +& " " +& secs +& "s (esc to interrupt \u00B7 type to steer)"]]
+      | still != "":
+          [[tcolor("prompt"), #false, #false, " " +& still]]
+      | ~else:
+          [[#false, #false, #false, ""]]
     // search prompt row (present only while typing a query). Keeping an
     // idle placeholder here would draw one row more than search_h budgets,
     // clipping the footer and placing the cursor on the separator.
@@ -1548,20 +2291,24 @@ fun run_tui(~theme: theme_in :: Map = {},
              [tcolor("footer_fg"), tcolor("footer_bg"), #false, to_string(desc)]]
           | [[tcolor("prompt"), #false, #false, "   " +& lab],
              [tcolor("tool_result"), #false, #false, to_string(desc)]]
-    // footer: always the full stats line, never overwritten by the spinner
-    let ftext = footer() +& (if footer_extra == "" | "" | "  \u2502 " +& footer_extra)
+    // shortcuts bar + footer chips
+    let hints = pager.shortcuts_bar(focus, turn_thread && #true, last_selected_kind)
+    let chip_src = footer() +& (if footer_extra == "" | "" | " \u2502 " +& footer_extra)
+    let chips = pager.split_chips(chip_src)
+    let ftext = hints +& "  \u00B7  " +& String.join(chips, " \u2502 ")
     let fpad:
       let padding = math.max(0, cols - display_width(ftext))
       ftext.substring(0 .. math.min(ftext.length(), cols)) +& String.make(padding, Char" ")
     let foot = [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
-    let cursor_row = clamp(header_h + trans_h + widget_h + queue_h + ask_h
+    let cursor_row = clamp(header_h + trans_h + widget_h + pane_h + queue_h + ask_h
                              + search_h + 2 + (cur_line - win_start),
                            0, math.max(0, rows - 1))
     let cursor_col = clamp(2 + display_width(cur_text().substring(0 .. cur_col)),
                            0, cols - 1)
     let y_trans = header_h
     let y_widget = y_trans + trans_h
-    let y_queue = y_widget + widget_h
+    let y_pane = y_widget + widget_h
+    let y_queue = y_pane + pane_h
     let y_status = y_queue + queue_h
     let y_ask = y_status + 1
     let y_search = y_ask + ask_h
@@ -1569,15 +2316,29 @@ fun run_tui(~theme: theme_in :: Map = {},
     let y_ed = y_sep + 1
     let y_pop = y_ed + ed_h
     let y_foot = y_pop + popup_h
+    last_ed_y := y_ed
+    last_pane_y := y_pane
     let hits:
       let trans_hits:
         for List (i in first .. math.min(wrapped.length(), first + trans_h)):
-          skip_when to_string(wrapped_kinds[i]) != "tool_result"
-          make_hit(y_trans + (i - first), 0, cols, "tool_fold", i)
+          let src = wrapped_sources[i]
+          let blk = pager.block_at_index(blocks, src)
+          let bid = if blk is_a Map | blk["id"] | src
+          let y = y_trans + (i - first)
+          let base = [make_hit(y, 0, cols, "entry", bid)]
+          if to_string(wrapped_kinds[i]) == "tool_result"
+          | base.add(make_hit(y, 0, cols, "tool_fold", bid))
+          | base
+      let trans_hits:
+        for List:
+          each group in trans_hits
+          each h in group
+          h
       let status_hits:
-        if turn_thread
-        | [make_hit(y_status, 0, cols, "stop", #false)]
-        | []
+        cond
+        | turn_thread: [make_hit(y_status, 0, cols, "stop", #false)]
+        | still != "": [make_hit(y_status, 0, cols, "tasks_open", #false)]
+        | ~else: []
       let ed_hits:
         for List (i in win_start .. math.min(input_lines.length(), win_start + ed_h)):
           make_hit(y_ed + (i - win_start), 0, cols, "editor", i)
@@ -1590,13 +2351,32 @@ fun run_tui(~theme: theme_in :: Map = {},
       let ask_hits:
         cond
         | ask is_a Map: ask_card_hits(y_ask)
+        | q_waiting:
+            pager.question_card_hits(y_ask, q_options.add(pager.OTHER_OPTION))
+        | plan_waiting || overlay_kind == "plan_pending":
+            pager.plan_review_hits(y_ask)
         | ~else: []
-      trans_hits ++ status_hits ++ ask_hits ++ ed_hits ++ pop_hits
-        ++ [make_hit(y_foot, 0, cols, "footer", #false)]
+      let pane_hits:
+        for List (i in 0 .. math.min(pane_lines.length(), math.max(0, pane_h - 1))):
+          make_hit(y_pane + 1 + i, 0, cols,
+                   to_string(pane_lines[i].get("id", "pane")),
+                   pane_lines[i].get("data", i))
+      let chip_x = display_width(hints) + 4
+      let chip_hs = pager.chip_hits(y_foot, chips, cols, ~x0: chip_x)
+      [make_hit(y_trans, 0, cols, "scrollback", #false)]
+        ++ trans_hits ++ status_hits ++ ask_hits ++ ed_hits ++ pop_hits ++ pane_hits
+        ++ chip_hs
     last_hits := hits
-    term.#{term-draw!}(header_rows ++ trans_rows ++ widget_rows ++ queue_rows ++ [status_row] ++ ask_rows ++ search_rows ++ [sep]
-                         ++ input_rows ++ popup_rows ++ [foot],
-                       [cursor_row, cursor_col])
+    let foot = (if hover_hit is_a Map && hover_hit.get("row", -1) == y_foot
+                | pager.apply_hover_row(foot, #true)
+                | foot)
+    if page_kind
+    | render_page(rows, cols)
+    | term.#{term-draw!}(header_rows ++ trans_rows ++ widget_rows ++ pane_rows ++ [status_row] ++ ask_rows ++ search_rows ++ [sep]
+                           ++ input_rows ++ popup_rows ++ [foot],
+                         (if focus == "prompt"
+                          | [cursor_row, cursor_col]
+                          | #false))
 
   // optional render-loop profiling: RHO_TUI_DEBUG=/path/to/log
   match rkt.getenv("RHO_TUI_DEBUG")
@@ -1661,21 +2441,44 @@ fun run_tui(~theme: theme_in :: Map = {},
           | #'eof: running := #false
           | [#'resize, _, _]: dirty := #true
           | [#'wheel, d]:
-              scroll := math.max(0, scroll + d)
-              dirty := #true
+              if page_kind
+              | page_sel := math.max(0, page_sel + (if d > 0 | -1 | 1))
+                dirty := #true
+              | block:
+                  scroll := math.max(0, scroll + d)
+                  dirty := #true
           | [#'mouse, mtype, btn, mrow, mcol]:
               let mt = to_string(mtype)
               let r = mrow - 1
               let c = mcol - 1
               cond
-              | mt == "press" && btn == 1:
-                  if r >= last_trans_y && r < last_trans_y + last_trans_h
-                  | let rr = r - last_trans_y
-                    sel_anchor := [rr, c]
-                    sel_focus := [rr, c]
-                    sel_dragged := #false
+              | mt == "motion":
+                  let h = hit_at(last_hits, r, c)
+                  let prev = hover_hit
+                  let same:
+                    cond
+                    | prev is_a Map && h is_a Map:
+                        prev.get("id", "") == h.get("id", "")
+                          && prev.get("row", -1) == h.get("row", -1)
+                    | prev == #false && h == #false: #true
+                    | ~else: #false
+                  when !same
+                  | hover_hit := h
                     dirty := #true
-                  | clear_selection()
+              | mt == "press" && btn == 1:
+                  cond
+                  | page_kind: #void
+                  | r >= last_trans_y && r < last_trans_y + last_trans_h:
+                      let rr = r - last_trans_y
+                      sel_anchor := [rr, c]
+                      sel_focus := [rr, c]
+                      sel_dragged := #false
+                      dirty := #true
+                  | ~else:
+                      clear_selection()
+                      when r >= last_ed_y
+                      | focus := "prompt"
+                        dirty := #true
               | mt == "drag" && sel_anchor:
                   sel_focus := [clamp(r - last_trans_y, 0, last_trans_h - 1), math.max(0, c)]
                   sel_dragged := #true

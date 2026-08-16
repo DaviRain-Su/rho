@@ -1,0 +1,40 @@
+#lang rhombus
+
+import:
+  rhombus/envvar open
+  "../src/kernel/trust.rhm" as trust
+  "../src/kernel/config.rhm" as config
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+// Use a temp HOME so trust.json is isolated from the real ~/.rho
+def _ = putenv("HOME", "/tmp/rho-trust-test-home")
+// Clean up any leftover trust.json from a previous run
+try:
+  filesystem.delete("/tmp/rho-trust-test-home/.rho/trust.json")
+  ~catch _: #void
+try:
+  filesystem.make_directory("/tmp/rho-trust-test-home", ~parents: #true)
+  ~catch _: #void
+
+def cwd = "/tmp/rho-trust-test-cwd"
+
+check("unknown cwd", trust.trust_status(cwd) == #'unknown)
+
+trust.set_trust(cwd, #true)
+check("trusted after set #true", trust.trust_status(cwd) == #'trusted)
+
+trust.set_trust(cwd, #false)
+check("untrusted after set #false", trust.trust_status(cwd) == #'untrusted)
+
+// a different cwd is still unknown
+check("other cwd unknown", trust.trust_status("/some/other/path") == #'unknown)
+
+if failures == 0
+| println("ALL PASS")
+| error("trust tests failed: " +& failures)

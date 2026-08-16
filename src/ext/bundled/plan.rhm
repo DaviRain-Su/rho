@@ -199,7 +199,7 @@ fun disable(rho):
   refresh(rho)
   rho.notify("plan mode off")
 
-fun start_execute(rho):
+fun commit_execute(rho):
   let items = plan_items(rho)
   rho.state["plan_on"] := #false
   rho.state["plan_exec"] := items != []
@@ -210,6 +210,17 @@ fun start_execute(rho):
   | rho.notify("no Plan: steps; full tools restored")
   | rho.notify("executing plan — send a message to start:\n"
                  +& format_items(items))
+
+fun start_execute(rho):
+  let items = plan_items(rho)
+  cond
+  | items == []:
+      commit_execute(rho)
+  | ~else:
+      rho.state["plan_do_execute"] := fun (): commit_execute(rho)
+      rho.state["plan_do_quit"] := fun (): disable(rho)
+      rho.open_overlay("plan_pending", items)
+      rho.notify("plan review: a approve · s stay · q quit")
 
 fun last_assistant(rho) :: String:
   match rho.session
@@ -236,6 +247,10 @@ fun init(rho):
                 | a == "on" || a == "enable": enable(rho)
                 | a == "off" || a == "disable": disable(rho)
                 | a == "execute" || a == "run": start_execute(rho)
+                | a == "approve":
+                    match rho.state.get("plan_do_execute", #false)
+                    | fn :: Function: fn()
+                    | ~else: start_execute(rho)
                 | a == "status" || a == "":
                     restore(rho)
                     cond

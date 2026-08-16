@@ -1,0 +1,152 @@
+#lang rhombus
+
+import:
+  "../src/ui/pager.rhm" as pager
+  "../src/ui/tui.rhm" as tui
+  "../src/kernel/tasks.rhm" as tasks
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+fun tcolor(_k): "magenta"
+
+check("hover marks underline",
+      pager.apply_hover_row([[#false, #false, #false, "x"]], #true)[0][2]
+        == "underline")
+check("hover off keeps style",
+      pager.apply_hover_row([[#false, #false, "bold", "x"]], #false)[0][2]
+        == "bold")
+
+check("shortcuts prompt idle",
+      pager.shortcuts_bar("prompt", #false, "").contains("Enter send"))
+check("shortcuts running",
+      pager.shortcuts_bar("prompt", #true, "").contains("interrupt"))
+check("shortcuts user",
+      pager.shortcuts_bar("scrollback", #false, "user").contains("fork"))
+
+def chips = pager.split_chips(" /tmp  \u2502  kimi/k2  \u2502  tok 1/2")
+check("split chips count", chips.length() == 3)
+check("split first cwd", chips[0].contains("tmp") || chips[0] == "/tmp")
+def chits = pager.chip_hits(20, chips, 80)
+check("chip model id",
+      tui.hit_at(chits, 20, chits[1]["c0"])["id"] == "chip_model")
+
+def blocks = pager.entry_blocks([["user", "hi"],
+                                 ["user", "there"],
+                                 ["assistant", "ok"],
+                                 ["tool_result", "out"]])
+check("three blocks", blocks.length() == 3)
+check("user block spans two lines",
+      blocks[0]["kind"] == "user" && blocks[0]["end"] == 2)
+check("block at 2 is assistant",
+      pager.block_at_index(blocks, 2)["kind"] == "assistant")
+
+check("fold tool",
+      pager.fold_tool_line("a\nb\nc", #false).contains("lines"))
+check("fold expanded",
+      pager.fold_tool_line("a\nb", #true) == "a\nb")
+
+check("status empty", pager.task_status_text(0, 0) == "")
+check("status sub", pager.task_status_text(1, 0).contains("subagent"))
+check("focus editor", pager.focus_for_hit("editor") == "prompt")
+check("focus entry", pager.focus_for_hit("entry") == "scrollback")
+
+def qrows = pager.question_card_rows("pick", ["a", "b"], 40, tcolor)
+check("question rows", qrows.length() == 3)
+def qhits = pager.question_card_hits(5, ["a", "b"])
+check("question hit", tui.hit_at(qhits, 6, 4)["id"] == "question_opt")
+
+def prows = pager.plan_review_rows([{ "step": 1, "text": "read", "done": #false }],
+                                   80, tcolor)
+check("plan review", to_string(prows[1][0][3]).contains("read"))
+check("plan hits",
+      tui.hit_at(pager.plan_review_hits(0), 0, 20)["id"] == "plan_approve")
+
+def filtered = pager.palette_filter([["help", "list"], ["plan", "mode"]], "pl")
+check("palette filter", filtered.length() == 1 && filtered[0][0] == "plan")
+def pitems = pager.palette_page_items([["help", "list"], ["plan", "mode"]], "pl")
+check("palette page pick",
+      pitems.length() == 1 && pitems[0]["id"] == "palette_pick"
+        && pitems[0]["name"] == "plan")
+def ritems = pager.resume_page_items([{ "path": "/s.jsonl", "preview": "hi" }])
+check("resume page path",
+      ritems[0]["id"] == "resume_pick"
+        && to_string(ritems[0]["text"]).contains("/s.jsonl"))
+def fitems = pager.frame_page_items("sub-agent x\nhello")
+check("frame page lines",
+      fitems.length() == 2 && fitems[0]["id"] == "frame_line")
+
+def rrows = pager.resume_rows([{ "path": "/s.jsonl", "preview": "hi" }], 0, 40, tcolor)
+check("resume rows", rrows.length() == 2)
+
+check("queue lines",
+      pager.queue_pane_lines(["later"])[0]["text"].contains("[edit]"))
+check("todos lines",
+      pager.todos_pane_lines([{ "id": 1, "text": "x", "done": #false }])[0]["id"]
+        == "todo_toggle")
+check("tasks empty",
+      pager.tasks_pane_lines([])[0]["id"] == "task_noop")
+
+tasks.reset()
+tasks.note_start("subagent", "research")
+check("tasks live", tasks.live().length() == 1)
+check("tasks status", tasks.status_text().contains("subagent"))
+tasks.note_end("research")
+check("tasks cleared", tasks.live() == [])
+
+def dash = pager.dashboard_overlay_rows("model: kimi\npermission: allow", 80, tcolor)
+check("dashboard single-session",
+      to_string(dash[0][0][3]).contains("single attached"))
+
+def pf = pager.page_frame(~title: "Dashboard",
+                          ~body: ["model: x", "cwd: /tmp"],
+                          ~hints: "Esc close",
+                          ~rows: 10,
+                          ~cols: 40,
+                          ~sel: 0)
+check("page fills rows", pf.length() == 10)
+check("page title", to_string(pf[0][0][3]).contains("Dashboard"))
+check("page esc", to_string(pf[9][0][3]).contains("Esc close"))
+
+def items = pager.dashboard_page_items("model: x\ncwd: /tmp")
+check("dashboard page actions",
+      items[items.length() - 1]["id"] == "dash_resume")
+def sitems = pager.settings_page_items(
+  [{ "key": "offline", "value": "false", "desc": "net", "kind": "bool" },
+   { "key": "theme", "value": "dark", "desc": "TUI theme", "kind": "string" }],
+  {})
+check("settings group header",
+      sitems[0]["id"] == "settings_header"
+        && to_string(sitems[0]["text"]).contains("Appearance"))
+check("settings theme in appearance",
+      sitems[1]["id"] == "settings_row" && sitems[1]["key"] == "theme")
+check("settings advanced leftover",
+      to_string(sitems[sitems.length() - 1]["text"]).contains("offline"))
+def mitems = pager.model_page_items([["kimi/k2", "fast"], ["openai/gpt"]], "k2", "kimi/k2")
+check("model page pick",
+      mitems.length() == 1 && mitems[0]["id"] == "model_pick"
+        && mitems[0]["name"] == "kimi/k2"
+        && to_string(mitems[0]["text"]).contains("*"))
+def thitems = pager.theme_page_items(["dark"], "")
+check("theme default first",
+      thitems[0]["name"] == "" && to_string(thitems[0]["text"]).contains("default"))
+def hitems = pager.help_page_items("Enter send\nEsc close")
+check("help page lines",
+      hitems.length() == 2 && hitems[0]["id"] == "help_line")
+def eitems = pager.extensions_page_items("mcp", [["echo", 2]], [])
+check("extensions mcp row",
+      eitems[1]["id"] == "ext_mcp" && to_string(eitems[1]["text"]).contains("echo"))
+def skitems = pager.extensions_page_items("skills", [], [{ "name": "foo", "desc": "bar" }])
+check("extensions skill row",
+      skitems[1]["id"] == "ext_skill" && skitems[1]["name"] == "foo")
+check("bool flip", pager.next_setting_value("bool", "false", 1) == "true")
+check("enum wrap",
+      pager.next_setting_value(["off", "low"], "low", 1) == "off")
+
+if failures == 0
+| println("t_pager OK")
+| error("pager tests failed: " +& failures)

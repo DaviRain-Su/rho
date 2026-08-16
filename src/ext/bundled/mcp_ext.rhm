@@ -34,18 +34,41 @@ fun mcp_cmd(rho, args :: String):
       mcp.disconnect_all()
       rho.notify("mcp stopped")
   | a == "" || a == "list":
-      match mcp.status()
-      | []: rho.notify("no MCP servers (add ~/.rho/mcp.json)")
-      | rows:
-          for (row in rows):
-            rho.notify("  " +& row[0] +& "  " +& row[1] +& " tools")
+      when !rho.open_page("extensions", "mcp")
+      | match mcp.status()
+        | []: rho.notify("no MCP servers (add ~/.rho/mcp.json)")
+        | rows:
+            for (row in rows):
+              let srv = row[0]
+              let ntools = row[1]
+              let nres = mcp.list_resources().get(srv, []).length()
+              let nprompts = mcp.list_prompts().get(srv, []).length()
+              rho.notify("  " +& srv +& "  " +& ntools +& " tools  " +& nres +& " resources  " +& nprompts +& " prompts")
+  | a == "resources":
+      match mcp.list_resources()
+      | {} :: Map: rho.notify("no MCP resources")
+      | res_map:
+          for ((srv, res_list) in res_map):
+            rho.notify("  " +& srv +& ":")
+            for (r in res_list):
+              skip_when !(r is_a Map)
+              rho.notify("    " +& to_string(r.get("uri", "")) +& "  " +& to_string(r.get("name", "")))
+  | a == "prompts":
+      match mcp.list_prompts()
+      | {} :: Map: rho.notify("no MCP prompts")
+      | p_map:
+          for ((srv, p_list) in p_map):
+            rho.notify("  " +& srv +& ":")
+            for (p in p_list):
+              skip_when !(p is_a Map)
+              rho.notify("    " +& to_string(p.get("name", "")) +& "  " +& to_string(p.get("description", "")))
   | ~else:
-      rho.notify("usage: /mcp [list|reload|stop]")
+      rho.notify("usage: /mcp [list|reload|stop|resources|prompts]")
 
 fun init(rho):
   rho.register_command(
     ~name: "mcp",
-    ~description: "MCP servers: /mcp [list|reload|stop]",
+    ~description: "MCP servers: /mcp [list|reload|stop|resources|prompts]",
     ~handler: fun (args): mcp_cmd(rho, args))
   rho.on("session_shutdown",
          fun (_e):

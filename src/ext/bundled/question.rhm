@@ -30,10 +30,11 @@ fun ask(rho, prompt :: String, labels :: List) :: String:
   | !rho.has_ui(): "error: no UI"
   | labels == []: "error: no options"
   | ~else:
-      let choice = rho.ui.select(prompt, labels.add(OTHER))
+      let choice = rho.ask_card(prompt, labels.add(OTHER))
       cond
-      | choice == #false: "error: cancelled"
-      | choice == OTHER:
+      | choice == #false || to_string(choice).starts_with("error:"):
+          if choice == #false | "error: cancelled" | to_string(choice)
+      | to_string(choice) == OTHER:
           let typed = rho.ui.input(prompt)
           if typed.trim() == "" | "error: cancelled" | typed.trim()
       | ~else: to_string(choice)

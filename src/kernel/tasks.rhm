@@ -1,0 +1,52 @@
+#lang rhombus
+
+// Live task table for the TUI still-running line and tasks pane.
+// Extensions and the agent runtime record start/end; the pager only reads.
+
+export:
+  note_start
+  note_end
+  live
+  status_text
+  reset
+  count_kind
+
+def mutable items :: List = []
+
+fun note_start(kind :: String, label :: String):
+  let id = kind +& ":" +& label +& ":" +& items.length()
+  items := items.add({ "id": id,
+                       "kind": kind,
+                       "label": label })
+  id
+
+fun note_end(label :: String):
+  items := for List (t in items):
+             skip_when to_string(t.get("label", "")) == label
+             t
+  #void
+
+fun live() :: List:
+  items
+
+fun count_kind(kind :: String) :: Int:
+  for values(n = 0) (t in items):
+    if t.get("kind", "") == kind | n + 1 | n
+
+fun status_text(~queued: queued :: Int = 0) :: String:
+  let n = items.length()
+  cond
+  | n == 0 && queued == 0: ""
+  | ~else:
+      let bits:
+        for List (kind in ["subagent", "bash", "loop"]):
+          let c = count_kind(kind)
+          skip_when c == 0
+          c +& " " +& kind
+      let bits = (if queued == 0 | bits | bits.add(queued +& " queued"))
+      if bits == []
+      | ""
+      | "\u25CE " +& String.join(bits, " \u00B7 ") +& " still running"
+
+fun reset():
+  items := []

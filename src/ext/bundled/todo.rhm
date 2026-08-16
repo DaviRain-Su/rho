@@ -138,7 +138,26 @@ fun init(rho):
     ~handler: fun (_args):
                 restore(rho)
                 rho.notify(format_list(todos_of(rho)))
+                rho.toggle_pane("todos")
                 refresh(rho))
+  rho.register_pane(
+    ~id: "todos",
+    ~title: "todos",
+    ~lines: fun ():
+              restore(rho)
+              let items = todos_of(rho)
+              if items == []
+              | [{ "text": "  (no todos)", "id": "todo_noop", "data": -1 }]
+              | for List (t in items):
+                  let done = t is_a Map && t.get("done", #false)
+                  let id = if t is_a Map | t.get("id", 0) | 0
+                  let text = if t is_a Map | to_string(t.get("text", "")) | ""
+                  { "text": "  " +& (if done | "[x]" | "[ ]") +& " #" +& id +& " " +& text,
+                    "id": "todo_toggle",
+                    "data": id },
+    ~on_click: fun (data):
+                 handle(rho, { "action": "toggle", "id": data })
+                 refresh(rho))
   rho.register_renderer(
     ~tool: "todo",
     ~fn: fun (phase, _name, data):

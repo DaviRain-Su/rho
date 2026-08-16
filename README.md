@@ -125,8 +125,11 @@ message.
 Full-screen interface (raart): transcript, multi-line editor, footer with
 cwd/model/tokens/cost. `/hotkeys` lists keys: Enter submits, Ctrl-J inserts a
 newline, Tab completes paths (`@token` fuzzy-searches the repo), Up/Down is
-history or cursor movement, PgUp/PgDn scrolls, Ctrl-C interrupts (or clears /
-quits), Esc interrupts, Ctrl-P cycles providers, Ctrl-D quits. `!cmd` runs a
+history or cursor movement, PgUp/PgDn scrolls, click a transcript block to select it, click the
+prompt to type, hover underlines hits. Ctrl-T / Ctrl-G / Ctrl-; toggle
+the todos, tasks, and queue panes; `?` opens the command palette.
+Ctrl-C interrupts (or clears / quits), Esc interrupts, Ctrl-P cycles
+providers, Ctrl-D quits. `!cmd` runs a
 shell command; `!!cmd` also appends the output to the model context. Themes:
 `~/.rho/themes/<name>.json` + `--theme` (see `examples/themes/`).
 The built-in theme defines ~65 color tokens across core UI, backgrounds,
@@ -391,5 +394,11 @@ registered as `mcp_<server>_<tool>`.
 - No OAuth for providers that only accept API keys (Kimi, Ollama, …)
 - ChatGPT subscription login is the `openai-codex` provider (`/login openai oauth`). It calls `chatgpt.com/backend-api/codex/responses`. Platform `openai` still needs `OPENAI_API_KEY` with billing.
 - TUI editor highlighting is command/`@file`/`code`, not full language syntax
-- `transport: "websocket"` falls back to SSE (see `src/ai/ws.rhm`)
-- ACP is not implemented (Pi uses `--mode rpc`; rho has `--rpc`)
+- WebSocket transport is a stub — `src/ai/ws.rhm` has a TODO and always falls back to SSE. The `transport` setting exists but has no effect.
+- `sandbox-exec` (used on macOS for `/sandbox`) is deprecated by Apple and may be removed in future macOS versions.
+- No sandbox support on Windows — only macOS (`sandbox-exec`) and Linux (`unshare -n`) have network sandboxing. Windows falls through to no wrapper.
+- Sandbox only blocks network access, not filesystem access — bash can still read/write any user-accessible file.
+- `t_diag.rhm` (the only end-to-end integration test) is skipped in CI.
+- MCP resources and prompts are now supported but `/mcp resources` and `/mcp prompts` require server support.
+- Gemini API key is sent via the `x-goog-api-key` header (previously was in the URL query parameter — this is now fixed).
+- ACP (Agent Client Protocol) is not implemented. rho's `--mode rpc` uses a custom JSON-lines protocol, not ACP.

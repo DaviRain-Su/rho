@@ -1,0 +1,49 @@
+#lang rhombus
+
+import:
+  "../src/ai/provider_error.rhm" as perr
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+check("429 → transient", perr.classify_status("test", 429, "{}").category == #'transient)
+check("503 → transient", perr.classify_status("test", 503, "{}").category == #'transient)
+check("401 → auth", perr.classify_status("test", 401, "{}").category == #'auth)
+check("403 → auth", perr.classify_status("test", 403, "{}").category == #'auth)
+check("400 → client", perr.classify_status("test", 400, "{}").category == #'client)
+check("404 → client", perr.classify_status("test", 404, "{}").category == #'client)
+check("200 → unknown", perr.classify_status("test", 200, "{}").category == #'unknown)
+
+def transient_err = perr.classify_status("test", 429, "{}")
+check("is_transient on transient ProviderError", perr.is_transient(transient_err) == #true)
+
+def auth_err = perr.classify_status("test", 401, "{}")
+check("is_transient on auth ProviderError", perr.is_transient(auth_err) == #false)
+
+// plain Exn.Fail with "connection" in the message
+def conn_err = try:
+  error("connection reset by peer")
+  ~catch e:
+    e
+check("is_transient on connection Exn.Fail", perr.is_transient(conn_err) == #true)
+
+def other_err = try:
+  error("something else went wrong")
+  ~catch e:
+    e
+check("is_transient on non-connection Exn.Fail", perr.is_transient(other_err) == #false)
+
+check("retry_after on plain Exn.Fail is #false", perr.retry_after(conn_err) == #false)
+
+// retry_after on a ProviderError with retry_after_secs
+def ra_err = perr.classify_status("test", 429, "{\"retry_after\": 30}")
+check("retry_after extracts delay", ra_err.retry_after_secs == 30)
+check("retry_after on ProviderError", perr.retry_after(ra_err) == 30)
+
+if failures == 0
+| println("ALL PASS")
+| error("provider_error tests failed: " +& failures)

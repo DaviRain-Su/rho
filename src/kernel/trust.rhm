@@ -6,6 +6,7 @@
 
 import:
   json
+  lib("racket/base.rkt") as rkt
   "config.rhm"
   "errors.rhm" as errors
 
@@ -32,3 +33,7 @@ fun set_trust(cwd :: String, decision :: Boolean):
   filesystem.write_string(trust_path(),
                           json.to_string(read_trust() ++ { cwd: decision }),
                           ~exists: #'truncate)
+  try:
+    rkt.#{file-or-directory-permissions}(Path(trust_path()), 0o600)
+    ~catch _:
+      errors.warn("trust", "could not set permissions on trust.json")

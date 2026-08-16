@@ -3,6 +3,7 @@
 // Status strip + /dashboard. Pi's status-line / custom-footer pattern.
 
 import:
+  lib("racket/base.rkt") as rkt
   "../../kernel/loop.rhm" as loop
   "../../ext/mcp.rhm" as mcp
 
@@ -32,13 +33,47 @@ fun cfg_steps(rho) :: String:
   | #false: to_string(loop.MAX_STEPS)
   | cfg: to_string(loop.step_limit(cfg))
 
+fun cfg_cwd() :: String:
+  let s = to_string(rkt.#{current-directory}())
+  if s.length() > 1 && s.substring(s.length() - 1 ..) == "/"
+  | s.substring(0 .. s.length() - 1)
+  | s
+
+fun sess_name(rho) :: String:
+  match rho.session
+  | #false: "(none)"
+  | s:
+      let n = to_string(s.name)
+      if n == "" | "(none)" | n
+
+fun sess_path(rho) :: String:
+  match rho.session
+  | #false: "(no session file)"
+  | s:
+      if s.path is_a String | to_string(s.path) | "(no session file)"
+
+fun token_line(rho) :: String:
+  match rho.session
+  | #false: "in=0 out=0"
+  | s:
+      let t = for values(acc = [0, 0]) (m in s.messages()):
+                skip_when to_string(m.get("role", "")) != "assistant"
+                let u = m.get("usage", {})
+                skip_when !(u is_a Map)
+                [acc[0] + u.get("input", 0), acc[1] + u.get("output", 0)]
+      "in=" +& t[0] +& " out=" +& t[1]
+
 fun snapshot(rho) :: String:
   "model: " +& cfg_model(rho)
     +& "\npermission: " +& cfg_mode(rho)
-    +& "\nmessages: " +& msg_count(rho)
+    +& "\ncwd: " +& cfg_cwd()
     +& "\ntools: " +& rho.get_all_tools().length()
     +& "\nmcp: " +& mcp_count()
     +& "\nsteps: " +& cfg_steps(rho)
+    +& "\ntokens: " +& token_line(rho)
+    +& "\nmessages: " +& msg_count(rho)
+    +& "\nsession: " +& sess_name(rho)
+    +& "\npath: " +& sess_path(rho)
 
 fun strip(rho) :: String:
   cfg_model(rho)
@@ -55,7 +90,10 @@ fun init(rho):
     ~name: "dashboard",
     ~description: "show session status (model, permissions, tools, MCP)",
     ~handler: fun (_args):
-                rho.notify(snapshot(rho))
+                let snap = snapshot(rho)
+                rho.state["dashboard_snap"] := snap
+                when !rho.open_page("dashboard")
+                | rho.notify(snap)
                 refresh(rho))
   rho.on("agent_start", fun (_e): refresh(rho))
   rho.on("agent_end", fun (_e): refresh(rho))

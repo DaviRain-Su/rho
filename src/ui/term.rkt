@@ -162,15 +162,20 @@
      ;; in-app text selection: 1-based coordinates. NB: the ansi package
      ;; passes (x y) to (mouse-event type button row column _), so the
      ;; "row" field actually holds the column and vice versa.
+     ;; Motion with no button is hover; motion with a button stays drag.
      (treelist 'mouse
                (case (mouse-event-type e)
                  [(release-all) "release"]
-                 [(motion) "drag"]
+                 [(motion)
+                  (if (let ([b (mouse-event-button e)])
+                        (or (not b) (eq? b 0) (eq? b 'none)))
+                      "motion"
+                      "drag")]
                  [else (symbol->string (mouse-event-type e))])
                (mouse-event-button e)
                (mouse-event-column e)    ; real row
                (mouse-event-row e))]     ; real column
-    [(any-mouse-event? e) 'skip]     ; motion without buttons, focus: ignored
+    [(any-mouse-event? e) 'skip]     ; leftover mouse kinds (focus, …)
     [(string? e) (treelist 'key (string->immutable-string e))]
     [(eof-object? e) 'eof]
     [else (treelist 'key (string->immutable-string (format "~a" e)))]))

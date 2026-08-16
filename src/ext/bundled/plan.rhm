@@ -1,0 +1,338 @@
+#lang rhombus
+
+// Read-only plan mode. /plan restricts tools; bash is allowlisted.
+// After a Plan: list, /plan execute restores writes and tracks [DONE:n].
+
+export:
+  init
+  is_safe_command
+  extract_plan_items
+  apply_dones
+  format_items
+  PLAN_TOOLS
+
+def PLAN_TOOLS: ["read_file", "bash", "grep", "find", "ls", "todo", "question"]
+
+def SAFE_HEADS: ["cat", "head", "tail", "less", "more", "grep", "rg",
+                 "find", "ls", "pwd", "echo", "printf", "wc", "sort",
+                 "uniq", "diff", "file", "stat", "du", "df", "tree",
+                 "which", "type", "env", "printenv", "uname", "whoami",
+                 "id", "date", "uptime", "ps", "git", "jq", "awk",
+                 "sed", "curl", "bat", "fd", "eza", "true", "false"]
+
+def GIT_SAFE: ["status", "log", "diff", "show", "branch", "remote",
+               "ls-files", "ls-tree", "describe", "rev-parse"]
+
+def UNSAFE: ["rm ", "rm\t", "rmdir", "sudo", "chmod", "chown", "mkdir",
+             "touch ", "kill ", "reboot", "shutdown", "mkfs", ">>",
+             "dd ", "npm install", "npm uninstall", "pip install"]
+
+fun first_token(s :: String) :: String:
+  let t = s.trim()
+  let parts = t.split(" ")
+  if parts == [] | "" | to_string(parts[0]).foldcase()
+
+fun rest_after_first(s :: String) :: String:
+  let t = s.trim()
+  let w = first_token(t)
+  if t.length() <= w.length() | "" | t.substring(w.length() ..).trim()
+
+fun is_safe_command(cmd :: String) :: Boolean:
+  let s = cmd.trim()
+  let low = s.foldcase()
+  let head = first_token(s)
+  let bad:
+    for values(hit = #false) (p in UNSAFE):
+      hit || low.contains(p)
+  let redirect = low.contains(" >") || s.starts_with(">")
+  cond
+  | s == "": #false
+  | bad || redirect: #false
+  | head == "git":
+      GIT_SAFE.contains(first_token(rest_after_first(s)))
+  | ~else: SAFE_HEADS.contains(head)
+
+fun digit_char(ch :: String) :: Boolean:
+  ch >= "0" && ch <= "9"
+
+fun take_digits(s :: String):
+  let n:
+    for values(acc = "") (i in 0 .. s.length()):
+      let ch = s.substring(i .. i + 1)
+      cond
+      | acc != "" && !digit_char(ch): acc
+      | digit_char(ch): acc +& ch
+      | ~else: acc
+  match String.maybe_to_int(n)
+  | i :: Int: i
+  | ~else: #false
+
+fun numbered_text(line :: String):
+  let s = line.trim()
+  let num = take_digits(s)
+  cond
+  | num == #false: #false
+  | ~else:
+      let rest = s.substring(to_string(num).length() ..).trim()
+      if rest.starts_with(".") || rest.starts_with(")")
+      | let text = rest.substring(1 ..).trim()
+        if text.length() > 2 | { "step": num, "text": text, "done": #false } | #false
+      | #false
+
+fun extract_plan_items(text :: String) :: List:
+  let lines = text.split("\n")
+  let start:
+    for values(idx = -1) (i in 0 .. lines.length()):
+      if to_string(lines[i]).trim().foldcase().starts_with("plan:") | i | idx
+  if start < 0
+  | []
+  | for List (i in (start + 1) .. lines.length()):
+      let item = numbered_text(to_string(lines[i]))
+      skip_when item == #false
+      item
+
+fun apply_dones(text :: String, items :: List) :: List:
+  let parts = text.split("[DONE:")
+  let nums:
+    for List (i in 1 .. parts.length()):
+      let n = take_digits(to_string(parts[i]))
+      skip_when n == #false
+      n
+  for List (t in items):
+    cond
+    | t is_a Map && nums.contains(t.get("step", -1)):
+        t ++ { "done": #true }
+    | ~else: t
+
+fun format_items(items :: List) :: String:
+  if items == []
+  | "(no plan steps)"
+  | String.join(
+      (for List (t in items):
+         let done = t is_a Map && t.get("done", #false)
+         let step = if t is_a Map | t.get("step", "?") | "?"
+         let text = if t is_a Map | to_string(t.get("text", "")) | ""
+         (if done | "[x] " | "[ ] ") +& step +& ". " +& text),
+      "\n")
+
+fun plan_on(rho) :: Boolean:
+  rho.state.get("plan_on", #false)
+
+fun plan_exec(rho) :: Boolean:
+  rho.state.get("plan_exec", #false)
+
+fun plan_items(rho) :: List:
+  match rho.state.get("plan_items", [])
+  | xs :: List: xs
+  | ~else: []
+
+fun persist(rho):
+  match rho.session
+  | #false: #void
+  | s:
+      s.append("custom",
+               { "type": "plan",
+                 "on": plan_on(rho),
+                 "exec": plan_exec(rho),
+                 "items": plan_items(rho) })
+      #void
+
+fun restore(rho):
+  match rho.session
+  | #false: #void
+  | s:
+      let last:
+        for values(found = #false) (e in s.path_entries()):
+          let d = e.get("data", {})
+          if e.get("kind", "") == "custom" && d is_a Map && d.get("type", "") == "plan"
+          | d
+          | found
+      when last is_a Map
+      | rho.state["plan_on"] := last.get("on", #false)
+        rho.state["plan_exec"] := last.get("exec", #false)
+        rho.state["plan_items"] := last.get("items", [])
+
+fun plan_tool_names(rho) :: List:
+  let all = rho.get_all_tools()
+  for List (n in PLAN_TOOLS):
+    skip_when !all.contains(n)
+    n
+
+fun apply_plan_tools(rho):
+  rho.set_active_tools(plan_tool_names(rho))
+
+fun restore_tools(rho):
+  match rho.state.get("plan_saved_tools", #false)
+  | names :: List: rho.set_active_tools(names)
+  | ~else: #void
+
+fun refresh(rho):
+  let items = plan_items(rho)
+  cond
+  | plan_exec(rho) && items != []:
+      let done_n:
+        for values(n = 0) (t in items):
+          if t is_a Map && t.get("done", #false) | n + 1 | n
+      rho.set_status("plan " +& done_n +& "/" +& items.length())
+      rho.set_widget("plan", format_items(items))
+  | plan_on(rho):
+      rho.set_status("plan")
+      rho.set_widget("plan", "plan mode (read-only)")
+  | ~else:
+      rho.set_widget("plan", #false)
+
+fun enable(rho):
+  when !plan_on(rho)
+  | rho.state["plan_saved_tools"] := rho.get_active_tools()
+  rho.state["plan_on"] := #true
+  rho.state["plan_exec"] := #false
+  apply_plan_tools(rho)
+  persist(rho)
+  refresh(rho)
+  rho.notify("plan mode on (read-only). /plan execute to run a Plan: list.")
+
+fun disable(rho):
+  rho.state["plan_on"] := #false
+  rho.state["plan_exec"] := #false
+  restore_tools(rho)
+  persist(rho)
+  refresh(rho)
+  rho.notify("plan mode off")
+
+fun start_execute(rho):
+  let items = plan_items(rho)
+  rho.state["plan_on"] := #false
+  rho.state["plan_exec"] := items != []
+  restore_tools(rho)
+  persist(rho)
+  refresh(rho)
+  if items == []
+  | rho.notify("no Plan: steps; full tools restored")
+  | rho.notify("executing plan — send a message to start:\n"
+                 +& format_items(items))
+
+fun last_assistant(rho) :: String:
+  match rho.session
+  | #false: ""
+  | s:
+      for values(found = "") (m in s.messages()):
+        if m.get("role", "") == "assistant"
+        | to_string(m.get("content", ""))
+        | found
+
+fun init(rho):
+  restore(rho)
+  when rho.flag("plan")
+  | rho.state["plan_on"] := #true
+    rho.state["plan_saved_tools"] := rho.get_active_tools()
+    apply_plan_tools(rho)
+  refresh(rho)
+  rho.register_command(
+    ~name: "plan",
+    ~description: "read-only plan mode: /plan [on|off|execute|status]",
+    ~handler: fun (args):
+                let a = args.trim().foldcase()
+                cond
+                | a == "on" || a == "enable": enable(rho)
+                | a == "off" || a == "disable": disable(rho)
+                | a == "execute" || a == "run": start_execute(rho)
+                | a == "status" || a == "":
+                    restore(rho)
+                    cond
+                    | plan_exec(rho):
+                        rho.notify("executing:\n" +& format_items(plan_items(rho)))
+                    | plan_on(rho):
+                        rho.notify("plan mode on\n" +& format_items(plan_items(rho)))
+                    | ~else:
+                        rho.notify("plan mode off")
+                    refresh(rho)
+                | ~else:
+                    rho.notify("usage: /plan [on|off|execute|status]"))
+  rho.register_shortcut(
+    ~key: "M-p",
+    ~description: "toggle plan mode",
+    ~fn: fun ():
+           if plan_on(rho) | disable(rho) | enable(rho))
+  rho.on("tool_call",
+         fun (ev :: Map):
+           cond
+           | !plan_on(rho) || plan_exec(rho): #false
+           | ev.get("toolName", "") == "write_file"
+               || ev.get("toolName", "") == "edit_file"
+               || ev.get("toolName", "") == "agent":
+               { "block": #true,
+                 "reason": "plan mode: writes disabled; /plan off or /plan execute" }
+           | ev.get("toolName", "") == "bash":
+               let input = ev.get("input", {})
+               let cmd:
+                 cond
+                 | input is_a Map: to_string(input.get("command", ""))
+                 | ~else: to_string(input)
+               if is_safe_command(cmd)
+               | #false
+               | { "block": #true,
+                   "reason": "plan mode: bash not allowlisted: " +& cmd }
+           | ~else: #false)
+  rho.on("before_request",
+         fun (ev :: Map):
+           cond
+           | ev.get("step", 0) != 0: #false
+           | plan_on(rho):
+               { "messages":
+                   [{ "role": "user",
+                      "content":
+                        "[PLAN MODE ACTIVE]\n"
+                          +& "Read-only exploration. Tools: read_file, bash (allowlisted), "
+                          +& "grep, find, ls, todo. Do not edit files.\n"
+                          +& "End with a numbered plan under a Plan: header:\n\n"
+                          +& "Plan:\n1. First step\n2. Second step\n" }] }
+           | plan_exec(rho) && plan_items(rho) != []:
+               let left:
+                 for List (t in plan_items(rho)):
+                   skip_when t is_a Map && t.get("done", #false)
+                   to_string(t.get("step", "?")) +& ". " +& to_string(t.get("text", ""))
+               { "messages":
+                   [{ "role": "user",
+                      "content":
+                        "[EXECUTING PLAN]\nRemaining:\n"
+                          +& String.join(left, "\n")
+                          +& "\nAfter each step, include [DONE:n] in your reply." }] }
+           | ~else: #false)
+  rho.on("turn_end",
+         fun (ev :: Map):
+           when plan_exec(rho)
+           | let text = to_string(ev.get("content", ""))
+             let next = apply_dones(text, plan_items(rho))
+             rho.state["plan_items"] := next
+             persist(rho)
+             refresh(rho)
+             let open_n:
+               for values(n = 0) (t in next):
+                 if t is_a Map && t.get("done", #false) | n | n + 1
+             when open_n == 0 && next != []
+             | rho.state["plan_exec"] := #false
+               persist(rho)
+               refresh(rho)
+               rho.notify("plan complete\n" +& format_items(next)))
+  rho.on("agent_end",
+         fun (_e):
+           when plan_on(rho) && !plan_exec(rho)
+           | let found = extract_plan_items(last_assistant(rho))
+             when found != []
+             | rho.state["plan_items"] := found
+               persist(rho)
+               refresh(rho)
+               rho.notify("plan steps:\n" +& format_items(found)
+                            +& "\n/plan execute to run")
+           #false)
+  rho.on("agent_start",
+         fun (_e):
+           when plan_on(rho) && !plan_exec(rho)
+           | apply_plan_tools(rho)
+           refresh(rho))
+  rho.on("session_tree",
+         fun (_e):
+           restore(rho)
+           when plan_on(rho) && !plan_exec(rho)
+           | apply_plan_tools(rho)
+           refresh(rho))

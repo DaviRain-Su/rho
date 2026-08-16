@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rho — a Pi-style coding agent in Rhombus</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0 auto;
+      max-width: 40rem;
+      padding: 3rem 1.25rem;
+      font: 16px/1.5 ui-sans-serif, system-ui, sans-serif;
+      background: #111;
+      color: #e8e4dc;
+    }
+    h1 { font-weight: 600; letter-spacing: -0.03em; margin: 0 0 0.4rem; }
+    .sub { color: #9a958c; margin: 0 0 2rem; }
+    a { color: #8ec8ff; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.9em;
+    }
+    pre {
+      background: #1c1c1c;
+      padding: 0.9rem 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+    }
+    ul { padding-left: 1.2rem; }
+  </style>
+</head>
+<body>
+  <h1>rho (ρ)</h1>
+  <p class="sub">A Pi-style coding agent for the terminal, written in Rhombus. The kernel stays small; user-visible features load as extensions.</p>
+  <pre>raco pkg install https://github.com/DaviRain-Su/rho.git
+racket src/main.rhm</pre>
+  <ul>
+    <li><code>question</code>, <code>fetch</code>, git checkpoints, MCP, plan/todo, sandbox, dashboard — bundled extensions</li>
+    <li><code>--no-extensions</code> skips those plugins (no MCP connect)</li>
+    <li>Racket catalog source: <code>github://github.com/DaviRain-Su/rho/v0.2.0</code></li>
+    <li>Full notes and providers: <a href="https://github.com/DaviRain-Su/rho">README</a></li>
+  </ul>
+</body>
+</html>

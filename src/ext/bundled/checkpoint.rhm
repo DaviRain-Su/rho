@@ -1,0 +1,74 @@
+#lang rhombus
+
+// Git stash checkpoints at turn_start. /fork can restore that tree.
+
+import:
+  "../../kernel/crypto.rkt" as crypto
+
+export:
+  init
+  lookup_ref
+  in_git_repo
+
+fun in_git_repo() :: Boolean:
+  filesystem.directory_exists(".git")
+
+fun git(args :: List):
+  crypto.#{run-argv}("git", args)
+
+fun current_entry_id(rho):
+  match rho.session
+  | #false: #false
+  | s:
+      let leaf = s.leaf
+      if leaf is_a Int | leaf | #false
+
+fun lookup_ref(session, target) :: String:
+  cond
+  | session == #false || !(target is_a Int): ""
+  | ~else:
+      for values(found = "") (e in session.path_entries()):
+        let d = e.get("data", {})
+        if e.get("kind", "") == "custom"
+           && d is_a Map
+           && d.get("type", "") == "git_checkpoint"
+           && d.get("entry_id", -1) == target
+        | to_string(d.get("ref", ""))
+        | found
+
+fun save_checkpoint(rho):
+  when in_git_repo()
+  | let id = current_entry_id(rho)
+    when id is_a Int
+    | let values(code, out) = git(["stash", "create"])
+      let ref = to_string(out).trim()
+      when code == 0 && ref != "" && !ref.foldcase().starts_with("fatal")
+      | match rho.session
+        | #false: #void
+        | s:
+            s.append("custom",
+                     { "type": "git_checkpoint",
+                       "entry_id": id,
+                       "ref": ref })
+            #void
+
+fun maybe_restore(rho, ev :: Map):
+  let target = ev.get("target", #false)
+  let ref = lookup_ref(rho.session, target)
+  cond
+  | ref == "": #false
+  | !rho.has_ui(): #false
+  | ~else:
+      let choice = rho.ui.select("Restore code to checkpoint " +& ref.substring(0 .. math.min(8, ref.length())) +& "?",
+                                 ["Yes, restore code to that point",
+                                  "No, keep current code"])
+      when choice is_a String && choice.starts_with("Yes")
+      | let values(code, out) = git(["stash", "apply", ref])
+        if code == 0
+        | rho.notify("code restored to checkpoint")
+        | rho.notify("checkpoint restore failed: " +& to_string(out).trim())
+      #false
+
+fun init(rho):
+  rho.on("turn_start", fun (_e): save_checkpoint(rho))
+  rho.on("session_before_fork", fun (ev :: Map): maybe_restore(rho, ev))

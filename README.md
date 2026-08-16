@@ -29,6 +29,8 @@ session.
 
 ```bash
 raco pkg install --link --name rho /path/to/this/repo   # enables lib("rho/...") imports
+# or, from git / the Racket catalog (source: https://github.com/DaviRain-Su/rho.git):
+#   raco pkg install https://github.com/DaviRain-Su/rho.git
 racket src/main.rhm                                     # TUI on a terminal
 racket src/main.rhm --tui-mode plain                    # readline REPL
 sh tests/run.sh                                         # offline tests (same as CI)
@@ -180,7 +182,7 @@ extensions/skills/prompts are ignored (headless runs use the
 `/clone` `/new` `/name` `/resume` `/export` `/import` `/compact` `/clear`
 `/login` `/logout` `/skills` `/prompts` `/packages` `/share` `/quit`
 `/remember` `/doctor` `/context` `/verify` `/permission` `/allow` `/ask`
-`/steps` `/mcp` `/dashboard` `/sandbox` — plus other extension commands,
+`/steps` `/mcp` `/dashboard` `/sandbox` `/todos` `/plan` — plus other extension commands,
 `/skill:name`, and `/template-name`.
 
 `/login <provider> oauth` opens the browser and returns immediately (TUI
@@ -206,11 +208,20 @@ steps) and refreshes a TUI widget. `/sandbox [on|off]` wraps `bash` through
 an OS network jail (`sandbox-exec -n no-network` on macOS, `unshare -n` on
 Linux) via `rho.set_bash_spawn_hook`. Sandbox is off by default.
 
+The `todo` tool (and `/todos`) keeps a session list that follows `/fork`.
+`question` asks the user a multiple-choice (plus “Type something.”); without
+a TTY it returns `error: no UI` instead of blocking. `fetch` GETs an
+`http`/`https` URL (size-capped, HTML stripped). `git-checkpoint` stashes
+at `turn_start` and offers `git stash apply` on `/fork`.
+`/plan` is read-only exploration: writes are blocked and bash is allowlisted
+(`question` is allowed). After a numbered `Plan:` list, `/plan execute`
+restores tools and tracks `[DONE:n]` in the model's replies.
+
 ## Extensions
 
 Extensions are Rhombus modules exporting `init(rho)`. rho always loads
 `src/ext/bundled/` (guards, audit, memory, doctor, usage, verify, agent,
-dashboard, sandbox). Then it picks
+dashboard, sandbox, todo, plan, question, checkpoint, fetch, mcp_ext). Then it picks
 up `~/.rho/extensions/*.rhm`, installed packages, and (if trusted)
 `.rho/extensions/*.rhm`. `examples/extensions/` is documentation only
 and is not loaded.
@@ -350,8 +361,9 @@ src/
     loader.rhm        discovery + hot reload
     tool.rhm          `tool` definition macro
     bundled/          shipped plugins: guards, audit, memory, doctor, usage,
-                      verify, agent, dashboard, sandbox
-    mcp.rhm           MCP stdio client (~/.rho/mcp.json)
+                      verify, agent, dashboard, sandbox, todo, plan,
+                      question, checkpoint, fetch, mcp_ext
+    mcp.rhm           MCP stdio client (parse / connect / status)
   ui/
     repl.rhm          readline REPL (steering, /follow, Ctrl-C)
     tui.rhm           raart full-screen TUI
@@ -370,8 +382,9 @@ Stdio servers in `~/.rho/mcp.json` (and trusted `.rho/mcp.json`):
 { "mcpServers": { "echo": { "command": "npx", "args": ["-y", "pkg"] } } }
 ```
 
-`/mcp` lists them, `/mcp reload` reconnects. Each tool is registered as
-`mcp_<server>_<tool>`.
+The bundled `mcp_ext` extension connects at startup and registers `/mcp`
+(list / reload / stop). `--no-extensions` does not connect. Each tool is
+registered as `mcp_<server>_<tool>`.
 
 ## Known limitations
 

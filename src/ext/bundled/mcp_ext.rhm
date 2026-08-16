@@ -1,0 +1,54 @@
+#lang rhombus
+
+// MCP UI and connect. Protocol stays in ext/mcp.rhm; this extension
+// owns /mcp and startup connect so --no-extensions stays disconnected.
+
+import:
+  "../../ext/mcp.rhm" as mcp
+
+export:
+  init
+
+fun include_project(rho) :: Boolean:
+  rho.state.get("project_trusted", #false) == #true
+
+fun notify_fn(rho):
+  fun say(s :: String):
+    rho.notify(s)
+  say
+
+fun do_connect(rho):
+  when rho.state.get("mcp_skip_reload", #false) != #true
+  | mcp.reload(rho.events,
+               ~notify: notify_fn(rho),
+               ~include_project: include_project(rho))
+
+fun mcp_cmd(rho, args :: String):
+  let a = args.trim().foldcase()
+  cond
+  | a == "reload":
+      rho.state["mcp_skip_reload"] := #false
+      do_connect(rho)
+      rho.notify("mcp reloaded")
+  | a == "stop":
+      mcp.disconnect_all()
+      rho.notify("mcp stopped")
+  | a == "" || a == "list":
+      match mcp.status()
+      | []: rho.notify("no MCP servers (add ~/.rho/mcp.json)")
+      | rows:
+          for (row in rows):
+            rho.notify("  " +& row[0] +& "  " +& row[1] +& " tools")
+  | ~else:
+      rho.notify("usage: /mcp [list|reload|stop]")
+
+fun init(rho):
+  rho.register_command(
+    ~name: "mcp",
+    ~description: "MCP servers: /mcp [list|reload|stop]",
+    ~handler: fun (args): mcp_cmd(rho, args))
+  rho.on("session_shutdown",
+         fun (_e):
+           mcp.disconnect_all()
+           #false)
+  do_connect(rho)

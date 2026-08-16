@@ -54,7 +54,6 @@ import:
   "tools/core.rhm" open
   "ext/api.rhm" open
   "ext/loader.rhm" as loader
-  "ext/mcp.rhm" as mcp
   "ui/repl.rhm" open
   "ui/tui.rhm" as tui
 
@@ -271,6 +270,9 @@ fun default_system_prompt() :: String:
     +& "which derives the JSON schema from the annotations (defaults become optional).\n"
     +& "For isolated or parallelizable work, call the `agent` tool to run a nested "
     +& "sub-agent with its own session; it returns a final text answer.\n"
+    +& "Track multi-step work with the `todo` tool. Ask the user with `question`. "
+    +& "Fetch public http(s) pages with `fetch`. `/plan` is read-only exploration; "
+    +& "write a numbered Plan: then `/plan execute` and mark steps with [DONE:n].\n"
     +& "Be concise. Prefer tools over guessing."
 
 // --skill / --prompt-template survive --no-skills / --no-prompt-templates
@@ -344,9 +346,6 @@ fun do_reload(notify = #true):
                                               packages.package_extension_dirs()
                                                 ++ opts.get("extensions", []),
                                             ~include_project: project_trusted)
-  mcp.reload(registry,
-             ~notify: fun (s): api.notify(s),
-             ~include_project: project_trusted)
   when notify
   | api.notify("extensions: " +& ok +& " loaded, " +& failed +& " failed")
 
@@ -467,31 +466,6 @@ registry.register_command(
   ~name: "steps",
   ~description: "agent step limit: /steps [n] (default 200)",
   ~handler: steps_cmd)
-
-fun mcp_cmd(args :: String):
-  let a = args.trim().foldcase()
-  cond
-  | a == "reload":
-      mcp.reload(registry,
-                 ~notify: fun (s): api.notify(s),
-                 ~include_project: project_trusted)
-      api.notify("mcp reloaded")
-  | a == "stop":
-      mcp.disconnect_all()
-      api.notify("mcp stopped")
-  | a == "" || a == "list":
-      match mcp.status()
-      | []: api.notify("no MCP servers (add ~/.rho/mcp.json)")
-      | rows:
-          for (row in rows):
-            api.notify("  " +& row[0] +& "  " +& row[1] +& " tools")
-  | ~else:
-      api.notify("usage: /mcp [list|reload|stop]")
-
-registry.register_command(
-  ~name: "mcp",
-  ~description: "MCP servers: /mcp [list|reload|stop]",
-  ~handler: mcp_cmd)
 
 registry.register_command(
   ~name: "help", ~description: "list commands and tools",
@@ -919,6 +893,12 @@ registry.register_command(
                       | found
               cond
               | !target: api.notify("no user message to fork from")
+              | !session_event_ok("session_before_fork",
+                                  { "target": target["id"],
+                                    "path": (if session.path is_a String
+                                             | session.path
+                                             | "") }):
+                  api.notify("fork cancelled by extension")
               | ~else:
                   let parent = target.get("parent", #'null)
                   session.set_leaf(if parent is_a Int | parent | #false)
@@ -953,7 +933,7 @@ registry.register_command(
   ~handler: fun (_args):
               cond
               | !(session.path is_a String): api.notify("no session file to clone")
-              | !session_event_ok("session_before_fork", { "path": session.path }):
+              | !session_event_ok("session_before_clone", { "path": session.path }):
                   api.notify("clone cancelled by extension")
               | ~else:
                   session := start_session(~cwd: cwd(), ~resume: session.path, ~fork: #true)
@@ -1956,6 +1936,7 @@ fun ensure_trust() :: Boolean:
 
 fun init_trust():
   project_trusted := ensure_trust()
+  registry.state["project_trusted"] := project_trusted
   // a just-approved project unlocks its .rho/settings.json
   when project_trusted
   | settings.reload(~include_project: #true)
@@ -2310,9 +2291,7 @@ module main:
       apply_tool_filters()
       if !opts.get("no_extensions", #false)
       | do_reload(#false)
-      | mcp.reload(registry,
-                   ~notify: fun (s): #void,
-                   ~include_project: project_trusted)
+      | #void
       let tui_mode = opts.get("tui_mode", config.settings.get("tui_mode", "tui"))
       cond
       | rpc_mode: run_rpc()
@@ -2329,4 +2308,3 @@ module main:
                    ~pending_ask: pending_ask_state,
                    ~answer_ask: reply_ask_state)
       registry.emit("session_shutdown", {})
-      mcp.disconnect_all()

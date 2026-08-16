@@ -1,0 +1,123 @@
+#lang rhombus
+
+// HTTP(S) fetch for the model. No browser. HTML is stripped to text.
+
+import:
+  net/http
+
+export:
+  init
+  ok_url
+  strip_html
+  clip
+  DEFAULT_MAX
+
+def DEFAULT_MAX = 50000
+
+fun ok_url(url :: String) :: Boolean:
+  let s = url.trim().foldcase()
+  s.starts_with("http://") || s.starts_with("https://")
+
+fun as_int(v, fallback :: Int) :: Int:
+  cond
+  | v is_a Int: v
+  | ~else:
+      match String.maybe_to_int(to_string(v).trim())
+      | n :: Int: n
+      | ~else: fallback
+
+fun clip(s :: String, max_bytes :: Int) :: String:
+  if s.length() <= max_bytes
+  | s
+  | s.substring(0 .. max_bytes) +& "\n...[truncated]"
+
+fun drop_blocks(html :: String, tag :: String) :: String:
+  let open_t = "<" +& tag
+  let close_t = "</" +& tag
+  let low = html.foldcase()
+  recur go(src = html, src_low = low, acc = ""):
+    let start = src_low.find(open_t)
+    cond
+    | start == #false: acc +& src
+    | ~else:
+        let after = src_low.substring(start ..)
+        let close_at = after.find(close_t)
+        let end:
+          cond
+          | close_at == #false: src.length()
+          | ~else:
+              let rest = after.substring(close_at + close_t.length() ..)
+              let gt = rest.find(">")
+              start + close_at + close_t.length() + (if gt == #false | 0 | gt + 1)
+        go(src.substring(end ..),
+           src_low.substring(end ..),
+           acc +& src.substring(0 .. start))
+
+fun drop_tags(html :: String) :: String:
+  let parts = html.split("<")
+  let chunks:
+    for List (i in 0 .. parts.length()):
+      let p = to_string(parts[i])
+      if i == 0
+      | p
+      | let gt = p.find(">")
+        if gt == #false | "" | p.substring(gt + 1 ..)
+  String.join(chunks, "")
+
+fun squeeze_ws(s :: String) :: String:
+  let lines:
+    for List (ln in s.split("\n")):
+      let t = ln.trim()
+      skip_when t == ""
+      t
+  String.join(lines, "\n")
+
+fun strip_html(html :: String) :: String:
+  squeeze_ws(drop_tags(drop_blocks(drop_blocks(html, "script"), "style")))
+
+fun looks_html(s :: String) :: Boolean:
+  let t = s.trim().foldcase()
+  t.starts_with("<!doctype") || t.starts_with("<html") || t.contains("<html")
+
+fun fetch_url(url :: String, max_bytes :: Int) :: String:
+  cond
+  | !ok_url(url): "error: only http(s) URLs are allowed"
+  | max_bytes < 1: "error: max_bytes must be positive"
+  | ~else:
+      try:
+        let resp = http.get(url.trim(),
+                            ~timeouts: http.Timeouts(~lease: 10, ~connect: 10,
+                                                     ~request: 15))
+        let status = resp.status_code
+        let body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+        resp.close()
+        cond
+        | status < 200 || status >= 400:
+            "error: HTTP " +& status
+        | ~else:
+            let text:
+              if looks_html(body) | strip_html(body) | body
+            clip(text, max_bytes)
+        ~catch e :: Exn.Fail:
+          "error: " +& e.message
+
+fun init(rho):
+  rho.register_tool(
+    ~name: "fetch",
+    ~description: "Fetch a public http(s) URL and return text. HTML is stripped to readable text. Use for docs and pages, not for browser automation.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "url": { "type": "string", "description": "http or https URL" },
+                 "max_bytes": { "type": "integer",
+                                "description": "Max characters to return (default 50000)" }
+               },
+               "required": ["url"] },
+    ~fn: fun (args):
+           fetch_url(to_string(args.get("url", "")),
+                     as_int(args.get("max_bytes", DEFAULT_MAX), DEFAULT_MAX)))
+  rho.register_renderer(
+    ~tool: "fetch",
+    ~fn: fun (phase, _name, data):
+           if phase == "call" && data is_a Map
+           | "\u25CF fetch " +& to_string(data.get("url", ""))
+           | #false)

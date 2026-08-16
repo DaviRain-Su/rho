@@ -174,7 +174,7 @@ fun connect_one(registry, server :: String, spec :: Map, notify_fn):
     rpc(conn, server, "initialize",
         { "protocolVersion": PROTOCOL,
           "capabilities": {},
-          "clientInfo": { "name": "rho", "version": "0.1" } })
+          "clientInfo": { "name": "rho", "version": "0.2" } })
     notify(conn, "notifications/initialized", {})
     let listed = rpc(conn, server, "tools/list", {})
     let tools:

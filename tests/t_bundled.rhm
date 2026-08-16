@@ -10,6 +10,12 @@ import:
   "../src/kernel/reload.rkt" as reload
   "../src/tools/core.rhm" as core
   "../src/ext/bundled/sandbox.rhm" as sandbox
+  "../src/ext/bundled/plan.rhm" as plan
+  "../src/ext/bundled/todo.rhm" as todo
+  "../src/ext/bundled/question.rhm" as question
+  "../src/ext/bundled/checkpoint.rhm" as checkpoint
+  "../src/ext/bundled/fetch.rhm" as fetch
+  lib("racket/base.rkt") as rkt
 
 def mutable failures = 0
 fun check(label :: String, ok):
@@ -29,6 +35,12 @@ check("verify shipped", filesystem.file_exists(bundled +& "/verify.rhm"))
 check("agent shipped", filesystem.file_exists(bundled +& "/agent.rhm"))
 check("dashboard shipped", filesystem.file_exists(bundled +& "/dashboard.rhm"))
 check("sandbox shipped", filesystem.file_exists(bundled +& "/sandbox.rhm"))
+check("todo shipped", filesystem.file_exists(bundled +& "/todo.rhm"))
+check("plan shipped", filesystem.file_exists(bundled +& "/plan.rhm"))
+check("question shipped", filesystem.file_exists(bundled +& "/question.rhm"))
+check("checkpoint shipped", filesystem.file_exists(bundled +& "/checkpoint.rhm"))
+check("fetch shipped", filesystem.file_exists(bundled +& "/fetch.rhm"))
+check("mcp_ext shipped", filesystem.file_exists(bundled +& "/mcp_ext.rhm"))
 
 def found = loader.discover_extensions(~include_project: #false)
 check("discover includes guards",
@@ -193,6 +205,118 @@ check("sandbox wrap or passthrough",
 check("sh_quote", sandbox.sh_quote("it's") == "'it'\\''s'")
 reg.find_command("sandbox").handler("off")
 check("sandbox off again", core.apply_bash_hook(reg, "echo hi") == "echo hi")
+
+load_one("todo.rhm")
+check("todo tool", reg.find_tool("todo") && #true)
+check("todo add",
+      to_string(reg.find_tool("todo").fn({ "action": "add", "text": "ship plan" }))
+        .contains("#1"))
+check("todo list",
+      to_string(reg.find_tool("todo").fn({ "action": "list" })).contains("ship plan"))
+check("todo toggle",
+      to_string(reg.find_tool("todo").fn({ "action": "toggle", "id": 1 }))
+        .contains("[x]"))
+check("todos command", reg.find_command("todos") && #true)
+reg.find_command("todos").handler("")
+check("todos notified", notes.get_string().to_string().contains("ship plan"))
+
+check("plan echo safe", plan.is_safe_command("echo hi"))
+check("plan git status safe", plan.is_safe_command("git status"))
+check("plan git push blocked", !plan.is_safe_command("git push origin main"))
+check("plan rm blocked", !plan.is_safe_command("rm -rf src"))
+check("plan redirect blocked", !plan.is_safe_command("echo x > file"))
+def extracted = plan.extract_plan_items("intro\nPlan:\n1. Read the loop\n2. Add tests\n")
+check("plan extract count", extracted.length() == 2)
+check("plan extract text",
+      extracted[0] is_a Map && extracted[0].get("text", "") == "Read the loop")
+def marked = plan.apply_dones("did it [DONE:1]", extracted)
+check("plan done tag",
+      marked[0] is_a Map && marked[0].get("done", #false))
+check("plan format", todo.format_list([]).contains("no todos"))
+
+load_one("plan.rhm")
+check("plan command", reg.find_command("plan") && #true)
+reg.find_command("plan").handler("on")
+check("plan on", reg.state.get("plan_on", #false))
+check("plan blocks write",
+      reg.emit("tool_call",
+               { "toolName": "write_file", "input": {} }).get("block", #false))
+check("plan allows echo bash",
+      reg.emit("tool_call",
+               { "toolName": "bash",
+                 "input": { "command": "echo hi" } }) == #false)
+check("plan blocks rm bash",
+      reg.emit("tool_call",
+               { "toolName": "bash",
+                 "input": { "command": "rm -rf x" } }).get("block", #false))
+reg.find_command("plan").handler("off")
+check("plan off", !reg.state.get("plan_on", #true))
+check("plan off allows write",
+      reg.emit("tool_call",
+               { "toolName": "write_file", "input": {} }) == #false)
+check("plan whitelist has question", plan.PLAN_TOOLS.contains("question"))
+
+check("option_labels strings",
+      question.option_labels(["a", "b"]) == ["a", "b"])
+check("option_labels maps",
+      question.option_labels([{ "label": "Yes", "description": "do it" }])
+        == ["Yes"])
+def qreg = make_registry()
+fun no_out():
+  #false
+def qapi = PiAPI(qreg, no_out, fun (): sess, [])
+let qpath = bundled +& "/question.rhm"
+reload.rerequire_path(qpath)
+qreg.current_source := qpath
+reload.get_export(qpath, "init")(qapi)
+qreg.current_source := "builtin"
+check("question tool", qreg.find_tool("question") && #true)
+check("question no UI",
+      to_string(qreg.find_tool("question").fn({ "question": "pick",
+                                                "options": ["a", "b"] }))
+        .contains("no UI"))
+
+check("fetch rejects file", !fetch.ok_url("file:///tmp/x"))
+check("fetch rejects empty", !fetch.ok_url(""))
+check("fetch allows https", fetch.ok_url("https://example.com/x"))
+check("fetch allows http", fetch.ok_url("http://example.com/x"))
+def stripped = fetch.strip_html("<html><head><style>p{color:red}</style></head>"
+                                  +& "<body><script>alert(1)</script>"
+                                  +& "<h1>Hello</h1><p>World</p></body></html>")
+check("fetch strips script", !stripped.contains("alert"))
+check("fetch strips tags", !stripped.contains("<h1>") && stripped.contains("Hello"))
+check("fetch clip", fetch.clip("abcd", 2).contains("truncated"))
+
+def csess = start_session(~cwd: tmp, ~no_session: #true)
+csess.append("custom",
+             { "type": "git_checkpoint", "entry_id": 3, "ref": "abc123def" })
+check("checkpoint lookup", checkpoint.lookup_ref(csess, 3) == "abc123def")
+check("checkpoint miss", checkpoint.lookup_ref(csess, 9) == "")
+check("checkpoint no session", checkpoint.lookup_ref(#false, 3) == "")
+def old_cwd = to_string(rkt.#{current-directory}())
+rkt.#{current-directory}(tmp)
+check("checkpoint skips non-git", !checkpoint.in_git_repo())
+rkt.#{current-directory}(old_cwd)
+
+load_one("checkpoint.rhm")
+check("checkpoint fork handler idle",
+      reg.emit("session_before_fork",
+               { "target": 3, "path": tmp }) == #false)
+
+reg.state["mcp_skip_reload"] := #true
+load_one("mcp_ext.rhm")
+check("mcp command", reg.find_command("mcp") && #true)
+reg.find_command("mcp").handler("list")
+check("mcp list notified",
+      notes.get_string().to_string().contains("MCP")
+        || notes.get_string().to_string().contains("mcp"))
+
+def main_src = filesystem.read_string("src/main.rhm")
+check("fork emits target event",
+      main_src.contains("session_before_fork")
+        && main_src.contains("\"target\":"))
+check("clone uses clone event", main_src.contains("session_before_clone"))
+check("main does not connect MCP", !main_src.contains("mcp.reload"))
 
 if failures == 0
 | println("t_bundled OK")

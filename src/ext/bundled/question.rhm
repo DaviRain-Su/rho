@@ -1,0 +1,65 @@
+#lang rhombus
+
+// Ask the user a multiple-choice question. Headless / no output port
+// returns an error instead of blocking.
+
+export:
+  init
+  option_labels
+
+def OTHER = "Type something."
+
+fun option_labels(raw) :: List:
+  cond
+  | raw is_a List:
+      for List (x in raw):
+        cond
+        | x is_a String: x.trim()
+        | x is_a Map:
+            let lab = to_string(x.get("label", "")).trim()
+            if lab != "" | lab | to_string(x.get("description", "")).trim()
+        | ~else: to_string(x).trim()
+  | raw is_a String:
+      for List (x in raw.split(",")):
+        skip_when x.trim() == ""
+        x.trim()
+  | ~else: []
+
+fun ask(rho, prompt :: String, labels :: List) :: String:
+  cond
+  | !rho.has_ui(): "error: no UI"
+  | labels == []: "error: no options"
+  | ~else:
+      let choice = rho.ui.select(prompt, labels.add(OTHER))
+      cond
+      | choice == #false: "error: cancelled"
+      | choice == OTHER:
+          let typed = rho.ui.input(prompt)
+          if typed.trim() == "" | "error: cancelled" | typed.trim()
+      | ~else: to_string(choice)
+
+fun init(rho):
+  rho.register_tool(
+    ~name: "question",
+    ~description: "Ask the user a multiple-choice question and wait for the answer. Use when you need a decision before continuing.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "question": { "type": "string",
+                               "description": "The question to ask" },
+                 "options": { "type": "array",
+                              "description": "Choices (strings, or objects with label)",
+                              "items": { "type": "string" } }
+               },
+               "required": ["question", "options"] },
+    ~fn: fun (args):
+           let q = to_string(args.get("question", "")).trim()
+           let labels = option_labels(args.get("options", []))
+           cond
+           | q == "": "error: question is required"
+           | ~else: ask(rho, q, labels))
+  rho.register_renderer(
+    ~tool: "question",
+    ~fn: fun (phase, _name, data):
+           if phase == "call" && data is_a Map
+           | "\u25CF ask " +& to_string(data.get("question", "question"))
+           | #false)

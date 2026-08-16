@@ -1,0 +1,152 @@
+#lang rhombus
+
+// Session-scoped todo list. The model drives it with the `todo` tool;
+// snapshots live in custom session entries so /fork keeps the right list.
+
+export:
+  init
+  format_list
+
+fun as_int(v):
+  cond
+  | v is_a Int: v
+  | ~else:
+      match String.maybe_to_int(to_string(v).trim())
+      | n :: Int: n
+      | ~else: #false
+
+fun todos_of(rho) :: List:
+  match rho.state.get("todos", [])
+  | xs :: List: xs
+  | ~else: []
+
+fun next_of(rho) :: Int:
+  match rho.state.get("todo_next", 1)
+  | n :: Int: n
+  | ~else: 1
+
+fun format_list(items :: List) :: String:
+  if items == []
+  | "(no todos)"
+  | String.join(
+      (for List (t in items):
+         let done = t is_a Map && t.get("done", #false)
+         let id = if t is_a Map | t.get("id", "?") | "?"
+         let text = if t is_a Map | to_string(t.get("text", "")) | ""
+         (if done | "[x] " | "[ ] ") +& "#" +& id +& " " +& text),
+      "\n")
+
+fun persist(rho):
+  let snap = { "type": "todo",
+               "todos": todos_of(rho),
+               "next": next_of(rho) }
+  match rho.session
+  | #false: #void
+  | s:
+      s.append("custom", snap)
+      #void
+
+fun restore(rho):
+  match rho.session
+  | #false: #void
+  | s:
+      let last:
+        for values(found = #false) (e in s.path_entries()):
+          let d = e.get("data", {})
+          if e.get("kind", "") == "custom" && d is_a Map && d.get("type", "") == "todo"
+          | d
+          | found
+      when last is_a Map
+      | rho.state["todos"] := last.get("todos", [])
+        rho.state["todo_next"] := last.get("next", 1)
+
+fun set_todos(rho, items :: List, next :: Int):
+  rho.state["todos"] := items
+  rho.state["todo_next"] := next
+  persist(rho)
+
+fun refresh(rho):
+  let items = todos_of(rho)
+  let open_n:
+    for values(n = 0) (t in items):
+      if t is_a Map && t.get("done", #false) | n | n + 1
+  if items == []
+  | rho.set_widget("todo", #false)
+  | rho.set_widget("todo",
+                   open_n +& "/" +& items.length() +& " todos")
+
+fun handle(rho, args :: Map) :: String:
+  let action = to_string(args.get("action", "list")).trim().foldcase()
+  cond
+  | action == "list":
+      format_list(todos_of(rho))
+  | action == "add":
+      let text = to_string(args.get("text", "")).trim()
+      cond
+      | text == "": "error: text is required for add"
+      | ~else:
+          let id = next_of(rho)
+          let item = { "id": id, "text": text, "done": #false }
+          set_todos(rho, todos_of(rho).add(item), id + 1)
+          refresh(rho)
+          "added #" +& id +& ": " +& text
+  | action == "toggle" || action == "done":
+      let id = as_int(args.get("id", #false))
+      cond
+      | id == #false: "error: id is required for toggle"
+      | ~else:
+          let values(found, items):
+            for values(hit = #false, acc :: List = []) (t in todos_of(rho)):
+              cond
+              | t is_a Map && t.get("id", #false) == id:
+                  let done = t.get("done", #false)
+                  values(#true, acc.add(t ++ { "done": !done }))
+              | ~else: values(hit, acc.add(t))
+          cond
+          | !found: "error: no todo #" +& id
+          | ~else:
+              set_todos(rho, items, next_of(rho))
+              refresh(rho)
+              format_list(items)
+  | action == "clear":
+      let n = todos_of(rho).length()
+      set_todos(rho, [], 1)
+      refresh(rho)
+      "cleared " +& n +& " todos"
+  | ~else: "error: action must be list, add, toggle, or clear"
+
+fun init(rho):
+  restore(rho)
+  refresh(rho)
+  rho.register_tool(
+    ~name: "todo",
+    ~description: "Manage a short todo list for this session. Actions: list, add (text), toggle/done (id), clear. Use this for multi-step work so progress is visible.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "action": { "type": "string",
+                             "description": "list | add | toggle | done | clear" },
+                 "text": { "type": "string",
+                           "description": "Todo text (add)" },
+                 "id": { "type": "integer",
+                         "description": "Todo id (toggle/done)" }
+               },
+               "required": ["action"] },
+    ~fn: fun (args): handle(rho, args))
+  rho.register_command(
+    ~name: "todos",
+    ~description: "show the session todo list",
+    ~handler: fun (_args):
+                restore(rho)
+                rho.notify(format_list(todos_of(rho)))
+                refresh(rho))
+  rho.register_renderer(
+    ~tool: "todo",
+    ~fn: fun (phase, _name, data):
+           if phase == "call" && data is_a Map
+           | "\u25CF todo " +& to_string(data.get("action", "list"))
+           | #false)
+  fun on_session(_e):
+    restore(rho)
+    refresh(rho)
+  rho.on("session_tree", on_session)
+  rho.on("agent_start", on_session)

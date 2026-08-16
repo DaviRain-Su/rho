@@ -51,6 +51,9 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
   method current_config():
     get_config()
 
+  method has_ui() :: Boolean:
+    get_out() != #false
+
   method set_bash_spawn_hook(fn):
     registry.state["bash_spawn_hook"] := fn
 

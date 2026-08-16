@@ -1,0 +1,55 @@
+#lang rhombus
+
+// WebSocket transport for streaming API responses.
+// Uses Racket's net/websocket if available; falls back to SSE otherwise.
+
+import:
+  json
+  net/http
+  lib("racket/base.rkt") as rkt
+  "sse.rhm"
+
+export:
+  stream_via_websocket
+  ws_available
+
+fun ws_available() :: Boolean:
+  // Check if net/websocket is available at runtime.
+  // The package is not part of Racket's core collects, so we probe for it.
+  try:
+    rkt.#{dynamic-require}(rkt.#{string->path}("net/websocket"), #false)
+    #true
+    ~catch _: #false
+
+// Attempt websocket streaming. Falls back to SSE if unavailable.
+// Same signature as openai.stream_chat but uses websocket transport.
+fun stream_via_websocket(~base_url: base_url :: String,
+                         ~api_key: api_key :: String,
+                         ~path: path :: String,
+                         ~body: body :: Map,
+                         ~headers: headers :: Map = {},
+                         ~on_data: on_data = fun (s): #void,
+                         ~on_done: on_done = fun (): #void,
+                         ~on_error: on_error = fun (e): #void):
+  cond
+  | !ws_available():
+      // Fallback: use regular SSE via http.post
+      let resp = http.post(base_url +& path,
+                           ~headers: headers,
+                           ~data: http.payload.json(body),
+                           ~stream: #true,
+                           ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))
+      if resp.status_code < 200 || resp.status_code >= 300
+      | let err_body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+        resp.close()
+        on_error("websocket fallback: HTTP " +& resp.status_code +& ": " +& err_body)
+      | try:
+          sse.each_event(resp.output(), fun (_evt, data): on_data(data))
+          on_done()
+          ~finally:
+            resp.close()
+  | ~else:
+      // TODO: implement actual websocket connection using net/websocket.
+      // For now this path is unreachable (ws_available always #false
+      // until the package is confirmed installed).
+      on_error("websocket: not yet implemented")

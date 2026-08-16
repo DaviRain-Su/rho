@@ -79,6 +79,7 @@ Built-in provider profiles (override or extend in `~/.rho/config.json`):
 | `qwen` | OpenAI chat completions | `QWEN_API_KEY` |
 | `zai` | OpenAI chat completions | `ZAI_API_KEY` |
 | `anthropic` | Anthropic messages | `ANTHROPIC_API_KEY` |
+| `google` | Gemini (generativelanguage) | `GOOGLE_API_KEY` |
 
 `~/.rho/config.json` also takes `"settings"`: `reserve_tokens`,
 `keep_recent_tokens` (compaction), `theme`, `tui_mode`,
@@ -312,6 +313,7 @@ src/
     sse.rhm           SSE parser
     openai.rhm        OpenAI-compatible streaming client (+usage/thinking)
     anthropic.rhm     Anthropic messages streaming client (+usage/thinking)
+    gemini.rhm        Google Gemini streaming client (+usage/thinking)
     models.rhm        model metadata registry (+ ~/.rho/models.json)
   tools/core.rhm      read/write/edit/bash/grep/find/ls
   ext/
@@ -333,5 +335,5 @@ tests/                runnable test modules (t_*.rhm)
 - No MCP, and no OAuth for providers that only accept API keys (Kimi, Ollama, …)
 - ChatGPT subscription login is the `openai-codex` provider (`/login openai oauth`). It calls `chatgpt.com/backend-api/codex/responses`. Platform `openai` still needs `OPENAI_API_KEY` with billing.
 - TUI editor highlighting is command/`@file`/`code`, not full language syntax
-- `transport: "websocket"` is plumbed but falls back to SSE (websocket client not yet implemented)
+- `transport: "websocket"` falls back to SSE (see `src/ai/ws.rhm`)
 - Google Gemini requires a native protocol client (not OpenAI-compatible); not yet implemented

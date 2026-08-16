@@ -7,6 +7,7 @@ import:
   lib("racket/base.rkt") as rkt
   "../ai/openai.rhm"
   "../ai/anthropic.rhm"
+  "../ai/gemini.rhm"
   "../ai/codex.rhm" as codex
   "../ai/modelsdev.rhm" as modelsdev
   "../ai/types.rhm" open
@@ -55,6 +56,17 @@ fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: M
                             ~thinking: config.thinking,
                             ~extra_headers: headers,
                             ~transport: transport)
+  | "gemini":
+      gemini.stream_chat(~base_url: config.base_url(),
+                         ~api_key: config.api_key(),
+                         ~model: config.model,
+                         ~messages: messages,
+                         ~tools: tools,
+                         ~on_text: on_text,
+                         ~on_thinking: on_thinking,
+                         ~thinking: config.thinking,
+                         ~extra_headers: headers,
+                         ~transport: transport)
   | ~else:
       if oauth.is_chatgpt_oauth(config)
       | codex.stream_responses(~base_url: oauth.chatgpt_codex_url,

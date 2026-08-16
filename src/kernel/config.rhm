@@ -347,6 +347,12 @@ def default_providers :: Map:
         "mode": "paste",
         "extra_auth_params": { "code": "true" }
       }
+    },
+    "google": {
+      "kind": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "api_key_env": "GOOGLE_API_KEY",
+      "default_model": "gemini-2.5-flash"
     }
   }
 

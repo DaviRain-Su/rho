@@ -1681,7 +1681,7 @@ fun handle_input_tui(input :: String):
            ~session: session,
            ~system_prompt: system_prompt(),
            ~input: input,
-           ~images: take_cli_images(),
+           ~images: take_cli_images() ++ tui.take_paste_images(),
            ~on_text: fun (s):
                        tui.set_activity("responding")
                        tui.push_delta(s),
@@ -1826,7 +1826,9 @@ fun run_tui_mode():
                      tui.push("notify", to_string(s))
                      go()
                  | ~else: #void)
+  let tui_mode = opts.get("tui_mode", config.settings.get("tui_mode", "tui"))
   tui.run_tui(~theme: load_theme(),
+              ~tui_mode: tui_mode,
               ~banner: banner +& "TUI: type / for the command menu, /hotkeys for keys\n",
               ~handle_command: handle_command,
               ~handle_input: handle_input_tui,
@@ -2232,6 +2234,8 @@ module main:
       | rpc_mode: run_rpc()
       | headless: run_headless()
       | tui_mode == "tui" && stdin_is_tty():
+          run_tui_mode()
+      | tui_mode == "fullscreen" && stdin_is_tty():
           run_tui_mode()
       | ~else:
           run_repl(~banner: banner,

@@ -1,0 +1,163 @@
+#lang rhombus
+
+// Google Gemini API client with SSE streaming.
+// Uses the generativelanguage API (v1beta) with API key auth.
+
+import:
+  json
+  net/http
+  "sse.rhm"
+
+export:
+  stream_chat
+  convert_messages
+
+// Convert canonical messages to Gemini format.
+// Returns (system_text, contents) where contents is the Gemini message array.
+fun convert_messages(messages :: List):
+  def mutable system_text = ""
+  def mutable out :: List = []
+  for (m in messages):
+    match m.get("role", "")
+    | "system":
+        system_text := (if system_text == ""
+                        | m.get("content", "")
+                        | system_text +& "\n\n" +& m.get("content", ""))
+    | "user":
+        let imgs = m.get("images", [])
+        if imgs is_a List && imgs != []
+        | out := out.add(
+            { "role": "user",
+              "parts":
+                [{ "text": m.get("content", "") }]
+                  ++ (for List (im in imgs):
+                        { "inline_data":
+                            { "mime_type": im.get("media_type", "image/png"),
+                              "data": im.get("data", "") } }) })
+        | out := out.add({ "role": "user", "parts": [{ "text": m.get("content", "") }] })
+    | "assistant":
+        let parts:
+          let base = (if m.get("content", "") is_a String && m.get("content", "") != ""
+                      | [{ "text": m.get("content", "") }]
+                      | [])
+          for values(ps = base) (tc in m.get("tool_calls", [])):
+            let input = try:
+                          json.from_string(tc.get("arguments", "{}"))
+                          ~catch _: {}
+            ps.add({ "functionCall": { "name": tc["name"], "args": input } })
+        out := out.add({ "role": "model", "parts": parts })
+    | "tool":
+        // tool result → functionResponse
+        let input = try:
+                      json.from_string(m.get("content", "{}"))
+                      ~catch _: m.get("content", "")
+        out := out.add(
+          { "role": "user",
+            "parts": [{ "functionResponse":
+                          { "name": "tool",
+                            "response": { "result": input } } }] })
+    | ~else: #void
+  values(system_text, out)
+
+fun thinking_budget(level :: String) :: Int:
+  match level
+  | "off": 0
+  | "minimal": 512
+  | "low": 2048
+  | "medium": 8192
+  | "high": 16384
+  | "xhigh": 32768
+  | "max": 65536
+  | ~else: 8192
+
+// Returns canonical assistant message (same shape as openai.stream_chat).
+fun stream_chat(~base_url: base_url :: String,
+                ~api_key: api_key :: String,
+                ~model: model :: String,
+                ~messages: messages :: List,
+                ~tools: tools :: List = [],
+                ~on_text: on_text = fun (s): #void,
+                ~on_thinking: on_thinking = fun (s): #void,
+                ~thinking: thinking :: maybe(String) = #false,
+                ~extra_headers: extra_headers :: Map = {},
+                ~transport: transport :: String = "auto") :: Map:
+  // transport: "websocket" would use a WS connection; for now all
+  // Gemini requests use SSE, so we fall back silently.
+  let (system_text, converted) = convert_messages(messages)
+  let body:
+    let base = { "contents": converted }
+    let base = (if system_text == ""
+                | base
+                | base ++ { "systemInstruction": { "parts": [{ "text": system_text }] } })
+    let base = (if thinking
+                | base ++ { "generationConfig":
+                              { "thinkingConfig": { "thinkingBudget": thinking_budget(thinking) } } }
+                | base)
+    if tools == []
+    | base
+    | base ++ { "tools": [{ "functionDeclarations":
+                              for List (t in tools):
+                                { "name": t["name"],
+                                  "description": t["description"],
+                                  "parameters": t["schema"] } }] }
+  let headers = { "Content-Type": "application/json" } ++ extra_headers
+  let url = base_url +& "/models/" +& model +& ":streamGenerateContent?alt=sse&key=" +& api_key
+  let resp = http.post(url,
+                       ~headers: headers,
+                       ~data: http.payload.json(body),
+                       ~stream: #true,
+                       ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))
+  when resp.status_code < 200 || resp.status_code >= 300
+  | let err_body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+    resp.close()
+    error("gemini: HTTP " +& resp.status_code +& ": " +& err_body)
+  def mutable content = ""
+  def mutable finish_reason = ""
+  def mutable tool_calls :: List = []
+  def mutable usage :: Map = {}
+  fun handle(_event, data :: String):
+    when data != "[DONE]"
+    | let chunk = try:
+                    json.from_string(data)
+                    ~catch _: #false
+      when chunk is_a Map
+      | match chunk.get("usageMetadata", #'null)
+        | u :: Map:
+            usage := { "input": u.get("promptTokenCount", 0),
+                       "output": u.get("candidatesTokenCount", 0),
+                       "cache_read": u.get("cachedContentTokenCount", 0) }
+        | ~else: #void
+        let candidates = chunk.get("candidates", [])
+        when candidates is_a List && candidates != []
+        | let cand = candidates[0]
+          match cand.get("finishReason", #'null)
+          | "STOP": finish_reason := "stop"
+          | "MAX_TOKENS": finish_reason := "length"
+          | "SAFETY": finish_reason := "safety"
+          | s :: String: finish_reason := to_string(s)
+          | ~else: #void
+          let parts = cand.get("content", {}).get("parts", [])
+          when parts is_a List
+          | for (part in parts):
+              match part.get("text", #'null)
+              | s :: String:
+                  when s != ""
+                  | content := content +& s
+                    on_text(s)
+              | ~else: #void
+              match part.get("functionCall", #'null)
+              | fc :: Map:
+                  let name = to_string(fc.get("name", ""))
+                  let args = json.to_string(fc.get("args", {}))
+                  let id = "call_" +& to_string(tool_calls.length())
+                  tool_calls := tool_calls.add({ "id": id, "name": name, "arguments": args })
+              | ~else: #void
+  try:
+    sse.each_event(resp.output(), handle)
+    { "role": "assistant",
+      "content": content,
+      "tool_calls": tool_calls,
+      "finish_reason": finish_reason,
+      "usage": usage }
+    ~finally:
+      resp.close()

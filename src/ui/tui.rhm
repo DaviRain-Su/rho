@@ -30,6 +30,7 @@ import:
   lib("racket/base.rkt") as rkt
   lib("racket/file.rkt") as rktfile
   lib("racket/system.rkt") as rktsys
+  lib("net/base64.rkt") as rkt64
   "term.rkt" as term
   "style.rhm" open
   "../kernel/sync.rkt" as sync
@@ -52,6 +53,22 @@ export:
   md_line_spans
   editor_line_spans
   wrap_spans
+  take_paste_images
+
+// Images pasted from the clipboard (Ctrl-V / Alt-V) while the TUI is
+// running.  Each entry is an attachment map shaped like encode_image's
+// output: { media_type, data (base64), name }.  take_paste_images()
+// drains and returns them so handle_input_tui can attach them to the
+// next turn.
+def mutable pending_images :: List = []
+
+def mutable pending_image_count = 0
+
+fun take_paste_images() :: List:
+  let l = pending_images
+  pending_images := []
+  pending_image_count := 0
+  l
 
 // ---- shared transcript state (written by turn threads, read by render) ----
 def mutable lines :: List = []       // [kind, text] finalized lines
@@ -314,6 +331,7 @@ fun common_prefix(strs :: List) :: String:
 // ---- the main TUI loop ----
 fun run_tui(~theme: theme_in :: Map = {},
             ~banner: banner :: String = "",
+            ~tui_mode: tui_mode_in :: String = "tui",
             ~handle_command: handle_command,
             ~handle_input: handle_input,
             ~footer: footer = fun (): "rho",
@@ -327,6 +345,7 @@ fun run_tui(~theme: theme_in :: Map = {},
             ~last_assistant: last_assistant = fun (): "",
             ~keybind: keybind = fun (action, default): default):
   let theme = default_theme ++ theme_in
+  fullscreen_mode := (tui_mode_in == "fullscreen")
   fun tcolor(kind :: String):
     let c = theme.get(kind, "default")
     if c == "default" | #false | c
@@ -335,6 +354,36 @@ fun run_tui(~theme: theme_in :: Map = {},
     to_string(keybind(action, default))
 
   def mutable input_lines :: List = [""]
+
+  // Reads an image from the system clipboard, returns a base64 attachment
+  // map or #false.  Tries pngpaste (macOS), xclip / xclip2 (Linux), and
+  // PowerShell (Windows / WSL).  Each attempt writes to a temp file which
+  // we read and base64-encode.
+  fun read_clipboard_image():
+    let tmp = to_string(rktfile.#{make-temporary-file}("rho-clip-~a.png"))
+    let script = "{ command -v pngpaste >/dev/null 2>&1 && pngpaste " +& tmp +& " 2>/dev/null; } "
+      +& "|| { command -v xclip >/dev/null 2>&1 && xclip -selection clipboard -t image/png -o > " +& tmp +& " 2>/dev/null; } "
+      +& "|| { command -v wl-paste >/dev/null 2>&1 && wl-paste -t image/png > " +& tmp +& " 2>/dev/null; } "
+      +& "; test -s " +& tmp
+    let ok = block:
+               try:
+                 rktsys.system(script)
+                 ~catch _:
+                   #false
+    cond
+    | !filesystem.file_exists(tmp): #false
+    | ~else:
+        let data = filesystem.read_bytes(tmp)
+        try:
+          filesystem.delete(tmp)
+          ~catch _:
+            #void
+        if data.length() > 0
+        | let b64 = Bytes.utf8_string(rkt64.#{base64-encode}(data, #""))
+          { "media_type": "image/png",
+            "data": b64,
+            "name": "clipboard-" +& pending_image_count +& ".png" }
+        | #false
   def mutable cur_line = 0
   def mutable cur_col = 0
   def mutable scroll = 0
@@ -349,6 +398,7 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable last_trans_h = 20      // visible transcript height from last render
   def mutable tools_expanded = #false  // Ctrl-O: expand tool output blocks
   def mutable thinking_shown = #true   // Ctrl-T: show/hide chain of thought
+  def mutable fullscreen_mode = #false  // experimental fullscreen scroll (Alt-F)
   def mutable kill_ring :: List = []   // newest first
   def mutable kill_idx = 0
   def mutable last_was_kill = #false
@@ -952,7 +1002,24 @@ fun run_tui(~theme: theme_in :: Map = {},
     | k == "C-P":
         let msg = cycle_model()
         when msg != "" | push("notify", msg)
+    | k == "C-V" || k == "M-V" || k == "M-v":
+        // Paste an image from the clipboard (pi-style).
+        match read_clipboard_image()
+        | img :: Map:
+            pending_image_count := pending_image_count + 1
+            pending_images := pending_images.add(img)
+            insert("[image: clipboard-" +& pending_image_count +& ".png]")
+            push("notify", "[pasted image " +& img["data"].length() +& " base64 chars]")
+            dirty := #true
+        | ~else:
+            push("notify", "[no image in clipboard]")
     | k == "C-L": dirty := #true
+    | k == "M-F" || k == "M-f":
+        fullscreen_mode := !fullscreen_mode
+        push("notify", (if fullscreen_mode
+                        | "[fullscreen scroll on]"
+                        | "[fullscreen scroll off]"))
+        dirty := #true
     | k == "C-D":
         when String.join(input_lines, "") == ""
         | running := #false
@@ -1009,8 +1076,11 @@ fun run_tui(~theme: theme_in :: Map = {},
       | ~else: []
     let header_h = header_rows.length()
     let search_h = (if search_active | 1 | 0)
+    // fullscreen: shrink the editor to its minimum (1 line) so the
+    // transcript fills nearly the whole screen
+    let fs_input_h = (if fullscreen_mode | 1 | input_h)
     // rows = header + transcript + widgets + queue + status(1) + search(?) + separator(1) + editor + popup + footer(1)
-    let trans_h = math.max(3, rows - input_h - 3 - search_h - popup_h - queue_h - widget_h - header_h)
+    let trans_h = math.max(3, rows - fs_input_h - 3 - search_h - popup_h - queue_h - widget_h - header_h)
     last_trans_h := trans_h
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
@@ -1115,16 +1185,26 @@ fun run_tui(~theme: theme_in :: Map = {},
               sp
           | [trans_rows[r]]
     // separator; shows position while scrolled back
+    let total_visible = wrapped.length()
     let sep_text:
-      if off > 0
-      | let tag = "\u2500\u2500 \u2193 " +& off +& " (PgDn/wheel to return) "
-        tag +& String.make(math.max(0, cols - display_width(tag)), Char"\u2500")
-      | String.make(cols, Char"\u2500")
+      cond
+      | fullscreen_mode && total_visible > trans_h:
+          // fullscreen: show [first-visible/total] scroll position
+          let pos = math.min(off, total_visible - trans_h)
+          let tag = "\u2500\u2500 [" +& (pos + 1) +& "/" +& total_visible
+                    +& "] \u2193 " +& off +& " (PgDn/wheel) "
+          tag +& String.make(math.max(0, cols - display_width(tag)), Char"\u2500")
+      | off > 0:
+          let tag = "\u2500\u2500 \u2193 " +& off +& " (PgDn/wheel to return) "
+          tag +& String.make(math.max(0, cols - display_width(tag)), Char"\u2500")
+      | ~else:
+          String.make(cols, Char"\u2500")
     let sep = [[tcolor("sep"), #false, #false, sep_text]]
     // editor window containing the cursor
-    let win_start = clamp(cur_line - input_h + 1, 0, math.max(0, input_lines.length() - input_h))
+    let ed_h = (if fullscreen_mode | fs_input_h | input_h)
+    let win_start = clamp(cur_line - ed_h + 1, 0, math.max(0, input_lines.length() - ed_h))
     let input_rows:
-      for List (i in win_start .. math.min(input_lines.length(), win_start + input_h)):
+      for List (i in win_start .. math.min(input_lines.length(), win_start + ed_h)):
         let prompt = (if i == 0 | "\u276F " | "\u2502 ")
         [[tcolor("prompt"), #false, "bold", prompt]]
           ++ editor_line_spans(to_string(input_lines[i]), i == 0, tcolor)

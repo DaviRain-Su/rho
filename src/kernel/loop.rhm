@@ -126,6 +126,7 @@ fun run_turn(~config: config,
                          | user_message(input)
                          | user_message(input) ++ { "images": images })
   registry.emit("user_message", { "content": input })
+  registry.emit("before_agent_start", { "input": input })
   registry.emit("agent_start", { "input": input })
   recur step(n = 0):
     let limit = config.settings.get("max_steps", MAX_STEPS)
@@ -167,6 +168,7 @@ fun run_turn(~config: config,
                                       on_thinking(s),
                                   ~headers: extra_headers)
     let assistant = openai.sanitize_assistant(assistant)
+    registry.emit("after_provider_response", { "message": assistant, "model": config.model })
     registry.emit("message_end", { "message": assistant })
     session.append_message(assistant)
     let tool_calls = tool_calls_of(assistant)

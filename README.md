@@ -189,19 +189,38 @@ API surface:
 
 - `rho.register_tool(~name, ~description, ~schema, ~fn)`
 - `rho.register_command(~name, ~description, ~handler)`
-- `rho.on(event, fn)` — events: `session_start`, `user_message`,
-  `agent_start`/`agent_end`, `turn_start`/`turn_end`, `before_request`
-  (return `{"messages": [...]}` to inject transient context), `tool_call`
-  (return `{"block": #true, "reason": ...}` to veto),
+- `rho.on(event, fn)` — events: `before_agent_start`, `agent_start`/`agent_end`,
+  `agent_settled`, `turn_start`/`turn_end`, `before_request` (return `{"messages": [...]}`
+  to inject transient context), `context` (rewrite outgoing messages),
+  `before_provider_request` (return `{"headers": ...}`), `after_provider_response`,
+  `message_start`/`message_update`/`message_end`, `thinking_update`,
+  `input` (rewrite user text), `user_message`, `user_bash`,
+  `tool_call` (return `{"block": #true, "reason": ...}` to veto),
   `tool_execution_start`/`tool_execution_end`, `tool_result`,
+  `model_select`, `thinking_level_select`,
+  `session_before_branch`/`session_before_fork`/`session_before_switch`/
+  `session_before_compact` (return `{"cancel": #true}` to abort),
+  `session_compact`, `session_tree`, `session_shutdown`,
   `subagent_start`/`subagent_end`
 - `rho.state` — mutable map, survives `/reload`
-- `rho.session` / `rho.append_entry(data)` — session access + custom entries
+- `rho.session` / `rho.append_entry(data)` / `rho.append_custom_message(content)` —
+  session access + custom entries
 - `rho.ui.confirm(msg)` / `rho.ui.select(msg, options)` / `rho.ui.input(msg)`
-- `rho.flag("name")` / `rho.register_flag(~name)` — read `--name[=value]`
-  CLI flags
+- `rho.flag("name")` / `rho.register_flag(~name)` — read `--name[=value]` CLI flags
 - `rho.register_renderer(~tool, ~fn)` — custom transcript rendering;
   `fn(phase, name, data)` returns a string or `#false`
+- `rho.register_message_renderer(~fn)` / `rho.register_entry_renderer(~fn)` —
+  custom transcript entry rendering
+- `rho.register_shortcut(~key, ~description, ~fn)` — keyboard shortcut
+- `rho.register_markdown_transformer(~fn)` — transform displayed markdown
+- `rho.register_provider(~name, ~profile)` — dynamic provider registration
+- `rho.set_model(model)` / `rho.get_thinking_level()` / `rho.set_thinking_level(level)`
+- `rho.get_active_tools()` / `rho.get_all_tools()` / `rho.set_active_tools(names)`
+- `rho.send_message(content, ~deliver_as)` / `rho.send_user_message(content, ~deliver_as)`
+  — inject messages (`deliver_as`: `"steer"`/`"followUp"`/`"next_turn"`)
+- `rho.set_label(entry_id, label)` / `rho.set_session_name(name)` / `rho.get_session_name()`
+- `rho.events` — shared event bus for inter-extension communication
+- `rho.set_status(s)` / `rho.set_widget(id, text)` / `rho.set_footer(s)` — TUI hooks
 - `rho.notify(msg)`
 
 ### The `tool` macro

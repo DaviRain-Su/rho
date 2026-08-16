@@ -151,3 +151,97 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
     let out = get_out()
     out.write_string("\u001B[36m[rho]\u001B[0m " +& msg +& "\n")
     out.flush()
+
+  // Set the current model in the live config.
+  method set_model(model :: String):
+    match get_config()
+    | #false: #void
+    | cfg: cfg.model := model
+
+  // Return the current thinking level as a string ("off", "low", ...).
+  method get_thinking_level() :: String:
+    match get_config()
+    | #false: "off"
+    | cfg:
+        if cfg.thinking | to_string(cfg.thinking) | "off"
+
+  // Set the thinking level; "off" clears it.
+  method set_thinking_level(level :: String):
+    match get_config()
+    | #false: #void
+    | cfg:
+        if level == "off"
+        | cfg.thinking := #false
+        | cfg.thinking := level
+
+  // Names of currently visible (filter-passing) tools.
+  method get_active_tools() :: List:
+    for List (t in registry.tool_list()):
+      t.name
+
+  // All registered tool names, sorted.
+  method get_all_tools() :: List:
+    registry.tools.keys().sort()
+
+  // Restrict the tool filter to the given names.
+  method set_active_tools(names :: List):
+    registry.set_tool_filter(~allow: names)
+
+  // Register a keyboard shortcut for the TUI to pick up.
+  method register_shortcut(~key: key :: String,
+                           ~description: description :: String = "",
+                           ~fn: fn):
+    let m:
+      match registry.state.get("shortcuts", #false)
+      | mm :: MutableMap: mm
+      | ~else:
+          let mm = MutableMap()
+          registry.state["shortcuts"] := mm
+          mm
+    m[key] := { "description": description, "fn": fn }
+
+  // Register a markdown transformer; TUI applies them in order.
+  method register_markdown_transformer(~fn: fn):
+    let xs = registry.state.get("markdown_transformers", [])
+    registry.state["markdown_transformers"] := xs.add(fn)
+
+  // Inject a custom message into the session.
+  method send_message(content :: String,
+                      ~deliver_as: deliver_as :: String = "next_turn"):
+    cond
+    | deliver_as == "steer":
+        rkt.#{thread-send}(rkt.#{current-thread}(), content)
+    | deliver_as == "followUp":
+        let q = registry.state.get("followup_queue", [])
+        registry.state["followup_queue"] := q.add(content)
+    | ~else:
+        get_session().append("custom_message", { "content": content })
+
+  // Inject a user message into the session.
+  method send_user_message(content :: String,
+                           ~deliver_as: deliver_as :: String = "next_turn"):
+    cond
+    | deliver_as == "steer":
+        rkt.#{thread-send}(rkt.#{current-thread}(), content)
+    | deliver_as == "followUp":
+        let q = registry.state.get("followup_queue", [])
+        registry.state["followup_queue"] := q.add(content)
+    | ~else:
+        get_session().append_message({ "role": "user", "content": content })
+
+  // Shared event bus (the registry itself) for inter-extension events.
+  property events:
+    registry
+
+  // Set a label/bookmark on a session entry.
+  method set_label(entry_id :: Int, label :: String):
+    let s = get_session()
+    s.set_label(label, ~target: entry_id)
+
+  // Set the session display name.
+  method set_session_name(name :: String):
+    get_session().set_name(name)
+
+  // Get the session display name.
+  method get_session_name() :: String:
+    get_session().name

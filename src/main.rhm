@@ -592,7 +592,9 @@ fun guarded_apply(~compact: do_compact = #true, apply) :: String:
   let old_m = to_string(config.model)
   let old_t = config.thinking
   let msg = apply()
-  finish_model_switch(old_p, old_m, old_t, msg, ~compact: do_compact)
+  let result = finish_model_switch(old_p, old_m, old_t, msg, ~compact: do_compact)
+  registry.emit("model_select", { "provider": config.provider, "model": config.model })
+  result
 
 fun set_model(arg :: String, ~compact: do_compact = #true) :: String:
   guarded_apply(~compact: do_compact, fun (): apply_set_model(arg))
@@ -786,6 +788,7 @@ registry.register_command(
                   | ~else:
                       let old_leaf = session.leaf
                       session.set_leaf(n)
+                      registry.emit("session_tree", { "target": n })
                       // keep a trace of what the abandoned branch contained
                       let summary = branch_summary_text(old_leaf, n)
                       when summary != "" && old_leaf != n
@@ -1043,10 +1046,13 @@ registry.register_command(
               | api.notify("compaction cancelled by extension")
               | api.notify("compacting\u2026")
                 api.notify(compaction.compact(~session: session, ~config: config,
-                                              ~instructions: args.trim())))
+                                              ~instructions: args.trim()))
+                registry.emit("session_compact", { "auto": #false }))
 registry.register_command(
   ~name: "quit", ~description: "exit",
-  ~handler: fun (_args): #'quit)
+  ~handler: fun (_args):
+              registry.emit("session_shutdown", {})
+              #'quit)
 
 // ---- credentials: /login /logout (~/.rho/auth.json, chmod 600) ----
 fun do_login_key(prov :: String, key :: String):
@@ -1126,6 +1132,7 @@ fun auto_compact():
       && session_event_ok("session_before_compact", { "auto": #true })
   | api.notify("context is near the window limit; compacting\u2026")
     api.notify(compaction.compact(~session: session, ~config: config))
+    registry.emit("session_compact", { "auto": #true })
 
 fun prepare_turn():
   let r = drain_pending_fit()
@@ -1536,10 +1543,12 @@ fun set_thinking(level :: String) :: String:
   cond
   | level == "off":
       config.thinking := #false
+      registry.emit("thinking_level_select", { "level": level })
       "thinking: off"
   | thinking_level_desc.has_key(level):
       if model_supports_thinking()
       | config.thinking := level
+        registry.emit("thinking_level_select", { "level": level })
         "thinking: " +& level +& " (" +& thinking_level_desc[level] +& ")"
       | config.model +& " does not support thinking"
   | ~else: "unknown level: " +& level +& " (off, low, medium, high)"
@@ -1553,6 +1562,8 @@ fun cycle_thinking() :: String:
         for values(found = 0) (i in 0 .. thinking_ring.length()):
           if thinking_ring[i] == config.thinking | i | found
       config.thinking := thinking_ring[(idx + 1) mod thinking_ring.length()]
+      registry.emit("thinking_level_select",
+                    { "level": (if config.thinking | config.thinking | "off") })
       "thinking: " +& (if config.thinking | config.thinking | "off")
 
 registry.register_command(
@@ -2022,6 +2033,99 @@ fun run_rpc():
             when bash_t && !rkt.#{thread-dead?}(bash_t)
             | rkt.#{break-thread}(bash_t)
             emit_json({ "type": "bash_aborted" })
+            loop()
+        | "set_model":
+            try:
+              set_model(to_string(req.get("model", "")))
+              emit_json({ "type": "model",
+                          "provider": config.provider,
+                          "model": config.model })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "cycle_model":
+            try:
+              cycle_model()
+              emit_json({ "type": "model",
+                          "provider": config.provider,
+                          "model": config.model })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "get_available_models":
+            emit_json({ "type": "available_models",
+                        "models": available_model_entries() })
+            loop()
+        | "set_thinking_level":
+            try:
+              set_thinking(to_string(req.get("level", "")))
+              emit_json({ "type": "thinking_level",
+                          "level": (if config.thinking | config.thinking | "off") })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "cycle_thinking_level":
+            try:
+              cycle_thinking()
+              emit_json({ "type": "thinking_level",
+                          "level": (if config.thinking | config.thinking | "off") })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "get_available_thinking_levels":
+            emit_json({ "type": "thinking_levels",
+                        "levels": ["off", "low", "medium", "high"],
+                        "current": (if config.thinking | config.thinking | "off") })
+            loop()
+        | "set_follow_up_mode":
+            let mode = to_string(req.get("mode", "all"))
+            registry.state["followup_mode"] := mode
+            emit_json({ "type": "follow_up_mode", "mode": mode })
+            loop()
+        | "get_session_stats":
+            emit_json({ "type": "session_stats",
+                        "usage": usage_totals(),
+                        "line": usage_line(),
+                        "session": (if session.path is_a String | session.path | ""),
+                        "name": session.name,
+                        "leaf": (if session.leaf is_a Int | session.leaf | -1) })
+            loop()
+        | "switch_session":
+            try:
+              session := start_session(~cwd: cwd(),
+                                       ~resume: to_string(req.get("path", "")))
+              emit_json({ "type": "session_switched", "path": session.path })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "fork":
+            try:
+              session := start_session(~cwd: cwd(),
+                                       ~resume: session.path, ~fork: #true)
+              emit_json({ "type": "forked", "path": session.path })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "clone":
+            try:
+              session := start_session(~cwd: cwd(),
+                                       ~resume: session.path, ~fork: #true)
+              emit_json({ "type": "cloned", "path": session.path })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "set_session_name":
+            try:
+              session.set_name(to_string(req.get("name", "")))
+              emit_json({ "type": "session_name", "name": session.name })
+              ~catch e :: Exn.Fail:
+                emit_json({ "type": "error", "message": e.message })
+            loop()
+        | "get_commands":
+            emit_json({ "type": "commands",
+                        "commands": (for List (c in registry.command_list()):
+                                       { "name": c.name,
+                                         "description": c.description }) })
             loop()
         | "quit":
             when turn_running()

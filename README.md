@@ -199,10 +199,10 @@ Tokens live in `~/.rho/auth.json` (0600) and refresh automatically.
 `read_file` `write_file` `edit_file` `bash` `grep` `find` `ls`
 `reload_extensions` — filterable with `--tools`/`--exclude-tools`/`--no-tools`.
 
-The `agent` tool is a bundled extension (`src/ext/bundled/agent.rhm`): a nested
-sub-agent with its own session (no further nesting). Pass `prompt`, optional
-`label`, and optional `tools` (comma-separated allowlist). `--no-extensions`
-drops it. `--no-builtin-tools` keeps it.
+The `agent` tool is a bundled extension (`src/ext/bundled/agent.rhm`): it
+spawns a nested session via kernel `run_turn` (no further nesting). Pass
+`prompt`, optional `label`, and optional `tools` (comma-separated allowlist).
+`--no-extensions` drops it. `--no-builtin-tools` keeps it.
 The TUI streams the child's text and tool calls live (indented, status
 `sub-agent <label>: <tool>`); Ctrl-O still folds long tool output.
 
@@ -340,7 +340,6 @@ src/
     registry.rhm      tools / commands / event handlers / state / filters
     session.rhm       session tree, JSONL persistence (~/.rho/sessions/)
     loop.rhm          agent loop: stream, execute tools, steering, events
-    subagent.rhm      nested-run primitive (the `agent` tool is an extension)
     oauth.rhm         PKCE login + token refresh
     crypto.rkt        PKCE / url-encode / localhost callback
     context.rhm       AGENTS.md hierarchy, SYSTEM.md/APPEND_SYSTEM.md
@@ -364,12 +363,13 @@ src/
     loader.rhm        discovery + hot reload
     tool.rhm          `tool` definition macro
     bundled/          shipped plugins: guards, audit, memory, doctor, usage,
-                      verify, agent, dashboard, sandbox, todo, plan,
-                      question, checkpoint, fetch, mcp_ext
+                      verify, agent, permission, dashboard, sandbox, todo,
+                      plan, question, checkpoint, fetch, mcp_ext
     mcp.rhm           MCP stdio client (parse / connect / status)
   ui/
     repl.rhm          readline REPL (steering, /follow, Ctrl-C)
     tui.rhm           raart full-screen TUI
+    tasks.rhm         live task table for the still-running line / tasks pane
     style.rhm         markdown + editor highlighting, width wrap
     term.rkt          raart lux-chaos shim
 examples/extensions/  greet.rhm (tool macro), guard.rhm (tool_call veto)

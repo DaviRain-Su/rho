@@ -133,7 +133,8 @@ class Registry(tools :: MutableMap,
       "commands": cs,
       "handlers": hs,
       "tool_renderers": renderers,
-      "message_renderers": state.get("message_renderers", []) }
+      "message_renderers": state.get("message_renderers", []),
+      "prompt_snippets": state.get("prompt_snippets", []) }
 
   method snapshot_extensions() :: Map:
     locked(fun (): snapshot_unlocked())
@@ -150,6 +151,7 @@ class Registry(tools :: MutableMap,
       let event = pair[0]
       handlers[event] := handlers.get(event, []) ++ pair[1]
     state["message_renderers"] := snap.get("message_renderers", [])
+    state["prompt_snippets"] := snap.get("prompt_snippets", [])
     let rows = snap.get("tool_renderers", [])
     when rows is_a List && rows != []
     | let mm = MutableMap()
@@ -181,8 +183,9 @@ class Registry(tools :: MutableMap,
       handlers[event] := (for List (entry in handlers[event]):
                             skip_when entry[0] != "builtin"
                             entry)
-    // renderers are only ever extension-contributed: rebuild from scratch
+    // renderers / prompt snippets are extension-contributed: rebuild
     state["message_renderers"] := []
+    state["prompt_snippets"] := []
     match state.get("tool_renderers", #false)
     | mm :: MutableMap:
         let ks:

@@ -15,6 +15,7 @@ import:
   "../src/ext/bundled/question.rhm" as question
   "../src/ext/bundled/checkpoint.rhm" as checkpoint
   "../src/ext/bundled/fetch.rhm" as fetch
+  "../src/ext/bundled/permission.rhm" as permission
   lib("racket/base.rkt") as rkt
 
 def mutable failures = 0
@@ -41,6 +42,7 @@ check("question shipped", filesystem.file_exists(bundled +& "/question.rhm"))
 check("checkpoint shipped", filesystem.file_exists(bundled +& "/checkpoint.rhm"))
 check("fetch shipped", filesystem.file_exists(bundled +& "/fetch.rhm"))
 check("mcp_ext shipped", filesystem.file_exists(bundled +& "/mcp_ext.rhm"))
+check("permission shipped", filesystem.file_exists(bundled +& "/permission.rhm"))
 
 def found = loader.discover_extensions(~include_project: #false)
 check("discover includes guards",
@@ -139,18 +141,22 @@ check("step parse string",
 check("step limit message",
       loop.step_limit_message(200).contains("/steps"))
 
-check("safe read_file", loop.safe_tool("read_file"))
-check("unsafe bash", !loop.safe_tool("bash"))
-check("ask mode prompts bash", loop.should_ask("ask", "bash", #false))
-check("ask mode skips read", !loop.should_ask("ask", "read_file", #false))
-check("allow mode skips bash", !loop.should_ask("allow", "bash", #false))
+check("safe read_file", permission.safe_tool("read_file"))
+check("unsafe bash", !permission.safe_tool("bash"))
+check("ask mode prompts bash", permission.should_ask("ask", "bash", #false))
+check("ask mode skips read", !permission.should_ask("ask", "read_file", #false))
+check("allow mode skips bash", !permission.should_ask("allow", "bash", #false))
 check("verdict ask forces prompt",
-      loop.should_ask("allow", "read_file", { "ask": #true }))
+      permission.should_ask("allow", "read_file", { "ask": #true }))
 class FakeCfg(settings :: Map)
 check("permission default allow",
-      loop.permission_mode(FakeCfg({})) == "allow")
+      permission.permission_mode(FakeCfg({})) == "allow")
 check("permission ask setting",
-      loop.permission_mode(FakeCfg({ "permission_mode": "ask" })) == "ask")
+      permission.permission_mode(FakeCfg({ "permission_mode": "ask" })) == "ask")
+check("wants_ask verdict",
+      loop.wants_ask(reg, "read_file", { "ask": #true }))
+check("wants_ask no hook",
+      !loop.wants_ask(make_registry(), "bash", #false))
 
 def ask_reg = make_registry()
 check("request_ask default allow",
@@ -180,6 +186,13 @@ check("verify allows success",
 reg.find_command("verify").handler("off")
 check("verify off", reg.state.get("verify_cmd", #true) == #false)
 
+load_one("permission.rhm")
+check("permission command", reg.find_command("permission") && #true)
+check("allow command", reg.find_command("allow") && #true)
+check("ask command", reg.find_command("ask") && #true)
+check("wants_ask hook",
+      loop.wants_ask(reg, "bash", #false) == #false)
+
 load_one("agent.rhm")
 check("agent tool", reg.find_tool("agent") && #true)
 check("agent empty prompt",
@@ -190,6 +203,10 @@ check("tasks pane registered",
       match reg.state.get("panes", #false)
       | m :: MutableMap: m.has_key("tasks")
       | ~else: #false)
+check("agent snippet",
+      to_string(reg.state.get("prompt_snippets", [])).contains("`agent`"))
+check("max_agent_depth default",
+      reg.state.get("max_agent_depth", 0) == 1)
 
 load_one("dashboard.rhm")
 check("dashboard command", reg.find_command("dashboard") && #true)

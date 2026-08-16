@@ -118,6 +118,8 @@ fun handle(rho, args :: Map) :: String:
 fun init(rho):
   restore(rho)
   refresh(rho)
+  rho.register_prompt_snippet(
+    "Track multi-step work with the `todo` tool.")
   rho.register_tool(
     ~name: "todo",
     ~description: "Manage a short todo list for this session. Actions: list, add (text), toggle/done (id), clear. Use this for multi-step work so progress is visible.",

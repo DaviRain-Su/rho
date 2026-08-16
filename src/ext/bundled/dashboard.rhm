@@ -13,7 +13,9 @@ export:
 fun cfg_mode(rho) :: String:
   match rho.current_config()
   | #false: "allow"
-  | cfg: loop.permission_mode(cfg)
+  | cfg:
+      let m = to_string(cfg.settings.get("permission_mode", "allow"))
+      if m == "ask" | "ask" | "allow"
 
 fun cfg_model(rho) :: String:
   match rho.current_config()

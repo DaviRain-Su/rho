@@ -4,7 +4,7 @@
 
 import:
   "../src/kernel/registry.rhm" open
-  "../src/kernel/subagent.rhm" as subagent
+  "../src/ext/bundled/agent.rhm" as agent
   "../src/tools/core.rhm" open
 
 def mutable failures = 0
@@ -22,12 +22,12 @@ parent.register_tool(
   ~schema: { "type": "object", "properties": {}, "required": [] },
   ~fn: fun (_args): "no")
 
-def names = subagent.child_tool_names(parent, #false)
+def names = agent.child_tool_names(parent, #false)
 check("drops agent", !names.contains("agent"))
 check("keeps read", names.contains("read_file"))
 check("keeps bash", names.contains("bash"))
 
-def filtered = subagent.child_tool_names(parent, ["read_file", "grep"])
+def filtered = agent.child_tool_names(parent, ["read_file", "grep"])
 check("allowlist read", filtered.contains("read_file"))
 check("allowlist no bash", !filtered.contains("bash"))
 check("allowlist no agent", !filtered.contains("agent"))
@@ -35,10 +35,10 @@ check("allowlist no agent", !filtered.contains("agent"))
 parent.state["agent_depth"] := 1
 parent.state["max_agent_depth"] := 1
 def err = try:
-            subagent.run_subagent(~config: #false,
-                                  ~parent: parent,
-                                  ~prompt: "hi",
-                                  ~system_prompt: "sys")
+            agent.run_subagent(~config: #false,
+                               ~parent: parent,
+                               ~prompt: "hi",
+                               ~system_prompt: "sys")
             "no-error"
             ~catch e :: Exn.Fail:
               e.message

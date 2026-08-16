@@ -19,32 +19,22 @@ export:
   call_provider
   stop_reason
   MAX_STOP_CONTINUATIONS
-  safe_tool
-  should_ask
   request_ask
-  permission_mode
-  SAFE_TOOLS
+  wants_ask
   step_limit
   step_limit_message
   MAX_STEPS
   MAX_STEPS_CAP
 
-def SAFE_TOOLS = ["read_file", "grep", "find", "ls"]
-
-fun safe_tool(name :: String) :: Boolean:
-  SAFE_TOOLS.contains(name)
-
-fun permission_mode(config) :: String:
-  let m = to_string(config.settings.get("permission_mode", "allow"))
-  if m == "ask" | "ask" | "allow"
-
-// Extension tool_call may force a prompt with {"ask": #true}.
-// Mode "ask" prompts for every non-read tool.
-fun should_ask(mode :: String, name :: String, verdict) :: Boolean:
+// tool_call may force a prompt with {"ask": #true}. Otherwise the
+// permission extension (or any host) may install state["should_ask"].
+fun wants_ask(registry, name :: String, verdict) :: Boolean:
   cond
   | verdict is_a Map && verdict.get("ask", #false): #true
-  | mode == "ask" && !safe_tool(name): #true
-  | ~else: #false
+  | ~else:
+      match registry.state.get("should_ask", #false)
+      | fn :: Function: fn(name, verdict)
+      | ~else: #false
 
 fun request_ask(registry, data :: Map) :: String:
   registry.state["pending_ask"] := data
@@ -297,7 +287,7 @@ fun run_turn(~config: config,
         cond
         | verdict is_a Map && verdict.get("block", #false):
             "blocked: " +& verdict.get("reason", "blocked by extension")
-        | should_ask(permission_mode(config), name, verdict):
+        | wants_ask(registry, name, verdict):
             let reason = (if verdict is_a Map | to_string(verdict.get("reason", "")) | "")
             let decision = request_ask(registry,
                                        { "toolName": name,

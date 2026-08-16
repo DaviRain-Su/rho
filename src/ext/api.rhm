@@ -111,6 +111,13 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
                        ~description: _description :: String = ""):
     flag(name)
 
+  // One line (or short paragraph) appended to the default system prompt.
+  // Cleared on /reload so extensions re-register from init.
+  method register_prompt_snippet(text :: String):
+    let cur = registry.state.get("prompt_snippets", [])
+    let cur = if cur is_a List | cur | []
+    registry.state["prompt_snippets"] := cur.add(text)
+
   // Custom transcript rendering for a tool (used by the TUI).
   // fn(phase, name, data) -> maybe(String); phase is "call" or "result".
   method register_renderer(~tool: tool :: String, ~fn: fn):

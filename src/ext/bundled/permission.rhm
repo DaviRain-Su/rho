@@ -1,0 +1,68 @@
+#lang rhombus
+
+// Tool permission policy. Kernel loop only honors {ask: true} and
+// state["should_ask"]; this extension owns ask-mode + SAFE_TOOLS.
+
+import:
+  "../../kernel/settings.rhm" as settings
+
+export:
+  init
+  SAFE_TOOLS
+  safe_tool
+  permission_mode
+  should_ask
+
+def SAFE_TOOLS = ["read_file", "grep", "find", "ls"]
+
+fun safe_tool(name :: String) :: Boolean:
+  SAFE_TOOLS.contains(name)
+
+fun permission_mode(config) :: String:
+  cond
+  | config == #false: "allow"
+  | ~else:
+      let m = to_string(config.settings.get("permission_mode", "allow"))
+      if m == "ask" | "ask" | "allow"
+
+fun should_ask(mode :: String, name :: String, verdict) :: Boolean:
+  cond
+  | verdict is_a Map && verdict.get("ask", #false): #true
+  | mode == "ask" && !safe_tool(name): #true
+  | ~else: #false
+
+fun set_mode(rho, mode :: String):
+  settings.set_global("permission_mode", mode)
+  match rho.current_config()
+  | cfg:
+      cfg.settings := cfg.settings ++ { "permission_mode": mode }
+  | ~else: #void
+  rho.notify("permission_mode = " +& mode)
+
+fun init(rho):
+  rho.state["should_ask"] := fun (name, verdict):
+    should_ask(permission_mode(rho.current_config()),
+               to_string(name),
+               verdict)
+  rho.register_command(
+    ~name: "permission",
+    ~description: "tool permission prompt: /permission [allow|ask]",
+    ~handler: fun (args):
+                let a = args.trim().foldcase()
+                cond
+                | a == "":
+                    rho.notify("permission_mode = "
+                                 +& permission_mode(rho.current_config())
+                                 +& "  (allow = run tools, ask = prompt for write/bash)")
+                | a == "allow" || a == "ask":
+                    set_mode(rho, a)
+                | ~else:
+                    rho.notify("usage: /permission [allow|ask]"))
+  rho.register_command(
+    ~name: "allow",
+    ~description: "run tools without prompting (alias of /permission allow)",
+    ~handler: fun (_args): set_mode(rho, "allow"))
+  rho.register_command(
+    ~name: "ask",
+    ~description: "prompt before write/bash tools (alias of /permission ask)",
+    ~handler: fun (_args): set_mode(rho, "ask"))

@@ -39,7 +39,7 @@ import:
   "style.rhm" open
   "pager.rhm" as pager
   "../kernel/sync.rkt" as sync
-  "../kernel/tasks.rhm" as tasks
+  "tasks.rhm" as tasks
 
 export:
   run_tui

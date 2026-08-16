@@ -45,7 +45,6 @@ import:
   "kernel/settings.rhm" as settings
   "kernel/trust.rhm" as trust
   "kernel/oauth.rhm" as oauth
-  "kernel/subagent.rhm" as subagent
   "kernel/crypto.rkt" as crypto
   "ai/models.rhm" as models
   "ai/modelsdev.rhm" as modelsdev
@@ -179,7 +178,7 @@ fun apply_settings():
   | ~else: #void
   registry.state["steering_mode"] := settings.get("steering_mode", "all")
   registry.state["followup_mode"] := settings.get("followup_mode", "all")
-  registry.state["max_agent_depth"] := settings.get("max_agent_depth", subagent.MAX_DEPTH)
+  registry.state["max_agent_depth"] := settings.get("max_agent_depth", 1)
 
 settings.reload(~include_project: trust.trust_status(cwd()) == #'trusted)
 apply_settings()
@@ -269,11 +268,6 @@ fun default_system_prompt() :: String:
     +& "  tool rho greet(name :: String, times :: Int = 1) ~desc \"Greet\":\n"
     +& "    \"Hello \" +& name\n"
     +& "which derives the JSON schema from the annotations (defaults become optional).\n"
-    +& "For isolated or parallelizable work, call the `agent` tool to run a nested "
-    +& "sub-agent with its own session; it returns a final text answer.\n"
-    +& "Track multi-step work with the `todo` tool. Ask the user with `question`. "
-    +& "Fetch public http(s) pages with `fetch`. `/plan` is read-only exploration; "
-    +& "write a numbered Plan: then `/plan execute` and mark steps with [DONE:n].\n"
     +& "Be concise. Prefer tools over guessing."
 
 // --skill / --prompt-template survive --no-skills / --no-prompt-templates
@@ -291,11 +285,24 @@ fun discover_prompts() :: List:
                    ~direct: opts.get("prompt_templates", []),
                    ~standard: !opts.get("no_prompts", #false))
 
+fun snippet_section() :: String:
+  match registry.state.get("prompt_snippets", [])
+  | bits :: List:
+      let lines:
+        for List (s in bits):
+          skip_when to_string(s).trim() == ""
+          to_string(s)
+      if lines == []
+      | ""
+      | "\n" +& String.join(lines, "\n") +& "\n"
+  | ~else: ""
+
 fun system_prompt() :: String:
   context.resolve_system_prompt(~default_prompt: default_system_prompt(),
                                 ~override_text: opts.get("system_prompt", #false),
                                 ~append_text: opts.get("append_system_prompt", #false),
                                 ~cwd: cwd())
+    +& snippet_section()
     +& context_section()
     +& skills.xml_section(discover_skills())
 
@@ -432,35 +439,6 @@ registry.register_command(
                           apply_settings()
                           apply_tool_filters()
                           api.notify(key +& " = " +& settings_value_str(key)))
-
-fun set_permission_mode(mode :: String):
-  settings.set_global("permission_mode", mode)
-  apply_settings()
-  api.notify("permission_mode = " +& mode)
-
-fun permission_cmd(args :: String):
-  let a = args.trim().foldcase()
-  cond
-  | a == "":
-      api.notify("permission_mode = " +& permission_mode(config)
-                   +& "  (allow = run tools, ask = prompt for write/bash)")
-  | a == "allow" || a == "ask":
-      set_permission_mode(a)
-  | ~else:
-      api.notify("usage: /permission [allow|ask]")
-
-registry.register_command(
-  ~name: "permission",
-  ~description: "tool permission prompt: /permission [allow|ask]",
-  ~handler: permission_cmd)
-registry.register_command(
-  ~name: "allow",
-  ~description: "run tools without prompting (alias of /permission allow)",
-  ~handler: fun (_args): set_permission_mode("allow"))
-registry.register_command(
-  ~name: "ask",
-  ~description: "prompt before write/bash tools (alias of /permission ask)",
-  ~handler: fun (_args): set_permission_mode("ask"))
 
 fun steps_cmd(args :: String):
   let a = args.trim()
@@ -1567,7 +1545,9 @@ fun tui_footer() :: String:
   let t = usage_totals()
   " " +& cwd() +& "  \u2502 " +& config.provider +& "/" +& config.model
     +& (if config.thinking | " \u00B7 think:" +& config.thinking | "")
-    +& (if permission_mode(config) == "ask" | " \u00B7 ask" | "")
+    +& (if to_string(config.settings.get("permission_mode", "allow")) == "ask"
+        | " \u00B7 ask"
+        | "")
     +& "  \u2502 tok " +& t["input"] +& "/" +& t["output"]
     +& " $" +& round2(t["cost"])
     +& (if session.name == "" | "" | "  \u2502 " +& session.name)

@@ -3,7 +3,7 @@
 import:
   "../src/ui/pager.rhm" as pager
   "../src/ui/tui.rhm" as tui
-  "../src/kernel/tasks.rhm" as tasks
+  "../src/ui/tasks.rhm" as tasks
 
 def mutable failures = 0
 fun check(label :: String, ok):

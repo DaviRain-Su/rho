@@ -102,6 +102,8 @@ fun fetch_url(url :: String, max_bytes :: Int) :: String:
           "error: " +& e.message
 
 fun init(rho):
+  rho.register_prompt_snippet(
+    "Fetch public http(s) pages with `fetch`.")
   rho.register_tool(
     ~name: "fetch",
     ~description: "Fetch a public http(s) URL and return text. HTML is stripped to readable text. Use for docs and pages, not for browser automation.",

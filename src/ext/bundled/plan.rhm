@@ -233,6 +233,9 @@ fun last_assistant(rho) :: String:
 
 fun init(rho):
   restore(rho)
+  rho.register_prompt_snippet(
+    "`/plan` is read-only exploration; write a numbered Plan: then `/plan execute` "
+      +& "and mark steps with [DONE:n].")
   when rho.flag("plan")
   | rho.state["plan_on"] := #true
     rho.state["plan_saved_tools"] := rho.get_active_tools()

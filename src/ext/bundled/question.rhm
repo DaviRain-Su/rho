@@ -40,6 +40,8 @@ fun ask(rho, prompt :: String, labels :: List) :: String:
       | ~else: to_string(choice)
 
 fun init(rho):
+  rho.register_prompt_snippet(
+    "Ask the user with `question`.")
   rho.register_tool(
     ~name: "question",
     ~description: "Ask the user a multiple-choice question and wait for the answer. Use when you need a decision before continuing.",

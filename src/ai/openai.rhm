@@ -103,7 +103,13 @@ fun stream_chat(~base_url: base_url :: String,
                  "messages": messages_payload(messages),
                  "stream": #true,
                  "stream_options": { "include_usage": #true } }
-    let base = (if thinking | base ++ { "reasoning_effort": thinking } | base)
+    let effort:
+      match thinking
+      | "minimal": "low"
+      | "xhigh": "high"
+      | "max": "high"
+      | ~else: thinking
+    let base = (if thinking | base ++ { "reasoning_effort": effort } | base)
     if tools == []
     | base
     | base ++ { "tools": tools_payload(tools) }

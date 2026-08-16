@@ -12,13 +12,65 @@ export:
   editor_line_spans
 
 def default_theme :: Map:
-  { "user": "cyan", "assistant": "default", "tool": "yellow",
+  { // --- Existing keys (kept) ---
+    "user": "cyan", "assistant": "default", "tool": "yellow",
     "tool_result": "brblack", "think": "brblack",
     "notify": "blue", "steer": "magenta", "subagent": "cyan",
     "error": "red", "shell": "green", "sep": "brblack",
     "footer_fg": "black", "footer_bg": "white", "prompt": "magenta",
     "md_head": "cyan", "md_code": "yellow", "md_quote": "brblack",
-    "md_bullet": "magenta" }
+    "md_bullet": "magenta",
+    // --- Core UI ---
+    "accent": "cyan",
+    "border": "brblack",
+    "border_accent": "cyan",
+    "border_muted": "brblack",
+    "success": "green",
+    "warning": "yellow",
+    "muted": "brblack",
+    "dim": "brblack",
+    "text": "default",
+    "thinking_text": "brblack",
+    // --- Backgrounds ---
+    "selected_bg": "cyan",
+    "scrollbar_thumb": "brblack",
+    "search_match_bg": "yellow",
+    "search_match_text": "black",
+    "user_message_bg": #false,
+    "user_message_text": "cyan",
+    "tool_pending_bg": #false,
+    "tool_success_bg": #false,
+    "tool_error_bg": #false,
+    "tool_title": "yellow",
+    "tool_output": "brblack",
+    // --- Markdown ---
+    "md_link": "cyan",
+    "md_link_url": "brblack",
+    "md_code_block": "yellow",
+    "md_code_block_border": "brblack",
+    "md_hr": "brblack",
+    "md_list_bullet": "magenta",
+    // --- Tool Diffs ---
+    "tool_diff_added": "green",
+    "tool_diff_removed": "red",
+    "tool_diff_context": "brblack",
+    // --- Syntax ---
+    "syntax_comment": "brblack",
+    "syntax_keyword": "magenta",
+    "syntax_function": "cyan",
+    "syntax_variable": "blue",
+    "syntax_string": "green",
+    "syntax_number": "yellow",
+    "syntax_type": "yellow",
+    "syntax_operator": "magenta",
+    "syntax_punctuation": "brblack",
+    // --- Thinking level borders ---
+    "thinking_off": "brblack",
+    "thinking_low": "blue",
+    "thinking_medium": "cyan",
+    "thinking_high": "magenta",
+    // --- Bash mode ---
+    "bash_mode": "green" }
 
 fun char_width(c :: Char) :: Int:
   let n = c.to_int()

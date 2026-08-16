@@ -11,6 +11,7 @@
 //   --tools <a,b>               only enable these tools
 //   --exclude-tools <a,b>       disable these tools
 //   --no-tools                  disable all tools
+//   --no-builtin-tools / -nbt   disable built-in tools (keep extension tools)
 //   --system-prompt <text>      replace the default system prompt
 //   --append-system-prompt <t>  append to the system prompt
 //   --no-context-files          skip AGENTS.md / CLAUDE.md discovery
@@ -90,6 +91,8 @@ fun parse_args() :: Map:
     | ["--tools", v, & more]: parse(more, acc ++ { "tools": split_list(v) })
     | ["--exclude-tools", v, & more]: parse(more, acc ++ { "exclude_tools": split_list(v) })
     | ["--no-tools", & more]: parse(more, acc ++ { "no_tools": #true })
+    | ["--no-builtin-tools", & more]: parse(more, acc ++ { "no_builtin_tools": #true })
+    | ["-nbt", & more]: parse(more, acc ++ { "no_builtin_tools": #true })
     | ["--system-prompt", v, & more]: parse(more, acc ++ { "system_prompt": v })
     | ["--append-system-prompt", v, & more]: parse(more, acc ++ { "append_system_prompt": v })
     | ["--no-context-files", & more]: parse(more, acc ++ { "no_context": #true })
@@ -299,6 +302,13 @@ fun apply_tool_filters():
   cond
   | opts.get("no_tools", #false):
       registry.set_tool_filter(~allow: [])
+  | opts.get("no_builtin_tools", #false):
+      let builtin_tools = ["read_file", "write_file", "edit_file",
+                           "bash", "grep", "find", "ls",
+                           "agent", "reload_extensions"]
+      let allow = opts.get("tools", #false)
+      registry.set_tool_filter(~allow: allow,
+                               ~deny: builtin_tools ++ opts.get("exclude_tools", []))
   | ~else:
       let allow = opts.get("tools", #false)
       let enabled = settings.get("default_tools", [])
@@ -1530,14 +1540,17 @@ registry.register_command(
                                +& " (Ctrl-P cycles)"))
 
 // Shift-Tab: cycle the thinking level
-def thinking_ring = [#false, "low", "medium", "high"]
+def thinking_ring = [#false, "minimal", "low", "medium", "high", "xhigh", "max"]
 
 // level -> description shown in the /thinking selector (pi-style)
 def thinking_level_desc :: Map:
   { "off": "no reasoning",
+    "minimal": "minimal reasoning (~1k tokens)",
     "low": "light reasoning (~4k tokens)",
     "medium": "moderate reasoning (~8k tokens)",
-    "high": "deep reasoning (~16k tokens)" }
+    "high": "deep reasoning (~16k tokens)",
+    "xhigh": "extra-deep reasoning (~32k tokens)",
+    "max": "maximum reasoning (~64k tokens)" }
 
 fun set_thinking(level :: String) :: String:
   cond
@@ -1551,7 +1564,7 @@ fun set_thinking(level :: String) :: String:
         registry.emit("thinking_level_select", { "level": level })
         "thinking: " +& level +& " (" +& thinking_level_desc[level] +& ")"
       | config.model +& " does not support thinking"
-  | ~else: "unknown level: " +& level +& " (off, low, medium, high)"
+  | ~else: "unknown level: " +& level +& " (off, minimal, low, medium, high, xhigh, max)"
 
 fun cycle_thinking() :: String:
   cond
@@ -1568,7 +1581,7 @@ fun cycle_thinking() :: String:
 
 registry.register_command(
   ~name: "thinking",
-  ~description: "reasoning effort: /thinking [off|low|medium|high] (chain of thought shows dim, Ctrl-T hides)",
+  ~description: "reasoning effort: /thinking [off|minimal|low|medium|high|xhigh|max] (chain of thought shows dim, Ctrl-T hides)",
   ~handler: fun (args):
               let level = args.trim()
               if level == ""
@@ -2074,7 +2087,7 @@ fun run_rpc():
             loop()
         | "get_available_thinking_levels":
             emit_json({ "type": "thinking_levels",
-                        "levels": ["off", "low", "medium", "high"],
+                        "levels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
                         "current": (if config.thinking | config.thinking | "off") })
             loop()
         | "set_follow_up_mode":

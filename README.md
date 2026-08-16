@@ -66,6 +66,18 @@ Built-in provider profiles (override or extend in `~/.rho/config.json`):
 | `openai-codex` | ChatGPT subscription (Codex) | `/login openai oauth` |
 | `openrouter` | OpenAI chat completions | `OPENROUTER_API_KEY` |
 | `ollama` | OpenAI chat completions | (none) |
+| `deepseek` | OpenAI chat completions | `DEEPSEEK_API_KEY` |
+| `mistral` | OpenAI chat completions | `MISTRAL_API_KEY` |
+| `groq` | OpenAI chat completions | `GROQ_API_KEY` |
+| `cerebras` | OpenAI chat completions | `CEREBRAS_API_KEY` |
+| `xai` | OpenAI chat completions | `XAI_API_KEY` |
+| `huggingface` | OpenAI chat completions | `HUGGINGFACE_API_KEY` |
+| `together` | OpenAI chat completions | `TOGETHER_API_KEY` |
+| `fireworks` | OpenAI chat completions | `FIREWORKS_API_KEY` |
+| `nvidia` | OpenAI chat completions | `NVIDIA_API_KEY` |
+| `minimax` | OpenAI chat completions | `MINIMAX_API_KEY` |
+| `qwen` | OpenAI chat completions | `QWEN_API_KEY` |
+| `zai` | OpenAI chat completions | `ZAI_API_KEY` |
 | `anthropic` | Anthropic messages | `ANTHROPIC_API_KEY` |
 
 `~/.rho/config.json` also takes `"settings"`: `reserve_tokens`,
@@ -108,6 +120,10 @@ history or cursor movement, PgUp/PgDn scrolls, Ctrl-C interrupts (or clears /
 quits), Esc interrupts, Ctrl-P cycles providers, Ctrl-D quits. `!cmd` runs a
 shell command; `!!cmd` also appends the output to the model context. Themes:
 `~/.rho/themes/<name>.json` + `--theme` (see `examples/themes/`).
+The built-in theme defines ~65 color tokens across core UI, backgrounds,
+markdown, tool diffs, syntax, thinking-level borders, and bash mode;
+theme JSON files may override any subset — missing keys fall back to
+the defaults in `src/ui/style.rhm`.
 
 While a turn runs you can keep typing: plain lines become steering messages
 injected after the current tool batch; `/follow <msg>` queues a follow-up

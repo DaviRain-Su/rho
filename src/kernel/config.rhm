@@ -261,6 +261,78 @@ def default_providers :: Map:
       "api_key_env": "",
       "default_model": "qwen3:8b"
     },
+    "deepseek": {
+      "kind": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "default_model": "deepseek-chat"
+    },
+    "mistral": {
+      "kind": "openai",
+      "base_url": "https://api.mistral.ai/v1",
+      "api_key_env": "MISTRAL_API_KEY",
+      "default_model": "mistral-large-latest"
+    },
+    "groq": {
+      "kind": "openai",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_env": "GROQ_API_KEY",
+      "default_model": "llama-4-scout-17b-16e-instruct"
+    },
+    "cerebras": {
+      "kind": "openai",
+      "base_url": "https://api.cerebras.ai/v1",
+      "api_key_env": "CEREBRAS_API_KEY",
+      "default_model": "llama-4-scout-17b-16e-instruct"
+    },
+    "xai": {
+      "kind": "openai",
+      "base_url": "https://api.x.ai/v1",
+      "api_key_env": "XAI_API_KEY",
+      "default_model": "grok-4"
+    },
+    "huggingface": {
+      "kind": "openai",
+      "base_url": "https://api-inference.huggingface.co/models",
+      "api_key_env": "HUGGINGFACE_API_KEY",
+      "default_model": "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    },
+    "together": {
+      "kind": "openai",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "default_model": "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    },
+    "fireworks": {
+      "kind": "openai",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "api_key_env": "FIREWORKS_API_KEY",
+      "default_model": "accounts/fireworks/models/llama4-scout-instruct-basic"
+    },
+    "nvidia": {
+      "kind": "openai",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "api_key_env": "NVIDIA_API_KEY",
+      "default_model": "meta/llama-4-scout-17b-16e-instruct"
+    },
+    "minimax": {
+      "kind": "openai",
+      "base_url": "https://api.minimaxi.chat/v1",
+      "api_key_env": "MINIMAX_API_KEY",
+      "default_model": "MiniMax-M2"
+    },
+    "qwen": {
+      "kind": "openai",
+      "base_url": "https://chat.qwen.ai/api/v1",
+      "api_key_env": "QWEN_API_KEY",
+      "default_model": "qwen-max"
+    },
+    "zai": {
+      "kind": "openai",
+      "base_url": "https://api.z.ai/api/v1",
+      "api_key_env": "ZAI_API_KEY",
+      "default_model": "glm-4.6"
+    },
     "anthropic": {
       "kind": "anthropic",
       "base_url": "https://api.anthropic.com",

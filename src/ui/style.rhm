@@ -1,0 +1,199 @@
+#lang rhombus
+
+// Shared TUI styling: markdown transcript spans, editor highlighting,
+// and width-aware wrap. Kept out of tui.rhm so tests don't need raart.
+
+export:
+  default_theme
+  char_width
+  display_width
+  wrap_spans
+  md_line_spans
+  editor_line_spans
+
+def default_theme :: Map:
+  { "user": "cyan", "assistant": "default", "tool": "yellow",
+    "tool_result": "brblack", "think": "brblack",
+    "notify": "blue", "steer": "magenta", "subagent": "cyan",
+    "error": "red", "shell": "green", "sep": "brblack",
+    "footer_fg": "black", "footer_bg": "white", "prompt": "magenta",
+    "md_head": "cyan", "md_code": "yellow", "md_quote": "brblack",
+    "md_bullet": "magenta" }
+
+fun char_width(c :: Char) :: Int:
+  let n = c.to_int()
+  if (n >= 0x1100 && n <= 0x115F)
+       || (n >= 0x2E80 && n <= 0xA4CF)
+       || (n >= 0xAC00 && n <= 0xD7A3)
+       || (n >= 0xF900 && n <= 0xFAFF)
+       || (n >= 0xFE30 && n <= 0xFE4F)
+       || (n >= 0xFF00 && n <= 0xFF60)
+       || (n >= 0xFFE0 && n <= 0xFFE6)
+       || (n >= 0x20000 && n <= 0x3FFFD)
+  | 2
+  | 1
+
+fun display_width(s :: String) :: Int:
+  for values(w = 0) (c in s):
+    w + char_width(c)
+
+fun wrap_spans(spans :: List, w :: Int) :: List:
+  recur go(pending = spans, cur :: List = [], cur_w = 0, acc :: List = []):
+    match pending
+    | []: acc.add(cur)
+    | [span, & rest]:
+        let [f, b, st, text0] = span
+        let text = to_string(text0)
+        let len = text.length()
+        let avail = w - cur_w
+        let cut:
+          recur scan(i = 0, tot = 0):
+            cond
+            | i >= len: i
+            | ~else:
+                let cw = char_width(text[i])
+                if tot + cw > avail | i | scan(i + 1, tot + cw)
+        cond
+        | cut >= len:
+            go(rest, cur.add([f, b, st, text]), cur_w + display_width(text), acc)
+        | cut == 0 && cur != []:
+            go(pending, [], 0, acc.add(cur))
+        | ~else:
+            let cut = math.max(1, cut)
+            go([[f, b, st, text.substring(cut ..)]] ++ rest, [], 0,
+               acc.add(cur.add([f, b, st, text.substring(0 .. cut)])))
+
+fun find_str(s :: String, sub :: String, from :: Int):
+  let n = s.length()
+  let m = sub.length()
+  recur go(i = from):
+    cond
+    | i + m > n: #false
+    | s.substring(i .. i + m) == sub: i
+    | ~else: go(i + 1)
+
+fun md_header_end(s :: String):
+  recur go(i = 0):
+    cond
+    | i < s.length() && i < 6 && s[i] == Char"#": go(i + 1)
+    | i > 0 && i < s.length() && s[i] == Char" ": i
+    | ~else: #false
+
+fun md_bullet_end(s :: String):
+  let n = s.length()
+  fun digit(c :: Char):
+    c.to_int() >= 48 && c.to_int() <= 57
+  recur sp(i = 0):
+    cond
+    | i < n && s[i] == Char" ": sp(i + 1)
+    | ~else:
+        cond
+        | i + 1 < n && (s[i] == Char"-" || s[i] == Char"*" || s[i] == Char"+")
+            && s[i + 1] == Char" ":
+            i + 2
+        | ~else:
+            recur dg(j = i):
+              cond
+              | j < n && digit(s[j]): dg(j + 1)
+              | j > i && j + 1 < n && s[j] == Char"." && s[j + 1] == Char" ":
+                  j + 2
+              | ~else: #false
+
+fun md_inline(s :: String, code_color) :: List:
+  recur go(rest = s, acc :: List = []):
+    cond
+    | rest == "":
+        if acc == [] | [[#false, #false, #false, ""]] | acc
+    | ~else:
+        let bt = find_str(rest, "`", 0)
+        let bd = find_str(rest, "**", 0)
+        cond
+        | bt is_a Int && (!(bd is_a Int) || bt < bd):
+            match find_str(rest, "`", bt + 1)
+            | j :: Int:
+                let acc2:
+                  if bt > 0
+                  | acc.add([#false, #false, #false, rest.substring(0 .. bt)])
+                  | acc
+                go(rest.substring(j + 1 ..),
+                   acc2.add([code_color, #false, #false, rest.substring(bt + 1 .. j)]))
+            | ~else: acc.add([#false, #false, #false, rest])
+        | bd is_a Int:
+            match find_str(rest, "**", bd + 2)
+            | j :: Int:
+                let acc2:
+                  if bd > 0
+                  | acc.add([#false, #false, #false, rest.substring(0 .. bd)])
+                  | acc
+                go(rest.substring(j + 2 ..),
+                   acc2.add([#false, #false, "bold", rest.substring(bd + 2 .. j)]))
+            | ~else: acc.add([#false, #false, #false, rest])
+        | ~else: acc.add([#false, #false, #false, rest])
+
+fun editor_inline(s :: String, tcolor) :: List:
+  recur go(rest = s, acc :: List = []):
+    cond
+    | rest == "":
+        if acc == [] | [[#false, #false, #false, ""]] | acc
+    | ~else:
+        let at = find_str(rest, "@", 0)
+        let bt = find_str(rest, "`", 0)
+        cond
+        | at is_a Int && (!(bt is_a Int) || at < bt):
+            let end:
+              recur scan(i = at + 1):
+                cond
+                | i >= rest.length(): i
+                | rest[i] == Char" " || rest[i] == Char"\t": i
+                | ~else: scan(i + 1)
+            let acc2:
+              if at > 0
+              | acc.add([#false, #false, #false, rest.substring(0 .. at)])
+              | acc
+            go(rest.substring(end ..),
+               acc2.add([tcolor("user"), #false, #false, rest.substring(at .. end)]))
+        | bt is_a Int:
+            match find_str(rest, "`", bt + 1)
+            | j :: Int:
+                let acc2:
+                  if bt > 0
+                  | acc.add([#false, #false, #false, rest.substring(0 .. bt)])
+                  | acc
+                go(rest.substring(j + 1 ..),
+                   acc2.add([tcolor("md_code"), #false, #false, rest.substring(bt + 1 .. j)]))
+            | ~else: acc.add([#false, #false, #false, rest])
+        | ~else: acc.add([#false, #false, #false, rest])
+
+fun editor_line_spans(text :: String, first_line, tcolor) :: List:
+  cond
+  | first_line && text.starts_with("!!"):
+      [[tcolor("shell"), #false, "bold", "!!"]]
+        ++ editor_inline(text.substring(2 ..), tcolor)
+  | first_line && text.starts_with("!"):
+      [[tcolor("shell"), #false, "bold", "!"]]
+        ++ editor_inline(text.substring(1 ..), tcolor)
+  | first_line && text.starts_with("/"):
+      let end:
+        recur go(i = 1):
+          cond
+          | i >= text.length(): i
+          | text[i] == Char" ": i
+          | ~else: go(i + 1)
+      [[tcolor("prompt"), #false, "bold", text.substring(0 .. end)]]
+        ++ editor_inline(text.substring(end ..), tcolor)
+  | ~else: editor_inline(text, tcolor)
+
+fun md_line_spans(text :: String, in_fence, tcolor) :: List:
+  let t = text.trim()
+  cond
+  | t.starts_with("```"): [[tcolor("sep"), #false, "dim", text]]
+  | in_fence: [[tcolor("md_code"), #false, #false, text]]
+  | md_header_end(text) is_a Int: [[tcolor("md_head"), #false, "bold", text]]
+  | t == "---" || t == "***" || t == "___": [[tcolor("sep"), #false, "dim", text]]
+  | t.starts_with(">"): [[tcolor("md_quote"), #false, "italic", text]]
+  | ~else:
+      match md_bullet_end(text)
+      | m :: Int:
+          [[tcolor("md_bullet"), #false, "bold", text.substring(0 .. m)]]
+            ++ md_inline(text.substring(m ..), tcolor("md_code"))
+      | ~else: md_inline(text, tcolor("md_code"))

@@ -42,4 +42,54 @@ when compaction.context_tokens(s) <= 0 | error("context_tokens broken")
 def s2 = start_session(~cwd: cwd, ~continue_latest: #true)
 when !(s2.messages()[0]["content"].contains("SUMMARY")) | error("compaction not persisted")
 
+// oversized single turn: cut inside the turn (not only at the user message)
+def s3 = start_session(~cwd: cwd +& "-big", ~no_session: #true)
+s3.append_message({ "role": "user", "content": "one question" })
+s3.append_message({ "role": "assistant", "content": "thinking " +& big(8000),
+                    "tool_calls": [{ "id": "c1", "name": "bash", "arguments": "{}" }] })
+s3.append_message({ "role": "tool", "tool_call_id": "c1", "content": "out " +& big(8000) })
+s3.append_message({ "role": "assistant", "content": "done " +& big(200) })
+def intra = compaction.find_cut_detail(s3, cfg)
+when !intra | error("expected intra-turn cut")
+when intra["id"] == 0 | error("intra-turn cut should not stay on the user message")
+when intra.get("keep_suffix", #false) is_a Int
+    && intra["id"] != 3
+| error("keep_suffix should land on the last oversized message")
+
+// single huge message: keep_suffix trims the kept tail
+def s4 = start_session(~cwd: cwd +& "-huge", ~no_session: #true)
+s4.append_message({ "role": "user", "content": "q " +& big(20000) })
+def huge = compaction.find_cut_detail(s4, cfg)
+when !(huge is_a Map) | error("expected keep_suffix cut for a single huge turn")
+when !(huge.get("keep_suffix", #false) is_a Int) | error("expected keep_suffix")
+s4.append("compaction", { "summary": "HEAD OF Q", "first_kept": huge["id"],
+                          "keep_suffix": 20 })
+def hm = s4.messages()
+when !(hm[0]["content"].contains("HEAD OF Q")) | error("huge summary missing")
+when hm[1]["content"].length() > 80 | error("keep_suffix not applied")
+when !hm[1]["content"].contains("earlier content summarized") | error("trim marker missing")
+
+// large → small switch: overflow is against the *target* window
+when !compaction.overflows_window(s, cfg, 1000) | error("expected overflow vs 1000-token window")
+when compaction.overflows_window(s, cfg, 1000000) | error("should fit a 1M window")
+when compaction.should_compact_for_switch(s, cfg, "unknown-model", "unknown-model")
+| error("same window should not compact-before-switch")
+when compaction.keep_for_window(cfg, 20000) != 2048
+| error("keep_for_window should clamp to 2048 when room is tiny")
+when compaction.keep_for_window(cfg, 100000) != 3000
+| error("keep_for_window should honor configured keep when it fits")
+
+def s5 = start_session(~cwd: cwd +& "-switch", ~no_session: #true)
+s5.append_message({ "role": "user", "content": "q" })
+s5.append_message({ "role": "assistant", "content": "a", "tool_calls": [],
+                    "usage": { "input": 200000, "output": 100 } })
+when !compaction.should_compact_for_switch(s5, cfg, "gpt-5.2", "unknown-model")
+| error("400k → 128k with 200k tokens should compact-before-switch")
+when compaction.should_compact_for_switch(s5, cfg, "unknown-model", "gpt-5.2")
+| error("small → large should not compact-before-switch")
+
+when compaction.estimate_tokens({ "role": "assistant", "content": "hi",
+                                  "tool_calls": [{ "arguments": { "command": "ls" } }] }) <= 0
+| error("estimate_tokens should accept map arguments")
+
 println("t_compaction OK")

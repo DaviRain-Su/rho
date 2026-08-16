@@ -1,0 +1,43 @@
+#lang rhombus
+
+import:
+  "../src/kernel/errors.rhm" as errors
+  "../src/kernel/crypto.rkt" as crypto
+  "../src/kernel/registry.rhm" as registry
+  lib("racket/file.rkt") as rktfile
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+check("object", errors.parse_json_map("{\"a\":1}", ~src: "t")["a"] == 1)
+check("invalid is empty", errors.parse_json_map("{", ~src: "t") == {})
+check("array is empty", errors.parse_json_map("[1]", ~src: "t") == {})
+check("missing file is empty", errors.read_json_map("/no/such/rho-json-test.json") == {})
+
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-json-~a"))
+filesystem.write_string(tmp, "{\"k\":\"v\"}", ~exists: #'truncate)
+check("read file", errors.read_json_map(tmp)["k"] == "v")
+filesystem.write_string(tmp, "not-json", ~exists: #'truncate)
+check("bad file is empty", errors.read_json_map(tmp) == {})
+
+def cmd = crypto.#{browser-argv}("https://example.com")
+check("browser argv",
+      cmd != #false && to_string(cmd).contains("https://example.com"))
+
+def reg = registry.make_registry()
+reg.register_tool(~name: "echo",
+                  ~description: "echo",
+                  ~schema: { "type": "object", "properties": {} },
+                  ~fn: fun (args): "ok")
+check("registry find", reg.find_tool("echo") && #true)
+check("registry list", reg.tool_list().length() == 1)
+reg.clear_extensions()
+check("builtin kept", reg.find_tool("echo") && #true)
+
+if failures == 0
+| println("t_errors OK")
+| error("errors tests failed: " +& failures)

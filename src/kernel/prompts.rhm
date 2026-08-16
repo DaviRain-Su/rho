@@ -6,6 +6,7 @@
 // arguments were given, they are appended.
 
 import:
+  lib("racket/base.rkt") as rkt
   "config.rhm"
   "frontmatter.rhm" as frontmatter
 
@@ -14,6 +15,7 @@ export:
   discover
   find_template
   expand
+  invalidate
 
 fun prompt_dirs(~cwd: cwd :: String, ~extra: extra :: List = [],
                 ~include_project: include_project = #true) :: List:
@@ -30,10 +32,46 @@ fun template_of(path :: String, name :: String) :: Map:
 
 // Returns list of {"name", "description", "argument_hint", "body"}.
 // ~direct entries are individual template .md files (--prompt-template).
+def mutable disc_key = ""
+def mutable disc_val = #false
+
+fun invalidate():
+  disc_key := ""
+  disc_val := #false
+
+fun path_stamp(p :: String) :: String:
+  cond
+  | filesystem.directory_exists(p):
+      p +& "@" +& rkt.#{file-or-directory-modify-seconds}(p) +& ":"
+        +& String.join((for List (f in filesystem.files(p)): to_string(f)), ",")
+  | filesystem.file_exists(p):
+      p +& "@" +& rkt.#{file-or-directory-modify-seconds}(p)
+  | ~else: p +& "@0"
+
 fun discover(~cwd: cwd :: String, ~extra: extra :: List = [],
              ~include_project: include_project = #true,
              ~direct: direct :: List = [],
              ~standard: standard = #true) :: List:
+  let dirs:
+    cond
+    | standard: prompt_dirs(~cwd: cwd, ~extra: extra, ~include_project: include_project)
+    | ~else: []
+  let key = cwd +& "|" +& to_string(include_project) +& "|" +& to_string(standard)
+    +& "|" +& String.join((for List (p in extra ++ direct ++ dirs): path_stamp(to_string(p))), ",")
+  cond
+  | disc_val is_a List && disc_key == key: disc_val
+  | ~else:
+      let items = discover_uncached(~cwd: cwd, ~extra: extra,
+                                    ~include_project: include_project,
+                                    ~direct: direct, ~standard: standard)
+      disc_key := key
+      disc_val := items
+      items
+
+fun discover_uncached(~cwd: cwd :: String, ~extra: extra :: List = [],
+                      ~include_project: include_project = #true,
+                      ~direct: direct :: List = [],
+                      ~standard: standard = #true) :: List:
   def seen = MutableMap()
   let direct_items:
     for List:

@@ -8,6 +8,7 @@
 import:
   json
   "config.rhm" as config
+  "errors.rhm" as errors
 
 export:
   reload
@@ -31,12 +32,7 @@ fun keybindings_path() :: String:
   config.config_dir() +& "/keybindings.json"
 
 fun read_json(path :: String) :: Map:
-  if filesystem.file_exists(path)
-  | let parsed = try:
-                   json.from_string(filesystem.read_string(path))
-                   ~catch _: {}
-    if parsed is_a Map | parsed | {}
-  | {}
+  errors.read_json_map(path)
 
 fun reload(~include_project: include_project = #true):
   global_map := read_json(global_path())
@@ -72,7 +68,10 @@ def known_keys :: Map:
     "reserve_tokens": ["compaction trigger reserve (default 16384)", "int"],
     "keep_recent_tokens": ["tokens kept after compaction (default 20000)", "int"],
     "auto_compaction": ["compact automatically near the context limit", "bool"],
+    "compact_on_model_switch": ["compact with the outgoing model when /model targets a smaller window", "bool"],
     "steering_mode": ["steering delivery", ["all", "one-at-a-time"]],
     "followup_mode": ["follow-up delivery", ["all", "one-at-a-time"]],
     "auto_retry": ["retry failed provider requests", "bool"],
-    "max_retries": ["max auto-retry attempts (default 3)", "int"] }
+    "max_retries": ["max auto-retry attempts (default 3)", "int"],
+    "max_agent_depth": ["nested sub-agent depth (default 1)", "int"],
+    "max_steps": ["agent loop step limit (default 40)", "int"] }

@@ -19,14 +19,24 @@ export:
   context_tokens
   needs_compaction
   find_cut
+  find_cut_detail
   compact
+  apply_keep_suffix
+  model_window
+  overflows_window
+  overflows_model
+  should_compact_for_switch
+  keep_for_window
+  keep_for_target
+  compact_to_fit
 
 fun estimate_tokens(m :: Map) :: Int:
   let content = m.get("content", "")
   let content_len = (if content is_a String | content.length() | 0)
   let tools_len:
     for values(n = 0) (tc in m.get("tool_calls", [])):
-      n + tc.get("arguments", "").length() + 20
+      let args = tc.get("arguments", "")
+      n + (if args is_a String | args.length() | to_string(args).length()) + 20
   math.exact(math.floor((content_len + tools_len) / 4)) + 8
 
 // Prefer the provider-reported usage of the newest assistant message;
@@ -48,9 +58,36 @@ fun reserve_tokens(config) :: Int:
 fun keep_recent_tokens(config) :: Int:
   config.settings.get("keep_recent_tokens", 20000)
 
+fun model_window(name :: String) :: Int:
+  models.model_info(name)["context_window"]
+
+fun overflows_window(session, config, window :: Int) :: Boolean:
+  let cap = window - reserve_tokens(config)
+  let cap = if cap < 2048 | 2048 | cap
+  context_tokens(session) > cap
+
+fun overflows_model(session, config, model :: String) :: Boolean:
+  model != "" && overflows_window(session, config, model_window(model))
+
 fun needs_compaction(session, config) :: Boolean:
-  let window = models.model_info(config.model)["context_window"]
-  context_tokens(session) > window - reserve_tokens(config)
+  overflows_model(session, config, to_string(config.model))
+
+// Large → small mid-session: compact with the outgoing model first.
+fun should_compact_for_switch(session, config,
+                              from_model :: String,
+                              to_model :: String) :: Boolean:
+  to_model != ""
+    && model_window(to_model) < model_window(from_model)
+    && overflows_model(session, config, to_model)
+
+fun keep_for_window(config, window :: Int) :: Int:
+  let configured = keep_recent_tokens(config)
+  let room = window - reserve_tokens(config) - 4096
+  let room = if room < 2048 | 2048 | room
+  if configured <= room | configured | room
+
+fun keep_for_target(config, target_model :: String) :: Int:
+  keep_for_window(config, model_window(target_model))
 
 // Message entries on the active path that the model currently sees
 // (i.e. after any previous compaction), oldest first.
@@ -64,34 +101,92 @@ fun visible_message_entries(session) :: List:
     skip_when path_list[i]["kind"] != "message"
     path_list[i]
 
-// Returns the id of the first entry to keep (a user message), or #false if
-// there is nothing worth compacting.
-fun find_cut(session, config) :: maybe(Int):
+fun tokens_from(entries :: List, start :: Int) :: Int:
+  for values(n = 0) (j in start .. entries.length()):
+    n + estimate_tokens(entries[j]["data"])
+
+// If the cut lands on a tool result, walk back to the assistant that
+// issued the matching tool_calls so a pair is never split.
+fun align_tool_group(entries :: List, idx :: Int) :: Int:
+  recur go(i = idx):
+    cond
+    | i <= 0: 0
+    | entries[i]["data"].get("role", "") == "tool": go(i - 1)
+    | ~else: i
+
+fun apply_keep_suffix(m :: Map, n :: Int) :: Map:
+  let content = to_string(m.get("content", ""))
+  if content.length() <= n
+  | m
+  | let marker = "[... earlier content summarized ...]\n"
+    m ++ { "content": marker +& content.substring(content.length() - n ..) }
+
+// Intra-turn split when the last user turn itself exceeds keep_recent.
+// Returns {"id", "keep_suffix"} where keep_suffix is #false or a char count.
+fun find_intra_turn(entries :: List, keep :: Int) :: maybe(Map):
+  let start_id:
+    for values(last_user = #false) (e in entries):
+      if e["data"].get("role", "") == "user" | e["id"] | last_user
+  cond
+  | !(start_id is_a Int): #false
+  | ~else:
+      let start_idx:
+        for values(found = 0) (i in 0 .. entries.length()):
+          if entries[i]["id"] == start_id | i | found
+      def mutable cut_idx = #false
+      for (i in start_idx .. entries.length()):
+        when cut_idx == #false && tokens_from(entries, i) <= keep
+        | cut_idx := i
+      cond
+      | cut_idx is_a Int && cut_idx > start_idx:
+          let aligned = align_tool_group(entries, cut_idx)
+          let idx = (if aligned > start_idx | aligned | cut_idx)
+          { "id": entries[idx]["id"], "keep_suffix": #false }
+      | ~else:
+          let last = entries[entries.length() - 1]
+          { "id": last["id"], "keep_suffix": keep * 4 }
+
+// {"id": first_kept, "keep_suffix": #false | Int}, or #false if nothing
+// is worth compacting.
+fun find_cut_detail(session, config, ~keep: keep_arg = #false) :: maybe(Map):
   let entries = visible_message_entries(session)
-  let keep = keep_recent_tokens(config)
-  // user-message indexes, and token total from each index to the end
+  let keep = if keep_arg is_a Int | keep_arg | keep_recent_tokens(config)
   def mutable best = #false
   for (i in 0 .. entries.length()):
     skip_when entries[i]["data"].get("role", "") != "user"
-    let tail_tokens:
-      for values(n = 0) (j in i .. entries.length()):
-        n + estimate_tokens(entries[j]["data"])
-    // earliest user message whose tail fits in keep_recent
-    when best == #false && tail_tokens <= keep
+    when best == #false && tokens_from(entries, i) <= keep
     | best := entries[i]["id"]
-  let cut:
-    if best == #false
-    | // single oversized turn: keep just the last turn and warn via caller
-      for values(last_user = #false) (e in entries):
-        if e["data"].get("role", "") == "user" | e["id"] | last_user
-    | best
-  // nothing before the cut -> no point compacting
-  let has_before:
-    for values(any = #false) (e in entries):
-      any || (cut is_a Int && e["id"] < cut)
-  has_before && cut
+  let detail:
+    if best is_a Int
+    | { "id": best, "keep_suffix": #false }
+    | find_intra_turn(entries, keep)
+  match detail
+  | #false: #false
+  | d :: Map:
+      let cut = d["id"]
+      let has_before:
+        for values(any = #false) (e in entries):
+          any || (cut is_a Int && e["id"] < cut)
+      if has_before || d.get("keep_suffix", #false) is_a Int
+      | d
+      | #false
 
-fun transcript_for_summary(session, first_kept :: Int) :: String:
+// Returns the id of the first entry to keep, or #false if there is
+// nothing worth compacting.
+fun find_cut(session, config, ~keep: keep_arg = #false) :: maybe(Int):
+  match find_cut_detail(session, config, ~keep: keep_arg)
+  | #false: #false
+  | d :: Map: d["id"]
+
+fun message_line(m :: Map) :: String:
+  let role = m.get("role", "?")
+  let tools:
+    for values(s = "") (tc in m.get("tool_calls", [])):
+      s +& "\n[tool_call " +& tc.get("name", "") +& " " +& tc.get("arguments", "") +& "]"
+  role +& ": " +& m.get("content", "") +& tools
+
+fun transcript_for_summary(session, first_kept :: Int,
+                           ~keep_suffix: keep_suffix = #false) :: String:
   let path_list = session.path_entries()
   // include the previous summary, if any, so context is not lost
   let prev_summary:
@@ -99,13 +194,17 @@ fun transcript_for_summary(session, first_kept :: Int) :: String:
       if e["kind"] == "compaction" | e["data"].get("summary", "") | found
   let parts:
     for List (e in path_list):
-      skip_when e["kind"] != "message" || e["id"] >= first_kept
+      skip_when e["kind"] != "message"
+      skip_when e["id"] > first_kept
+      skip_when e["id"] == first_kept && !(keep_suffix is_a Int)
       let m = e["data"]
-      let role = m.get("role", "?")
-      let tools:
-        for values(s = "") (tc in m.get("tool_calls", [])):
-          s +& "\n[tool_call " +& tc.get("name", "") +& " " +& tc.get("arguments", "") +& "]"
-      role +& ": " +& m.get("content", "") +& tools
+      if e["id"] == first_kept && keep_suffix is_a Int
+      | let content = to_string(m.get("content", ""))
+        let n = keep_suffix
+        if content.length() <= n
+        | message_line(m)
+        | message_line(m ++ { "content": content.substring(0 .. content.length() - n) })
+      | message_line(m)
   (if prev_summary == "" | "" | "Previous summary:\n" +& prev_summary +& "\n\n")
     +& String.join(parts, "\n\n")
 
@@ -120,12 +219,15 @@ def summary_system:
 // Returns a status string.
 fun compact(~session: session,
             ~config: config,
-            ~instructions: instructions :: String = "") :: String:
-  let cut = find_cut(session, config)
+            ~instructions: instructions :: String = "",
+            ~keep: keep_arg = #false) :: String:
+  let detail = find_cut_detail(session, config, ~keep: keep_arg)
   cond
-  | !cut: "nothing to compact"
+  | !detail: "nothing to compact"
   | ~else:
-      let transcript = transcript_for_summary(session, cut)
+      let cut = detail["id"]
+      let keep_suffix = detail.get("keep_suffix", #false)
+      let transcript = transcript_for_summary(session, cut, ~keep_suffix: keep_suffix)
       let prompt:
         (if instructions == "" | "" | "Extra instructions: " +& instructions +& "\n\n")
           +& "Summarize this conversation so far:\n\n" +& transcript
@@ -137,6 +239,32 @@ fun compact(~session: session,
       let summary = reply.get("content", "")
       if summary == ""
       | "compaction failed: empty summary"
-      | session.append("compaction", { "summary": summary, "first_kept": cut })
+      | let data = { "summary": summary, "first_kept": cut }
+        let data = (if keep_suffix is_a Int
+                    | data ++ { "keep_suffix": keep_suffix }
+                    | data)
+        session.append("compaction", data)
         "compacted: summarized everything before entry " +& cut
+          +& (if keep_suffix is_a Int | " (split oversized turn)" | "")
           +& " (" +& summary.length() +& " chars)"
+
+// Compact with the current (outgoing) model until the session fits
+// target_model's window, or until nothing more can be cut.
+fun compact_to_fit(~session: session,
+                   ~config: config,
+                   ~target_model: target_model :: String) :: String:
+  if !overflows_model(session, config, target_model)
+  | "already fits"
+  | let keep = keep_for_target(config, target_model)
+    recur go(n = 0, last = ""):
+      cond
+      | !overflows_model(session, config, target_model):
+          if last == "" | "already fits" | last
+      | n >= 3:
+          if last == "" | "nothing to compact" | last
+      | ~else:
+          let r = compact(~session: session, ~config: config, ~keep: keep)
+          cond
+          | r == "nothing to compact": r
+          | r.starts_with("compaction failed"): r
+          | ~else: go(n + 1, r)

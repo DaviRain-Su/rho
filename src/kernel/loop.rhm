@@ -7,7 +7,10 @@ import:
   lib("racket/base.rkt") as rkt
   "../ai/openai.rhm"
   "../ai/anthropic.rhm"
+  "../ai/codex.rhm" as codex
+  "../ai/modelsdev.rhm" as modelsdev
   "../ai/types.rhm" open
+  "oauth.rhm" as oauth
 
 export:
   run_turn
@@ -28,14 +31,17 @@ fun call_provider(config, messages, tools, on_text,
       do_call_provider(config, messages, tools, on_text, on_thinking, headers)
       ~catch e :: Exn.Fail:
         let transient:
-          e.message.contains("timed out") || e.message.contains("connection")
-            || e.message.contains("HTTP 429") || e.message.contains("HTTP 5")
+          (e.message.contains("timed out") || e.message.contains("connection")
+             || e.message.contains("HTTP 429") || e.message.contains("HTTP 5"))
+            && !e.message.contains("billing_not_active")
         if transient && n < retries
         | rkt.sleep(math.min(8, rkt.expt(2, n)))
           attempt(n + 1)
         | throw e
 
 fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: Map):
+  oauth.ensure_fresh(config)
+  let headers = headers ++ oauth.provider_headers(config)
   match config.kind()
   | "anthropic":
       anthropic.stream_chat(~base_url: config.base_url(),
@@ -48,15 +54,25 @@ fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: M
                             ~thinking: config.thinking,
                             ~extra_headers: headers)
   | ~else:
-      openai.stream_chat(~base_url: config.base_url(),
-                         ~api_key: config.api_key(),
-                         ~model: config.model,
-                         ~messages: messages,
-                         ~tools: tools,
-                         ~on_text: on_text,
-                         ~on_thinking: on_thinking,
-                         ~thinking: config.thinking,
-                         ~extra_headers: headers)
+      if oauth.is_chatgpt_oauth(config)
+      | codex.stream_responses(~base_url: oauth.chatgpt_codex_url,
+                               ~api_key: config.api_key(),
+                               ~model: modelsdev.codex_model_id(config.model),
+                               ~messages: messages,
+                               ~tools: tools,
+                               ~on_text: on_text,
+                               ~on_thinking: on_thinking,
+                               ~thinking: config.thinking,
+                               ~extra_headers: headers)
+      | openai.stream_chat(~base_url: config.base_url(),
+                           ~api_key: config.api_key(),
+                           ~model: config.model,
+                           ~messages: messages,
+                           ~tools: tools,
+                           ~on_text: on_text,
+                           ~on_thinking: on_thinking,
+                           ~thinking: config.thinking,
+                           ~extra_headers: headers)
 
 // Drain steering messages (sent to the current thread's mailbox by the REPL
 // while a turn runs) into the session. Returns #true if any arrived.
@@ -112,8 +128,10 @@ fun run_turn(~config: config,
   registry.emit("user_message", { "content": input })
   registry.emit("agent_start", { "input": input })
   recur step(n = 0):
-    when n >= MAX_STEPS
-    | error("agent loop exceeded " +& MAX_STEPS +& " steps")
+    let limit = config.settings.get("max_steps", MAX_STEPS)
+    let limit = if limit is_a Int && limit > 0 | limit | MAX_STEPS
+    when n >= limit
+    | error("agent loop exceeded " +& limit +& " steps")
     registry.emit("turn_start", { "step": n })
     let injected:
       match registry.emit("before_request", { "step": n })
@@ -148,15 +166,20 @@ fun run_turn(~config: config,
                                       registry.emit("thinking_update", { "delta": s })
                                       on_thinking(s),
                                   ~headers: extra_headers)
+    let assistant = openai.sanitize_assistant(assistant)
     registry.emit("message_end", { "message": assistant })
     session.append_message(assistant)
     let tool_calls = tool_calls_of(assistant)
     for (tc in tool_calls):
       let name = tc["name"]
-      let args = try:
-                   json.from_string(tc["arguments"])
-                   ~catch _: {}
-      let args = (if args is_a Map | args | {})
+      let parsed = try:
+                     json.from_string(to_string(tc.get("arguments", "")))
+                     ~catch _: #false
+      let args:
+        cond
+        | parsed is_a Map: parsed
+        | parsed is_a String && parsed != "": { "command": parsed }
+        | ~else: {}
       on_tool(name, args)
       let verdict = registry.emit("tool_call", { "toolName": name, "input": args })
       registry.emit("tool_execution_start", { "toolName": name, "input": args })

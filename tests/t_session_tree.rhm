@@ -4,6 +4,11 @@ import:
   lib("racket/file.rkt") as rktfile
   "../src/kernel/session.rhm" open
 
+when encode_cwd("/a/b") == encode_cwd("/a-b")
+| error("encode_cwd collision: /a/b and /a-b")
+when encode_cwd("/a/b") == encode_cwd_legacy("/a/b")
+| error("encode_cwd should not use the old dash join")
+
 def tmp = to_string(rktfile.#{make-temporary-file}("rho-sess-~a", #'directory))
 def cwd = (if tmp.substring(tmp.length() - 1 ..) == "/" | tmp.substring(0 .. tmp.length() - 1) | tmp)
 

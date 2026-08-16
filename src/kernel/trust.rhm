@@ -7,6 +7,7 @@
 import:
   json
   "config.rhm"
+  "errors.rhm" as errors
 
 export:
   trust_status
@@ -16,12 +17,7 @@ fun trust_path() :: String:
   config.config_dir() +& "/trust.json"
 
 fun read_trust() :: Map:
-  if filesystem.file_exists(trust_path())
-  | let parsed = try:
-                   json.from_string(filesystem.read_string(trust_path()))
-                   ~catch _: {}
-    if parsed is_a Map | parsed | {}
-  | {}
+  errors.read_json_map(trust_path())
 
 // #'trusted | #'untrusted | #'unknown
 fun trust_status(cwd :: String):

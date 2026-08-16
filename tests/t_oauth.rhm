@@ -1,0 +1,75 @@
+#lang rhombus
+
+// OAuth helpers: parse pasted codes/URLs, PKCE shape, provider profiles.
+
+import:
+  "../src/kernel/oauth.rhm" as oauth
+  "../src/kernel/config.rhm" as config
+  "../src/kernel/crypto.rkt" as crypto
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+def parsed_hash = oauth.parse_auth_input("abc123#state-xyz")
+check("hash code", parsed_hash["code"] == "abc123")
+check("hash state", parsed_hash["state"] == "state-xyz")
+
+def parsed_url = oauth.parse_auth_input(
+  "https://console.anthropic.com/oauth/code/callback?code=tok&state=st")
+check("url code", parsed_url["code"] == "tok")
+check("url state", parsed_url["state"] == "st")
+
+def parsed_bare = oauth.parse_auth_input("  onlycode  ")
+check("bare code", parsed_bare["code"] == "onlycode")
+check("bare state empty", parsed_bare["state"] == "")
+
+check("empty", oauth.parse_auth_input("")["code"] == "")
+
+def providers = config.load_config().providers
+check("anthropic oauth", oauth.supports_oauth("anthropic", providers))
+check("openai oauth aliases to openai-codex", oauth.supports_oauth("openai", providers))
+check("openai-codex oauth", oauth.supports_oauth("openai-codex", providers))
+check("canon openai", oauth.canon_oauth_provider("openai") == "openai-codex")
+check("kimi no oauth", !oauth.supports_oauth("kimi", providers))
+
+def o = oauth.oauth_profile("anthropic", providers)
+def url = oauth.authorize_url(o, "challenge", "state-1")
+check("auth url host", url.contains("claude.ai/oauth/authorize"))
+check("auth url client", url.contains("client_id="))
+check("auth url challenge", url.contains("code_challenge=challenge"))
+check("auth url s256", url.contains("code_challenge_method=S256"))
+
+def oo = oauth.oauth_profile("openai", providers)
+def ou = oauth.authorize_url(oo, "challenge", "state-1")
+check("openai simplified flow", ou.contains("codex_cli_simplified_flow=true"))
+check("openai originator", ou.contains("originator=codex_cli_rs"))
+check("openai orgs", ou.contains("id_token_add_organizations=true"))
+check("openai localhost redirect", ou.contains("localhost%3A1455"))
+
+def v = to_string(crypto.#{pkce-verifier}())
+def ch = to_string(crypto.#{pkce-challenge}(v))
+check("verifier len", v.length() >= 32)
+check("challenge len", ch.length() >= 32)
+check("verifier url-safe", !v.contains("+") && !v.contains("/") && !v.contains("="))
+
+def jwt = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOiB7ImNoYXRncHRfYWNjb3VudF9pZCI6ICJhY2N0LTEiLCAiY2hhdGdwdF9wbGFuX3R5cGUiOiAicGx1cyJ9fQ.x"
+check("jwt payload decodes",
+      to_string(crypto.#{jwt-payload}(jwt)).contains("acct-1"))
+check("account id from id_token",
+      oauth.chatgpt_account_id({ "id_token": jwt, "access_token": "x" }) == "acct-1")
+check("account id empty without jwt",
+      oauth.chatgpt_account_id({ "type": "oauth", "access_token": "not-a-jwt" }) == "")
+check("codex url",
+      oauth.chatgpt_codex_url.contains("chatgpt.com/backend-api/codex"))
+check("no pending oauth", !oauth.pending_oauth())
+check("complete without begin",
+      oauth.complete_oauth("anthropic", "code", providers)
+        .starts_with("no in-flight OAuth"))
+
+if failures == 0
+| println("t_oauth OK")
+| error("oauth tests failed: " +& failures)

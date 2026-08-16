@@ -1,0 +1,101 @@
+#lang rhombus
+
+// Codex / ChatGPT Responses payload shaping.
+
+import:
+  "../src/ai/codex.rhm" as codex
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+def items = codex.responses_input(
+  [{ "role": "system", "content": "be brief" },
+   { "role": "user", "content": "hi" },
+   { "role": "assistant", "content": "",
+     "tool_calls": [{ "id": "call_1", "name": "ls", "arguments": "{}" }] },
+   { "role": "tool", "tool_call_id": "call_1", "content": "a.txt" }])
+
+check("system becomes developer",
+      items[0]["role"] == "developer")
+check("user stays user",
+      items[1]["role"] == "user")
+check("tool call item",
+      items[2]["type"] == "function_call" && items[2]["call_id"] == "call_1")
+check("tool result item",
+      items[3]["type"] == "function_call_output" && items[3]["output"] == "a.txt")
+
+def tools = codex.tools_payload(
+  [{ "name": "ls", "description": "list", "schema": { "type": "object" } }])
+check("responses tool shape",
+      tools[0]["type"] == "function" && tools[0]["name"] == "ls"
+        && !tools[0].has_key("function"))
+
+def parsed = { "models":
+                 [{ "slug": "gpt-5.5", "visibility": "list" },
+                  { "slug": "gpt-5.3-codex-spark", "visibility": "list" },
+                  { "slug": "gpt-5.5-wm", "visibility": "list" },
+                  { "slug": "gpt-5.6", "visibility": "list" },
+                  { "slug": "hidden", "visibility": "hidden" }] }
+def ids = codex.parse_model_ids(parsed)
+check("parses 5.5", ids.contains("gpt-5.5"))
+check("parses spark", ids.contains("gpt-5.3-codex-spark"))
+check("drops wm slug", !ids.contains("gpt-5.5-wm"))
+check("drops bare gpt-5.6", !ids.contains("gpt-5.6"))
+check("drops hidden", !ids.contains("hidden"))
+
+def calls_done = codex.tool_calls_from_events(
+  [{ "type": "response.output_item.added",
+     "item": { "type": "function_call", "id": "fc_1", "call_id": "call_1",
+               "name": "bash", "arguments": "" } },
+   { "type": "response.output_item.done",
+     "item": { "type": "function_call", "id": "fc_1", "call_id": "call_1",
+               "name": "bash",
+               "arguments": { "command": "pwd" } } }])
+check("done arguments win over empty added",
+      calls_done.length() == 1
+        && calls_done[0]["name"] == "bash"
+        && calls_done[0]["arguments"].contains("pwd"))
+
+def calls_delta = codex.tool_calls_from_events(
+  [{ "type": "response.output_item.added",
+     "output_index": 0,
+     "item": { "type": "function_call", "id": "fc_2", "call_id": "call_2",
+               "name": "bash", "arguments": "" } },
+   { "type": "response.function_call_arguments.delta",
+     "item_id": "fc_2", "output_index": 0, "delta": "{\"com" },
+   { "type": "response.function_call_arguments.delta",
+     "item_id": "fc_2", "output_index": 0, "delta": "mand\":\"ls\"}" }])
+check("delta fragments join onto added name",
+      calls_delta.length() == 1
+        && calls_delta[0]["name"] == "bash"
+        && calls_delta[0]["arguments"].contains("ls"))
+
+def calls_mismatch = codex.tool_calls_from_events(
+  [{ "type": "response.output_item.added",
+     "item": { "type": "function_call", "id": "fc_3", "call_id": "call_3",
+               "name": "bash", "arguments": "" } },
+   { "type": "response.function_call_arguments.done",
+     "item_id": "fc_3", "call_id": "call_3",
+     "arguments": "{\"command\":\"echo hi\"}" }])
+check("done keyed by call_id merges with item id",
+      calls_mismatch.length() == 1
+        && calls_mismatch[0]["id"] == "call_3"
+        && calls_mismatch[0]["arguments"].contains("echo hi"))
+
+def calls_completed = codex.tool_calls_from_events(
+  [{ "type": "response.completed",
+     "response":
+       { "output":
+           [{ "type": "function_call", "id": "fc_4", "call_id": "call_4",
+              "name": "bash", "arguments": "{\"command\":\"uname\"}" }] } }])
+check("completed.output harvests function_call",
+      calls_completed.length() == 1
+        && calls_completed[0]["arguments"].contains("uname"))
+
+when failures > 0
+| error("t_codex: " +& failures +& " failed")
+println("t_codex ok")

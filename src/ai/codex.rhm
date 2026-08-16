@@ -1,0 +1,388 @@
+#lang rhombus
+
+// ChatGPT subscription (Codex OAuth) client.
+// ChatGPT tokens are not platform API keys: api.openai.com/v1/chat/completions
+// returns billing_not_active. Requests go to
+//   POST https://chatgpt.com/backend-api/codex/responses
+// with the OAuth bearer and chatgpt-account-id.
+
+import:
+  json
+  net/http
+  lib("racket/base.rkt") as rkt
+  "sse.rhm"
+  "../kernel/oauth.rhm" as oauth
+  "../kernel/sync.rkt" as sync
+
+export:
+  stream_responses
+  responses_input
+  tools_payload
+  live_models
+  parse_model_ids
+  refresh_models
+  refresh_models_async
+  tool_calls_from_events
+  args_json
+
+// Codex CLI filters the catalog by this query param. Newer versions
+// surface the 5.6 family (sol/terra/luna) as well as 5.3–5.5.
+def client_version = "0.144.1"
+
+def mutable live :: Map = {}
+def live_lock = sync.#{make-lock}()
+
+fun live_models() :: Map:
+  sync.#{with-lock}(live_lock, fun (): live)
+
+fun usable_slug(id :: String) :: Boolean:
+  let id = id.foldcase()
+  id != "" && !id.contains("-wm") && !id.contains("embedding")
+    && !id.starts_with("gpt-image") && id != "gpt-5.6"
+
+fun row_slug(row) :: String:
+  cond
+  | row is_a String: row
+  | row is_a Map:
+      let vis = to_string(row.get("visibility", "list"))
+      let ok_vis = vis == "" || vis == "list" || vis == "show"
+      let ok_api = row.get("supported_in_api", #true) != #false
+      if ok_vis && ok_api
+      | to_string(row.get("slug", row.get("id", "")))
+      | ""
+  | ~else: ""
+
+fun parse_model_ids(parsed) :: List:
+  let rows:
+    cond
+    | parsed is_a Map && parsed.get("models", #false) is_a List:
+        parsed["models"]
+    | parsed is_a Map && parsed.get("data", #false) is_a List:
+        parsed["data"]
+    | parsed is_a List: parsed
+    | ~else: []
+  for List (row in rows):
+    let id = row_slug(row)
+    skip_when !usable_slug(id)
+    id
+
+fun ids_to_map(ids :: List) :: Map:
+  for values(m = {}) (id in ids):
+    m ++ { id: {} }
+
+fun current_live() :: Map:
+  sync.#{with-lock}(live_lock, fun (): live)
+
+fun refresh_models(~api_key: api_key :: String,
+                   ~extra_headers: extra_headers :: Map = {}) :: Map:
+  if api_key == ""
+  | current_live()
+  | try:
+      let url = oauth.chatgpt_codex_url +& "/models?client_version=" +& client_version
+      let headers:
+        { "Accept-Encoding": "identity",
+          "Authorization": "Bearer " +& api_key }
+          ++ extra_headers
+      let resp = http.get(url,
+                          ~headers: headers,
+                          ~timeouts: http.Timeouts(~lease: 10, ~connect: 10,
+                                                   ~request: 20))
+      let text = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+      let status = resp.status_code
+      resp.close()
+      cond
+      | status < 200 || status >= 300: current_live()
+      | ~else:
+          let parsed = try:
+                         json.from_string(text)
+                         ~catch _: #false
+          let ids = parse_model_ids(parsed)
+          fun store_live():
+            when ids != []
+            | live := ids_to_map(ids)
+            live
+          sync.#{with-lock}(live_lock, store_live)
+      ~catch _:
+        current_live()
+
+fun refresh_models_async(~api_key: api_key :: String,
+                         ~extra_headers: extra_headers :: Map = {}):
+  rkt.thread(fun ():
+               refresh_models(~api_key: api_key, ~extra_headers: extra_headers)
+               #void)
+  #void
+
+fun tools_payload(tools :: List) :: List:
+  for List (t in tools):
+    { "type": "function",
+      "name": t["name"],
+      "description": t["description"],
+      "parameters": t["schema"] }
+
+fun text_parts(kind :: String, text :: String) :: List:
+  if text == ""
+  | []
+  | [{ "type": kind, "text": text }]
+
+fun message_items(m :: Map) :: List:
+  match m.get("role", "")
+  | "assistant":
+      let text = to_string(m.get("content", ""))
+      let shown:
+        if text == ""
+        | []
+        | [{ "role": "assistant",
+             "content": text_parts("output_text", text) }]
+      let calls:
+        for List (tc in m.get("tool_calls", [])):
+          { "type": "function_call",
+            "call_id": to_string(tc.get("id", "")),
+            "name": to_string(tc.get("name", "")),
+            "arguments": to_string(tc.get("arguments", "")) }
+      shown ++ calls
+  | "tool":
+      [{ "type": "function_call_output",
+         "call_id": to_string(m.get("tool_call_id", "")),
+         "output": to_string(m.get("content", "")) }]
+  | "system":
+      [{ "role": "developer",
+         "content": text_parts("input_text", to_string(m.get("content", ""))) }]
+  | role:
+      let imgs = m.get("images", [])
+      let text = [{ "type": "input_text", "text": to_string(m.get("content", "")) }]
+      let media:
+        if imgs is_a List
+        | for List (im in imgs):
+            { "type": "input_image",
+              "image_url": "data:" +& im.get("media_type", "image/png")
+                            +& ";base64," +& im.get("data", "") }
+        | []
+      [{ "role": role, "content": text ++ media }]
+
+fun responses_input(messages :: List) :: List:
+  for List:
+    each m in messages
+    each item in message_items(m)
+    item
+
+// Responses streams identify a call by item.id, call_id, item_id, and/or
+// output_index. Official Codex treats output_item.done.arguments as
+// authoritative; deltas alone are not enough (and may use a different key).
+fun args_json(v) :: String:
+  cond
+  | v is_a String: v
+  | v is_a Map: json.to_string(v)
+  | v is_a List: json.to_string(v)
+  | ~else: ""
+
+fun id_of(v) :: String:
+  cond
+  | v is_a String && v != "": v
+  | ~else: ""
+
+fun index_key(v) :: String:
+  cond
+  | v is_a String && v != "": "i:" +& v
+  | v == #false || v == #'null: ""
+  | ~else: "i:" +& to_string(v)
+
+fun event_keys(chunk :: Map, item) :: List:
+  let item = if item is_a Map | item | {}
+  for List (s in [id_of(item.get("id", "")),
+                  id_of(item.get("call_id", "")),
+                  id_of(chunk.get("item_id", "")),
+                  id_of(chunk.get("call_id", "")),
+                  index_key(chunk.get("output_index",
+                                      item.get("output_index", #false)))]):
+    skip_when s == ""
+    s
+
+fun find_call(acc, keys :: List):
+  for values(found = #false) (k in keys):
+    if found is_a Map | found | acc.get(k, #false)
+
+fun merge_keys(a :: List, b :: List) :: List:
+  let seen = MutableMap()
+  for List (k in a ++ b):
+    skip_when k == "" || seen.get(k, #false)
+    seen[k] := #true
+    k
+
+fun write_call(acc, keys :: List, rec :: Map):
+  for (k in keys):
+    acc[k] := rec
+  rec
+
+fun upsert_call(acc, keys :: List,
+                ~id: id :: String = "",
+                ~name: name :: String = "",
+                ~arguments: arguments :: String = "",
+                ~replace_args: replace_args = #false):
+  when keys != []
+  | let prev = find_call(acc, keys)
+    let prev = if prev is_a Map | prev | { "id": "", "name": "", "arguments": "", "keys": [] }
+    let all = merge_keys(keys, prev.get("keys", []))
+    let next_args:
+      cond
+      | replace_args && arguments != "": arguments
+      | replace_args: prev["arguments"]
+      | ~else: prev["arguments"] +& arguments
+    write_call(acc, all,
+               { "id": (if id != "" | id | (if prev["id"] != "" | prev["id"] | keys[0])),
+                 "name": (if name != "" | name | prev["name"]),
+                 "arguments": next_args,
+                 "keys": all })
+
+fun ingest_item(acc, item, ~replace_args: replace_args = #false,
+                ~chunk: chunk :: Map = {}):
+  when item is_a Map
+  | let itype = to_string(item.get("type", ""))
+    when itype == "function_call" || itype == "custom_tool_call"
+    | let keys = event_keys(chunk, item)
+      let raw = item.get("arguments", item.get("input", ""))
+      upsert_call(acc, keys,
+                  ~id: id_of(item.get("call_id", item.get("id", ""))),
+                  ~name: to_string(item.get("name", "")),
+                  ~arguments: args_json(raw),
+                  ~replace_args: replace_args)
+
+fun ingest_responses_event(acc, chunk :: Map, ~event: event = #false):
+  let typ = to_string(chunk.get("type", ""))
+  let typ = if typ != "" | typ | to_string(event || "")
+  cond
+  | typ == "response.output_item.added" || typ == "response.output_item.done":
+      ingest_item(acc, chunk.get("item", {}),
+                  ~replace_args: typ.ends_with(".done"),
+                  ~chunk: chunk)
+  | typ == "response.function_call_arguments.delta"
+      || typ == "response.custom_tool_call_input.delta":
+      upsert_call(acc, event_keys(chunk, {}),
+                  ~id: id_of(chunk.get("call_id", chunk.get("item_id", ""))),
+                  ~arguments: args_json(chunk.get("delta", "")))
+  | typ == "response.function_call_arguments.done"
+      || typ == "response.custom_tool_call_input.done":
+      let raw = chunk.get("arguments", chunk.get("input", chunk.get("delta", "")))
+      upsert_call(acc, event_keys(chunk, {}),
+                  ~id: id_of(chunk.get("call_id", chunk.get("item_id", ""))),
+                  ~arguments: args_json(raw),
+                  ~replace_args: #true)
+  | typ == "response.completed" || typ == "response.incomplete":
+      let r = chunk.get("response", {})
+      when r is_a Map
+      | let output = r.get("output", [])
+        when output is_a List
+        | for (item in output):
+            ingest_item(acc, item, ~replace_args: #true, ~chunk: chunk)
+  | ~else: #void
+
+fun tool_calls_from_acc(acc) :: List:
+  let seen = MutableMap()
+  for List (k in acc.keys().sort()):
+    let rec = acc[k]
+    let name = to_string(rec.get("name", ""))
+    skip_when name == ""
+    let uid = to_string(rec.get("id", ""))
+    let uid = if uid != "" | uid | k
+    skip_when seen.get(uid, #false)
+    seen[uid] := #true
+    { "id": uid,
+      "name": name,
+      "arguments": to_string(rec.get("arguments", "")) }
+
+fun tool_calls_from_events(events :: List) :: List:
+  let acc = MutableMap()
+  for (ev in events):
+    when ev is_a Map
+    | ingest_responses_event(acc, ev)
+  tool_calls_from_acc(acc)
+
+fun stream_responses(~base_url: base_url :: String,
+                     ~api_key: api_key :: String,
+                     ~model: model :: String,
+                     ~messages: messages :: List,
+                     ~tools: tools :: List = [],
+                     ~on_text: on_text = fun (s): #void,
+                     ~on_thinking: on_thinking = fun (s): #void,
+                     ~thinking: thinking :: maybe(String) = #false,
+                     ~extra_headers: extra_headers :: Map = {}) :: Map:
+  let body:
+    let base = { "model": model,
+                 "input": responses_input(messages),
+                 "stream": #true,
+                 "store": #false }
+    let base = (if thinking
+                | base ++ { "reasoning": { "effort": thinking, "summary": "auto" } }
+                | base)
+    if tools == []
+    | base
+    | base ++ { "tools": tools_payload(tools) }
+  let headers:
+    let base = { "Accept-Encoding": "identity" }
+    let base:
+      if api_key == ""
+      | base
+      | base ++ { "Authorization": "Bearer " +& api_key }
+    base ++ extra_headers
+  let url = (if base_url.ends_with("/")
+             | base_url.substring(0 .. base_url.length() - 1)
+             | base_url)
+              +& "/responses"
+  let resp = http.post(url,
+                       ~headers: headers,
+                       ~data: http.payload.json(body),
+                       ~stream: #true,
+                       ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))
+  when resp.status_code < 200 || resp.status_code >= 300
+  | let err_body = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+    resp.close()
+    error("codex: HTTP " +& resp.status_code +& ": " +& err_body)
+  def mutable content = ""
+  def mutable reasoning = ""
+  def mutable finish_reason = ""
+  def mutable usage :: Map = {}
+  def acc = MutableMap()
+  fun handle(event, data :: String):
+    when data != "[DONE]"
+    | let chunk = try:
+                    json.from_string(data)
+                    ~catch _: #false
+      when chunk is_a Map
+      | let typ = to_string(chunk.get("type", ""))
+        let typ = if typ != "" | typ | to_string(event || "")
+        cond
+        | typ == "response.output_text.delta" || typ == "response.text.delta":
+            let s = to_string(chunk.get("delta", ""))
+            when s != ""
+            | content := content +& s
+              on_text(s)
+        | typ.contains("reasoning") && typ.contains("delta"):
+            let s = to_string(chunk.get("delta", ""))
+            when s != ""
+            | reasoning := reasoning +& s
+              on_thinking(s)
+        | typ == "error" || typ == "response.failed":
+            let err = chunk.get("error", chunk.get("message", data))
+            error("codex: " +& (if err is_a String | err | json.to_string(err)))
+        | ~else:
+            ingest_responses_event(acc, chunk, ~event: event)
+            when typ == "response.completed" || typ == "response.incomplete"
+            | finish_reason := (if typ == "response.completed" | "stop" | "length")
+              let r = chunk.get("response", {})
+              when r is_a Map
+              | let u = r.get("usage", {})
+                when u is_a Map
+                | let details = u.get("input_tokens_details", {})
+                  usage := { "input": u.get("input_tokens", 0),
+                             "output": u.get("output_tokens", 0),
+                             "cache_read":
+                               if details is_a Map
+                               | details.get("cached_tokens", 0)
+                               | 0 }
+  try:
+    sse.each_event(resp.output(), handle)
+    let tool_calls = tool_calls_from_acc(acc)
+    let msg = { "role": "assistant", "content": content, "tool_calls": tool_calls,
+                "finish_reason": finish_reason, "usage": usage }
+    if reasoning == "" | msg | msg ++ { "thinking": reasoning }
+    ~finally:
+      resp.close()

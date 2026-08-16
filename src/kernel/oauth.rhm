@@ -1,0 +1,399 @@
+#lang rhombus
+
+// OAuth login (PKCE) for subscription providers.
+//
+// Anthropic (Claude Pro/Max): browser + paste the code (or redirect URL).
+// OpenAI Codex: browser + localhost callback (paste works as fallback).
+// Tokens land in ~/.rho/auth.json as either a bare key string or
+//   {"type":"oauth","access_token","refresh_token","expires_at",...}
+
+import:
+  json
+  net/http
+  lib("racket/base.rkt") as rkt
+  "crypto.rkt" as crypto
+  "config.rhm" as config
+  "sync.rkt" as sync
+
+export:
+  oauth_profile
+  supports_oauth
+  authorize_url
+  parse_auth_input
+  exchange_code
+  refresh_tokens
+  ensure_fresh
+  provider_headers
+  login_oauth
+  begin_oauth
+  complete_oauth
+  pending_oauth
+  open_browser
+  is_chatgpt_oauth
+  chatgpt_account_id
+  chatgpt_codex_url
+  canon_oauth_provider
+  chatgpt_access_token
+  chatgpt_headers
+
+fun canon_oauth_provider(provider :: String) :: String:
+  if provider == "openai" | "openai-codex" | provider
+
+fun oauth_profile(provider :: String, providers :: Map) :: maybe(Map):
+  let provider = canon_oauth_provider(provider)
+  let prof = providers.get(provider, {})
+  let o = (if prof is_a Map | prof.get("oauth", #false) | #false)
+  if o is_a Map | o | #false
+
+fun supports_oauth(provider :: String, providers :: Map) :: Boolean:
+  oauth_profile(provider, providers) is_a Map
+
+fun qparam(k :: String, v :: String) :: String:
+  crypto.#{url-encode}(k) +& "=" +& crypto.#{url-encode}(v)
+
+fun authorize_url(oauth :: Map, challenge :: String, state :: String) :: String:
+  let extra = oauth.get("extra_auth_params", {})
+  let pairs:
+    let base = [qparam("client_id", to_string(oauth.get("client_id", ""))),
+                qparam("response_type", "code"),
+                qparam("redirect_uri", to_string(oauth.get("redirect_uri", ""))),
+                qparam("scope", to_string(oauth.get("scope", ""))),
+                qparam("code_challenge", challenge),
+                qparam("code_challenge_method", "S256"),
+                qparam("state", state)]
+    if extra is_a Map
+    | for values(acc = base) ((k, v) in extra):
+        acc.add(qparam(to_string(k), to_string(v)))
+    | base
+  to_string(oauth.get("authorize_url", "")) +& "?" +& String.join(pairs, "&")
+
+// Accepts `code#state`, a redirect URL, or a bare code.
+fun parse_auth_input(raw :: String) :: Map:
+  let s = raw.trim()
+  cond
+  | s == "": { "code": "", "state": "" }
+  | s.contains("#") && !s.starts_with("http"):
+      let parts = s.split("#", ~trim: #false)
+      { "code": to_string(parts[0]).trim(),
+        "state": (if parts.length() > 1 | to_string(parts[1]).trim() | "") }
+  | s.contains("code="):
+      let qpos:
+        let hash = find_char(s, Char"#")
+        let qm = find_char(s, Char"?")
+        cond
+        | hash is_a Int && s.substring(hash + 1 ..).contains("code="): hash + 1
+        | qm is_a Int: qm + 1
+        | ~else: 0
+      let query = s.substring(qpos ..)
+      let amp = find_char(query, Char"#")
+      let query = (if amp is_a Int | query.substring(0 .. amp) | query)
+      { "code": query_val(query, "code"),
+        "state": query_val(query, "state") }
+  | ~else: { "code": s, "state": "" }
+
+fun find_char(s :: String, c :: Char):
+  for values(found = #false) (i in 0 .. s.length()):
+    found || (s[i] == c && i)
+
+fun query_val(query :: String, key :: String) :: String:
+  let prefix = key +& "="
+  for values(found = "") (part in query.split("&")):
+    let p = to_string(part)
+    if p.starts_with(prefix)
+    | url_decode(p.substring(prefix.length() ..))
+    | found
+
+fun hex_digit(c :: Char) :: Int:
+  let n = c.to_int()
+  cond
+  | n >= 48 && n <= 57: n - 48
+  | n >= 65 && n <= 70: n - 55
+  | n >= 97 && n <= 102: n - 87
+  | ~else: -1
+
+fun url_decode(s :: String) :: String:
+  recur go(rest = s, acc = ""):
+    cond
+    | rest == "": acc
+    | rest.starts_with("+"): go(rest.substring(1 ..), acc +& " ")
+    | rest.starts_with("%") && rest.length() >= 3:
+        let hi = hex_digit(rest[1])
+        let lo = hex_digit(rest[2])
+        if hi >= 0 && lo >= 0
+        | go(rest.substring(3 ..),
+             acc +& to_string(rkt.#{integer->char}(hi * 16 + lo)))
+        | go(rest.substring(1 ..), acc +& "%")
+    | ~else: go(rest.substring(1 ..), acc +& rest.substring(0 .. 1))
+
+fun form_body(fields :: Map) :: String:
+  String.join((for List ((k, v) in fields):
+                 qparam(to_string(k), to_string(v))),
+              "&")
+
+fun post_token(url :: String, fields :: Map) :: Map:
+  let body = form_body(fields)
+  let resp = http.post(url,
+                       ~headers: { "Content-Type": "application/x-www-form-urlencoded",
+                                   "Accept": "application/json" },
+                       ~data: body,
+                       ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 30))
+  let text = Bytes.utf8_string(resp.body(), Char"\uFFFD")
+  let status = resp.status_code
+  resp.close()
+  when status < 200 || status >= 300
+  | error("oauth token HTTP " +& status +& ": " +& text)
+  let parsed = try:
+                 json.from_string(text)
+                 ~catch _: #false
+  if parsed is_a Map | parsed | error("oauth token: bad JSON: " +& text)
+
+fun token_record(data :: Map, ~prev: prev :: Map = {}) :: Map:
+  let exp = data.get("expires_in", 0)
+  let exp_at:
+    if exp is_a Int && exp > 0
+    | rkt.#{current-seconds}() + exp - 60
+    | 0
+  let idt = to_string(data.get("id_token", prev.get("id_token", "")))
+  { "type": "oauth",
+    "access_token": to_string(data.get("access_token", "")),
+    "refresh_token": to_string(data.get("refresh_token",
+                                        prev.get("refresh_token", ""))),
+    "id_token": idt,
+    "expires_at": exp_at }
+
+fun jwt_claims(token :: String) :: Map:
+  let raw = crypto.#{jwt-payload}(token)
+  if raw
+  | try:
+      let parsed = json.from_string(to_string(raw))
+      if parsed is_a Map | parsed | {}
+      ~catch _: {}
+  | {}
+
+fun account_id_from_jwt(token :: String) :: String:
+  let claims = jwt_claims(token)
+  let auth = claims.get("https://api.openai.com/auth", {})
+  cond
+  | auth is_a Map && to_string(auth.get("chatgpt_account_id", "")) != "":
+      to_string(auth.get("chatgpt_account_id", ""))
+  | to_string(claims.get("chatgpt_account_id", "")) != "":
+      to_string(claims.get("chatgpt_account_id", ""))
+  | ~else: ""
+
+fun chatgpt_account_id(rec) :: String:
+  match rec
+  | m :: Map:
+      let from_id = account_id_from_jwt(to_string(m.get("id_token", "")))
+      if from_id != ""
+      | from_id
+      | account_id_from_jwt(to_string(m.get("access_token", "")))
+  | ~else: ""
+
+def chatgpt_codex_url = "https://chatgpt.com/backend-api/codex"
+
+fun chatgpt_auth_record():
+  let rec = config.auth_record("openai-codex")
+  if rec is_a Map | rec | config.auth_record("openai")
+
+fun chatgpt_access_token() :: String:
+  match chatgpt_auth_record()
+  | m :: Map: to_string(m.get("access_token", ""))
+  | k :: String: k
+  | ~else: ""
+
+fun chatgpt_headers() :: Map:
+  match chatgpt_auth_record()
+  | m :: Map:
+      let acct = chatgpt_account_id(m)
+      let h = { "originator": "codex_cli_rs",
+                "OpenAI-Beta": "responses=v1" }
+      if acct == ""
+      | h
+      | h ++ { "chatgpt-account-id": acct }
+  | ~else: {}
+
+fun is_chatgpt_oauth(cfg) :: Boolean:
+  let p = to_string(cfg.provider)
+  let rec = chatgpt_auth_record()
+  rec is_a Map && rec.get("type", "") == "oauth"
+    && (p == "openai-codex" || p == "openai")
+
+fun exchange_code(oauth :: Map, code :: String, verifier :: String,
+                  ~state: state :: String = "") :: Map:
+  let fields = { "grant_type": "authorization_code",
+                 "client_id": to_string(oauth.get("client_id", "")),
+                 "code": code,
+                 "redirect_uri": to_string(oauth.get("redirect_uri", "")),
+                 "code_verifier": verifier }
+  let fields = (if state == "" | fields | fields ++ { "state": state })
+  token_record(post_token(to_string(oauth.get("token_url", "")), fields))
+
+fun refresh_tokens(oauth :: Map, refresh :: String) :: Map:
+  token_record(post_token(to_string(oauth.get("token_url", "")),
+                          { "grant_type": "refresh_token",
+                            "client_id": to_string(oauth.get("client_id", "")),
+                            "refresh_token": refresh }))
+
+fun open_browser(url :: String) :: Boolean:
+  crypto.#{open-browser}(url) == #true
+
+fun ensure_fresh(cfg) :: Boolean:
+  let store = canon_oauth_provider(to_string(cfg.provider))
+  let rec = (if store == "openai-codex" | chatgpt_auth_record() | config.auth_record(cfg.provider))
+  match rec
+  | m :: Map:
+      cond
+      | m.get("type", "") != "oauth": #false
+      | ~else:
+          let exp = m.get("expires_at", 0)
+          let refresh = to_string(m.get("refresh_token", ""))
+          let oauth = oauth_profile(store, cfg.providers)
+          cond
+          | !(exp is_a Int) || exp <= 0: #false
+          | exp > rkt.#{current-seconds}() + 30: #false
+          | refresh == "" || !(oauth is_a Map): #false
+          | ~else:
+              try:
+                let next = refresh_tokens(oauth, refresh)
+                let next = (if to_string(next.get("refresh_token", "")) == ""
+                            | next ++ { "refresh_token": refresh }
+                            | next)
+                let next = (if to_string(next.get("id_token", "")) == ""
+                            | next ++ { "id_token": to_string(m.get("id_token", "")) }
+                            | next)
+                config.auth_set_record(store, next)
+                #true
+                ~catch _: #false
+  | ~else: #false
+
+fun provider_headers(cfg) :: Map:
+  let p = to_string(cfg.provider)
+  let rec = (if p == "openai" || p == "openai-codex"
+             | chatgpt_auth_record()
+             | config.auth_record(cfg.provider))
+  match rec
+  | m :: Map:
+      cond
+      | m.get("type", "") == "oauth" && cfg.kind() == "anthropic":
+          { "Authorization": "Bearer " +& to_string(m.get("access_token", "")),
+            "anthropic-beta": "oauth-2025-04-20" }
+      | m.get("type", "") == "oauth" && (p == "openai" || p == "openai-codex"):
+          let acct = chatgpt_account_id(m)
+          let h = { "originator": "codex_cli_rs",
+                    "OpenAI-Beta": "responses=v1" }
+          if acct == ""
+          | h
+          | h ++ { "chatgpt-account-id": acct }
+      | ~else: {}
+  | ~else: {}
+
+// In-flight PKCE login. TUI commands run on the render thread, so we never
+// block on read-line or the localhost callback there. The callback thread
+// and `/login ... oauth <code>` both touch `pending`.
+def mutable pending = #false
+def pending_lock = sync.#{make-lock}()
+
+fun with_pending(fn):
+  sync.#{with-lock}(pending_lock, fn)
+
+fun pending_oauth():
+  with_pending(fun (): pending)
+
+fun finish_locked(provider :: String, oauth :: Map, verifier :: String,
+                  parsed :: Map) :: String:
+  let code = to_string(parsed.get("code", ""))
+  let state = to_string(parsed.get("state", ""))
+  match pending
+  | m :: Map:
+      cond
+      | to_string(m.get("verifier", "")) != verifier:
+          "oauth already completed"
+      | code == "": "cancelled (empty code)"
+      | state != "" && state != verifier: "oauth state mismatch"
+      | ~else:
+          let rec = exchange_code(oauth, code, verifier,
+                                  ~state: (if state == "" | verifier | state))
+          when to_string(rec.get("access_token", "")) == ""
+          | error("oauth: empty access_token")
+          pending := #false
+          let store = canon_oauth_provider(provider)
+          config.auth_set_record(store, rec)
+          "saved OAuth tokens for " +& store +& " in ~/.rho/auth.json"
+  | ~else: "no in-flight OAuth"
+
+fun finish_with(provider :: String, oauth :: Map, verifier :: String,
+                parsed :: Map) :: String:
+  with_pending(fun (): finish_locked(provider, oauth, verifier, parsed))
+
+// Start PKCE, open the browser, return immediately. Localhost callback
+// (OpenAI) is waited on a background thread. Paste the code later with
+// complete_oauth / `/login <provider> oauth <code>`.
+fun begin_oauth(provider :: String, providers :: Map,
+                ~notify: notify = fun (s): #void) :: String:
+  let provider = canon_oauth_provider(provider)
+  let oauth = oauth_profile(provider, providers)
+  cond
+  | !(oauth is_a Map):
+      "no OAuth profile for " +& provider
+  | ~else:
+      let verifier = to_string(crypto.#{pkce-verifier}())
+      let challenge = to_string(crypto.#{pkce-challenge}(verifier))
+      let url = authorize_url(oauth, challenge, verifier)
+      fun store_pending():
+        pending := { "provider": provider, "verifier": verifier, "oauth": oauth }
+        #void
+      with_pending(store_pending)
+      notify("opening browser for " +& provider +& " login")
+      notify(url)
+      when !open_browser(url)
+      | notify("could not open a browser; open the URL above")
+      let mode = to_string(oauth.get("mode", "paste"))
+      when mode == "localhost"
+      | let port = oauth.get("callback_port", 1455)
+        notify("waiting in the background on localhost:" +& port)
+        notify("after you approve, the browser should jump to localhost:" +& port)
+        rkt.thread(fun ():
+                     try:
+                       let waited = crypto.#{oauth-wait-code}(port, 180)
+                       match waited
+                       | [code, state]:
+                           let msg = finish_with(provider, oauth, verifier,
+                                                 { "code": to_string(code),
+                                                   "state": to_string(state) })
+                           notify(msg)
+                       | ~else:
+                           notify("oauth callback timed out; if the address bar has localhost:"
+                                    +& port +& "/auth/callback, paste: /login "
+                                    +& provider +& " oauth <that-url>")
+                       ~catch e :: Exn.Fail:
+                         notify("oauth callback failed: " +& e.message
+                                  +& " (is port " +& port +& " already in use?)"))
+      "approve in the browser; success is: saved OAuth tokens for "
+        +& provider
+
+fun complete_oauth(provider :: String, raw :: String, providers :: Map) :: String:
+  let provider = canon_oauth_provider(provider)
+  let oauth = oauth_profile(provider, providers)
+  let snap = pending_oauth()
+  match snap
+  | m :: Map:
+      let pending_p = canon_oauth_provider(to_string(m.get("provider", "")))
+      cond
+      | pending_p != provider:
+          "in-flight login is for " +& pending_p
+            +& "; /login " +& pending_p +& " oauth <code>"
+      | ~else:
+          finish_with(provider, m["oauth"], to_string(m["verifier"]),
+                      parse_auth_input(raw))
+  | ~else:
+      "no in-flight OAuth; run /login " +& provider +& " oauth first"
+
+// Blocking helper kept for non-TUI callers. Prefer begin_oauth + complete_oauth.
+fun login_oauth(provider :: String, providers :: Map,
+                ~prompt: prompt,
+                ~notify: notify = fun (s): #void) :: String:
+  let hint = begin_oauth(provider, providers, ~notify: notify)
+  let raw = to_string(prompt("authorization code (or redirect URL):"))
+  if raw.trim() == ""
+  | hint
+  | complete_oauth(provider, raw, providers)

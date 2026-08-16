@@ -43,8 +43,12 @@ import:
   "kernel/packages.rhm" as packages
   "kernel/settings.rhm" as settings
   "kernel/trust.rhm" as trust
+  "kernel/oauth.rhm" as oauth
+  "kernel/subagent.rhm" as subagent
+  "kernel/crypto.rkt" as crypto
   "ai/models.rhm" as models
   "ai/modelsdev.rhm" as modelsdev
+  "ai/codex.rhm" as codex
   rhombus/envvar
   "tools/core.rhm" open
   "ext/api.rhm" open
@@ -170,6 +174,7 @@ fun apply_settings():
   | ~else: #void
   registry.state["steering_mode"] := settings.get("steering_mode", "all")
   registry.state["followup_mode"] := settings.get("followup_mode", "all")
+  registry.state["max_agent_depth"] := settings.get("max_agent_depth", subagent.MAX_DEPTH)
 
 settings.reload(~include_project: trust.trust_status(cwd()) == #'trusted)
 apply_settings()
@@ -259,6 +264,8 @@ fun default_system_prompt() :: String:
     +& "  tool rho greet(name :: String, times :: Int = 1) ~desc \"Greet\":\n"
     +& "    \"Hello \" +& name\n"
     +& "which derives the JSON schema from the annotations (defaults become optional).\n"
+    +& "For isolated or parallelizable work, call the `agent` tool to run a nested "
+    +& "sub-agent with its own session; it returns a final text answer.\n"
     +& "Be concise. Prefer tools over guessing."
 
 // --skill / --prompt-template survive --no-skills / --no-prompt-templates
@@ -397,41 +404,50 @@ registry.register_command(
 registry.register_command(
   ~name: "reload", ~description: "hot-reload extensions (picks up changed files)",
   ~handler: fun (_args): do_reload())
-// ---- model availability (pi-ai style: models.dev catalog + env API keys) ----
+// ---- model availability (models.dev catalog + env key or /login auth) ----
 
 // rho provider name -> models.dev catalog id for its model list
 def modelsdev_alias :: Map:
-  { "kimi": "moonshotai", "kimi-anthropic": "moonshotai" }
+  { "kimi": "kimi-for-coding", "kimi-anthropic": "kimi-for-coding" }
 
-fun env_ok(env_name :: String) :: Boolean:
-  env_name == ""
-    || (block:
-          let v = envvar.getenv(env_name)
-          v is_a String && v != "")
+fun filter_listed(pname :: String, mdls :: Map) :: Map:
+  for values(m = {}) ((mid, info) in mdls):
+    if modelsdev.listed_model(pname, to_string(mid)) | m ++ { mid: info } | m
 
-// [provider_name, models_map] for every provider usable right now:
-// configured rho providers with their key set, plus models.dev providers
-// (supported protocol + env key present) not shadowed by a configured one.
+// [provider_name, models_map] for every provider usable right now.
+// Built-ins with credentials, minus protocol aliases (kimi-anthropic).
+// Catalog extras only when the env uniquely identifies them, or a shared
+// env has an explicit preferred product (OPENCODE_API_KEY → opencode-go).
 fun available_provider_groups() :: List:
   let cat = modelsdev.catalog()
   let configured:
     for List:
       each pname in config.providers.keys().sort()
       let prof = config.providers[pname]
-      skip_when !env_ok(to_string(prof.get("api_key_env", "")))
+      let pname = to_string(pname)
+      skip_when modelsdev.hidden_builtin(pname) && config.provider != pname
+      skip_when !credentials_ok(pname, to_string(prof.get("api_key_env", "")))
       let src = modelsdev_alias.get(pname, pname)
+      let p = cat.get(src, #false)
+      let ms = (if p is_a Map | p.get("models", {}) | {})
+      let mdls = filter_listed(
+                   pname,
+                   modelsdev.merge_model_maps(
+                     modelsdev.merge_model_maps(
+                       if ms is_a Map | ms | {},
+                       modelsdev.fallback_models(pname)),
+                     if pname == "openai-codex" | codex.live_models() | {}))
       let mdls:
-        let p = cat.get(src, #false)
-        let ms = (if p is_a Map | p.get("models", {}) | {})
-        if ms is_a Map && ms.keys().length() > 0
-        | ms
+        if mdls.keys().length() > 0
+        | mdls
         | { to_string(prof.get("default_model", "")): {} }
-      [to_string(pname), mdls]
+      [pname, mdls]
   let dev_only:
     for List:
       each entry in modelsdev.available_providers()
       let [id, _prof, mdls] = entry
       skip_when config.providers.get(id, #false)
+      skip_when modelsdev.catalog_suppressed(id)
       skip_when mdls.keys().length() == 0
       [id, mdls]
   configured ++ dev_only
@@ -473,40 +489,141 @@ fun clamp_thinking() :: String:
 // Switch model, optionally crossing providers ("provider/model").
 // Unknown models.dev providers with a supported protocol are registered
 // into the live config on the fly.
-fun set_model(arg :: String) :: String:
+fun apply_set_model(arg :: String) :: String:
   let slash:
     for values(found = #false) (i in 0 .. arg.length()):
       found || (arg[i] == Char"/" && i)
-  let msg:
-    cond
-    | slash is_a Int:
-        let p = arg.substring(0 .. slash)
-        let m = arg.substring(slash + 1 ..)
-        cond
-        | config.providers.get(p, #false):
-            config.provider := p
-            config.model := m
-            "provider=" +& p +& " model=" +& m
-        | ~else:
-            let entry = modelsdev.catalog().get(p, #false)
-            let prof = (if entry is_a Map | modelsdev.provider_profile(entry) | #false)
-            cond
-            | prof is_a Map:
-                config.register_provider(p, prof)
-                config.provider := p
-                config.model := m
-                "provider=" +& p +& " model=" +& m
-            | ~else:
-                // the model id itself contains "/" (e.g. openrouter ids)
-                config.model := arg
-                "model set to " +& arg
-    | ~else:
-        config.model := arg
-        "model set to " +& arg
-  msg +& clamp_thinking()
+  cond
+  | slash is_a Int:
+      let p = arg.substring(0 .. slash)
+      let m = arg.substring(slash + 1 ..)
+      let chatgpt = has_chatgpt_auth()
+      let p = (if chatgpt && (p == "openai" || p == "openai-codex")
+               | "openai-codex"
+               | p)
+      let m = (if p == "openai-codex" | modelsdev.codex_model_id(m) | m)
+      cond
+      | config.providers.get(p, #false):
+          config.provider := p
+          config.model := m
+          "provider=" +& p +& " model=" +& m
+      | ~else:
+          let entry = modelsdev.catalog().get(p, #false)
+          let prof = (if entry is_a Map | modelsdev.provider_profile(entry) | #false)
+          cond
+          | prof is_a Map:
+              config.register_provider(p, prof)
+              config.provider := p
+              config.model := m
+              "provider=" +& p +& " model=" +& m
+          | ~else:
+              // the model id itself contains "/" (e.g. openrouter ids)
+              config.model := arg
+              "model set to " +& arg
+  | ~else:
+      if has_chatgpt_auth() && (config.provider == "openai" || config.provider == "openai-codex"
+                                 || arg.starts_with("gpt-5"))
+      | config.provider := "openai-codex"
+        config.model := modelsdev.codex_model_id(arg)
+        "provider=openai-codex model=" +& config.model
+      | block:
+          config.model := arg
+          "model set to " +& arg
+
+// Ctrl-P may land on a smaller window without compacting; the next turn
+// summarizes with this outgoing model first.
+def mutable pending_fit = #false
+
+fun compact_on_switch() :: Boolean:
+  config.settings.get("compact_on_model_switch", #true) != #false
+
+fun better_fit_source(old_p :: String, old_m :: String):
+  match pending_fit
+  | src :: Map:
+      if compaction.model_window(to_string(src.get("model", "")))
+           > compaction.model_window(old_m)
+      | src
+      | { "provider": old_p, "model": old_m }
+  | ~else: { "provider": old_p, "model": old_m }
+
+fun finish_model_switch(old_p :: String, old_m :: String, old_t, msg :: String,
+                        ~compact: do_compact = #true) :: String:
+  let new_p = config.provider
+  let new_m = to_string(config.model)
+  let overflow = compaction.overflows_model(session, config, new_m)
+  let needed = compact_on_switch()
+    && compaction.should_compact_for_switch(session, config, old_m, new_m)
+  cond
+  | needed && do_compact:
+      let src = better_fit_source(old_p, old_m)
+      config.provider := to_string(src["provider"])
+      config.model := to_string(src["model"])
+      config.thinking := old_t
+      api.notify("context exceeds " +& new_m +& " window; compacting with "
+                   +& config.model +& " first\u2026")
+      let r = try:
+                compaction.compact_to_fit(~session: session, ~config: config,
+                                          ~target_model: new_m)
+                ~catch e :: Exn.Fail:
+                  "compaction failed: " +& e.message
+      let still = compaction.overflows_model(session, config, new_m)
+      cond
+      | r.starts_with("compaction failed")
+          || (still && (r == "nothing to compact" || r == "already fits")):
+          pending_fit := #false
+          r +& "; stayed on " +& config.provider +& "/" +& config.model
+            +& " (target " +& new_p +& "/" +& new_m +& " window too small)"
+            +& clamp_thinking()
+      | ~else:
+          config.provider := new_p
+          config.model := new_m
+          pending_fit := #false
+          r +& "; " +& msg +& clamp_thinking()
+  | overflow && compact_on_switch() && !do_compact:
+      pending_fit := better_fit_source(old_p, old_m)
+      msg +& clamp_thinking()
+  | ~else:
+      when !overflow
+      | pending_fit := #false
+      msg +& clamp_thinking()
+
+fun guarded_apply(~compact: do_compact = #true, apply) :: String:
+  let old_p = config.provider
+  let old_m = to_string(config.model)
+  let old_t = config.thinking
+  let msg = apply()
+  finish_model_switch(old_p, old_m, old_t, msg, ~compact: do_compact)
+
+fun set_model(arg :: String, ~compact: do_compact = #true) :: String:
+  guarded_apply(~compact: do_compact, fun (): apply_set_model(arg))
+
+fun drain_pending_fit() :: String:
+  match pending_fit
+  | #false: ""
+  | src :: Map:
+      pending_fit := #false
+      let target = to_string(config.model)
+      if !compaction.overflows_model(session, config, target)
+      | ""
+      | let cur_p = config.provider
+        let cur_m = target
+        let cur_t = config.thinking
+        config.provider := to_string(src.get("provider", cur_p))
+        config.model := to_string(src.get("model", cur_m))
+        let r = try:
+                  compaction.compact_to_fit(~session: session, ~config: config,
+                                            ~target_model: cur_m)
+                  ~catch e :: Exn.Fail:
+                    "compaction failed: " +& e.message
+        config.provider := cur_p
+        config.model := cur_m
+        config.thinking := cur_t
+        if r.starts_with("compaction failed")
+        | r +& " (still on " +& cur_p +& "/" +& cur_m +& ")"
+        | r
 
 registry.register_command(
-  ~name: "model", ~description: "switch model: /model [provider/model | name]",
+  ~name: "model", ~description: "switch model: /model [provider/model | name] (compacts first when the target window is smaller)",
   ~handler: fun (args):
               if args == ""
               | api.notify("provider=" +& config.provider +& " model=" +& config.model)
@@ -520,20 +637,29 @@ registry.register_command(
                     for List (g in available_provider_groups()): g[0]
                   api.notify("provider=" +& config.provider
                                +& " (available: " +& String.join(avail, ", ") +& ")")
+              | args == "openai" && has_chatgpt_auth()
+                  && !credentials_ok("openai", "OPENAI_API_KEY"):
+                  api.notify(guarded_apply(fun ():
+                                             config.provider := "openai-codex"
+                                             config.model := "gpt-5.6-sol"
+                                             "switched to openai-codex model=gpt-5.6-sol (ChatGPT subscription)"))
               | config.providers.has_key(args):
-                  config.provider := args
-                  config.model := config.profile().get("default_model", config.model)
-                  api.notify("switched to " +& args +& " model=" +& config.model
-                               +& clamp_thinking())
+                  api.notify(guarded_apply(fun ():
+                                             config.provider := args
+                                             config.model := config.profile().get("default_model", config.model)
+                                             when args == "openai-codex"
+                                             | config.model := modelsdev.codex_model_id(to_string(config.model))
+                                             "switched to " +& args +& " model=" +& config.model))
               | ~else:
                   match modelsdev.catalog().get(args, #false)
                   | entry :: Map:
                       match modelsdev.provider_profile(entry)
                       | prof :: Map:
-                          config.register_provider(args, prof)
-                          config.provider := args
-                          config.model := ""
-                          api.notify("switched to " +& args +& "; pick a model with /model")
+                          api.notify(guarded_apply(fun ():
+                                                     config.register_provider(args, prof)
+                                                     config.provider := args
+                                                     config.model := ""
+                                                     "switched to " +& args +& "; pick a model with /model"))
                       | ~else: api.notify("provider " +& args +& " uses an unsupported protocol")
                   | ~else: api.notify("unknown provider: " +& args))
 // ---- usage accounting ----
@@ -562,9 +688,9 @@ fun usage_line() :: String:
 fun list_models():
   match available_model_entries()
   | []:
-      println("no models available: set an API key (e.g. KIMI_API_KEY,")
-      println("ANTHROPIC_API_KEY, OPENAI_API_KEY ...) and rerun; the model")
-      println("catalog (models.dev) downloads in the background on first run")
+      println("no models available: /login <provider> oauth  or  set an API")
+      println("key (KIMI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) and")
+      println("rerun; the model catalog (models.dev) downloads in the background")
   | entries:
       for (entry in entries):
         let [full, desc] = entry
@@ -895,11 +1021,13 @@ registry.register_command(
               cond
               | !(session.path is_a String): api.notify("no session file to share")
               | ~else:
-                  let tool = registry.tools.get("bash", #false)
-                  let cmd = "gh gist create '" +& session.path +& "' --desc 'rho session' 2>&1 || echo 'gh CLI unavailable or failed'"
-                  if tool
-                  | api.notify(to_string(tool.fn({ "command": cmd })))
-                  | api.notify("bash tool unavailable"))
+                  let values(code, text) = crypto.#{run-argv}(
+                    "gh", ["gist", "create", session.path, "--desc", "rho session"])
+                  if code == 0
+                  | api.notify(to_string(text).trim())
+                  | api.notify(if to_string(text).contains("not found")
+                               | "gh CLI unavailable or failed"
+                               | to_string(text).trim()))
 registry.register_command(
   ~name: "packages", ~description: "list installed packages (rho install/remove to manage)",
   ~handler: fun (_args):
@@ -921,26 +1049,66 @@ registry.register_command(
   ~handler: fun (_args): #'quit)
 
 // ---- credentials: /login /logout (~/.rho/auth.json, chmod 600) ----
+fun do_login_key(prov :: String, key :: String):
+  if key == ""
+  | api.notify("usage: /login " +& prov +& " <api-key>")
+  | auth_set(prov, key)
+    api.notify("saved key for " +& prov +& " in ~/.rho/auth.json")
+
+fun refresh_codex_models():
+  when has_chatgpt_auth()
+  | codex.refresh_models_async(~api_key: oauth.chatgpt_access_token(),
+                               ~extra_headers: oauth.chatgpt_headers())
+
+fun adopt_chatgpt():
+  config.provider := "openai-codex"
+  config.model := to_string(config.providers["openai-codex"].get("default_model", "gpt-5.6-sol"))
+  refresh_codex_models()
+  api.notify("using openai-codex / " +& config.model +& " (ChatGPT subscription)")
+
+fun login_notify(s :: String):
+  api.notify(s)
+  when s.contains("saved OAuth tokens") && s.contains("openai")
+  | adopt_chatgpt()
+
+fun do_login_oauth_start(prov :: String):
+  try:
+    api.notify(oauth.begin_oauth(prov, config.providers,
+                                 ~notify: login_notify))
+    ~catch e :: Exn.Fail:
+      api.notify("oauth failed: " +& e.message)
+
+fun do_login_oauth_finish(prov :: String, raw :: String):
+  try:
+    login_notify(oauth.complete_oauth(prov, raw, config.providers))
+    ~catch e :: Exn.Fail:
+      api.notify("oauth failed: " +& e.message)
+
 registry.register_command(
   ~name: "login",
-  ~description: "store an API key: /login <provider> [key] (key prompted if omitted)",
+  ~description: "store credentials: /login <provider> [oauth [code]|<api-key>]",
   ~handler: fun (args):
               let parts = args.trim().split(" ")
               cond
               | args.trim() == "":
                   match auth_list()
-                  | []: api.notify("no stored credentials; /login <provider> [key]")
+                  | []: api.notify("no stored credentials; /login <provider> oauth  or  /login <provider> <key>")
                   | ps: api.notify("stored credentials: " +& String.join(ps, ", "))
               | ~else:
                   let prov = to_string(parts[0])
-                  let key:
-                    if parts.length() > 1
-                    | String.join(parts.rest, " ").trim()
-                    | api.ui.input("API key for " +& prov +& ":")
-                  if key == ""
-                  | api.notify("cancelled (empty key)")
-                  | auth_set(prov, key)
-                    api.notify("saved key for " +& prov +& " in ~/.rho/auth.json"))
+                  let rest = (if parts.length() > 1 | String.join(parts.rest, " ").trim() | "")
+                  let has_oauth = oauth.supports_oauth(prov, config.providers)
+                  cond
+                  | rest == "oauth" || rest == "":
+                      if has_oauth
+                      | do_login_oauth_start(prov)
+                      | api.notify("no OAuth for " +& prov +& "; /login " +& prov +& " <api-key>")
+                  | rest.starts_with("oauth "):
+                      do_login_oauth_finish(prov, rest.substring(6..).trim())
+                  | rest == "key":
+                      api.notify("usage: /login " +& prov +& " <api-key>")
+                  | ~else:
+                      do_login_key(prov, rest))
 
 registry.register_command(
   ~name: "logout",
@@ -959,7 +1127,65 @@ fun auto_compact():
   | api.notify("context is near the window limit; compacting\u2026")
     api.notify(compaction.compact(~session: session, ~config: config))
 
+fun prepare_turn():
+  let r = drain_pending_fit()
+  when r != ""
+  | api.notify(r)
+  auto_compact()
+
 // Also expose reload as a tool so the agent can activate its own extensions.
+registry.register_tool(
+  ~name: "agent",
+  ~description: "Delegate a focused subtask to a nested agent with its own session. Use for isolated research, a series of commands, or a draft change. The sub-agent cannot spawn further agents. Returns its final text answer.",
+  ~schema: { "type": "object",
+             "properties": {
+               "prompt": { "type": "string", "description": "The task for the sub-agent" },
+               "label": { "type": "string", "description": "Short name shown in the transcript" },
+               "tools": { "type": "string",
+                          "description": "Optional comma-separated tool allowlist, e.g. read_file,grep,bash" }
+             },
+             "required": ["prompt"] },
+  ~fn: fun (args):
+         let prompt = to_string(args.get("prompt", ""))
+         let label = to_string(args.get("label", "subagent"))
+         let tools:
+           match args.get("tools", #false)
+           | s :: String:
+               for List (x in s.split(",")):
+                 skip_when x.trim() == ""
+                 x.trim()
+           | l :: List: (for List (x in l): to_string(x))
+           | ~else: #false
+         if prompt == ""
+         | "error: prompt is required"
+         | try:
+             registry.state["subagent_label"] := label
+             api.notify("sub-agent " +& label +& " started")
+             let r = subagent.run_subagent(
+               ~config: config,
+               ~parent: registry,
+               ~prompt: prompt,
+               ~system_prompt: system_prompt(),
+               ~label: label,
+               ~tools: tools,
+               ~on_text: fun (s): call_turn1("on_sub_text", "on_text", s),
+               ~on_thinking: fun (s): call_turn1("on_sub_think", "on_thinking", s),
+               ~on_tool: fun (name, args):
+                           call_turn2("on_sub_tool", "on_tool", name, args),
+               ~on_tool_result: fun (name, r):
+                                  call_turn2("on_sub_result", "on_tool_result", name, r))
+             api.notify("sub-agent " +& label +& " done")
+             r
+             ~catch e :: Exn.Fail:
+               "error: " +& e.message)
+
+api.register_renderer(
+  ~tool: "agent",
+  ~fn: fun (phase, name, data):
+         if phase == "call" && data is_a Map
+         | "\u25CF agent " +& to_string(data.get("label", "subagent"))
+         | #false)
+
 registry.register_tool(
   ~name: "reload_extensions",
   ~description: "Hot-reload agent extensions from the extension directories. Call after writing or editing an extension file to activate it.",
@@ -1026,7 +1252,65 @@ fun take_cli_images() :: List:
   pending_cli_images := []
   l
 
+fun set_turn_ui(~on_text: on_text,
+                ~on_thinking: on_thinking = fun (s): #void,
+                ~on_tool: on_tool,
+                ~on_tool_result: on_tool_result,
+                ~on_sub_text: on_sub_text = #false,
+                ~on_sub_think: on_sub_think = #false,
+                ~on_sub_tool: on_sub_tool = #false,
+                ~on_sub_result: on_sub_result = #false):
+  registry.state["on_text"] := on_text
+  registry.state["on_thinking"] := on_thinking
+  registry.state["on_tool"] := on_tool
+  registry.state["on_tool_result"] := on_tool_result
+  registry.state["on_sub_text"] := on_sub_text
+  registry.state["on_sub_think"] := on_sub_think
+  registry.state["on_sub_tool"] := on_sub_tool
+  registry.state["on_sub_result"] := on_sub_result
+
+fun turn_cb(key :: String):
+  registry.state.get(key, #false)
+
+fun call_turn1(key :: String, fallback :: String, a):
+  let f = turn_cb(key)
+  let f = if f | f | turn_cb(fallback)
+  when f | f(a)
+
+fun call_turn2(key :: String, fallback :: String, a, b):
+  let f = turn_cb(key)
+  let f = if f | f | turn_cb(fallback)
+  when f | f(a, b)
+
 fun handle_input(input :: String):
+  prepare_turn()
+  set_turn_ui(
+    ~on_text: fun (s):
+                out.write_string(s)
+                out.flush(),
+    ~on_thinking: fun (s):
+                    out.write_string(color("2;3", s))
+                    out.flush(),
+    ~on_tool: fun (name, args):
+                out.write_string("\n" +& color("2", "\u25CF " +& name +& " "
+                                                 +& summarize(args)) +& "\n")
+                out.flush(),
+    ~on_tool_result: fun (name, r):
+                       out.write_string(color("2", "  \u21B3 " +& first_line(r)) +& "\n")
+                       out.flush(),
+    ~on_sub_text: fun (s):
+                    out.write_string(s)
+                    out.flush(),
+    ~on_sub_think: fun (s):
+                     out.write_string(color("2;3", s))
+                     out.flush(),
+    ~on_sub_tool: fun (name, args):
+                    out.write_string("\n" +& color("2", "  \u2502 \u25CF " +& name +& " "
+                                                     +& summarize(args)) +& "\n")
+                    out.flush(),
+    ~on_sub_result: fun (name, r):
+                      out.write_string(color("2", "  \u2502 \u21B3 " +& first_line(r)) +& "\n")
+                      out.flush())
   run_turn(~config: config,
            ~registry: registry,
            ~session: session,
@@ -1053,7 +1337,11 @@ fun handle_input(input :: String):
   auto_compact()
 
 fun summarize(args :: Map) :: String:
-  let s = to_string(args)
+  let cmd = args.get("command", #false)
+  let s:
+    if cmd is_a String && cmd != ""
+    | cmd
+    | to_string(args)
   if s.length() > 80 | s.substring(0..80) +& "\u2026" | s
 
 fun first_line(s :: String) :: String:
@@ -1172,7 +1460,7 @@ fun tui_footer() :: String:
     +& " $" +& round2(t["cost"])
     +& (if session.name == "" | "" | "  \u2502 " +& session.name)
 
-def provider_ring = ["kimi", "kimi-anthropic", "openai", "anthropic", "openrouter", "ollama"]
+def provider_ring = ["kimi", "openai-codex", "openai", "anthropic", "openrouter", "ollama"]
 
 // scoped models (pi): --models a,b or settings enabled_models restrict the
 // Ctrl-P cycle to a hand-picked list ("provider/model" or bare model names)
@@ -1184,6 +1472,22 @@ def mutable scoped_models :: List:
       | l :: List: (for List (x in l): to_string(x))
       | ~else: []
 
+fun cycle_next_provider() :: String:
+  let avail:
+    for List (p in provider_ring):
+      skip_when !config.providers.has_key(p)
+      p
+  cond
+  | avail == []: "no providers to cycle"
+  | ~else:
+      let idx:
+        for values(found = 0) (i in 0 .. avail.length()):
+          if avail[i] == config.provider | i | found
+      let next = avail[(idx + 1) mod avail.length()]
+      config.provider := next
+      config.model := config.providers[next].get("default_model", config.model)
+      "model: " +& config.provider +& "/" +& config.model
+
 fun cycle_model() :: String:
   cond
   | scoped_models != []:
@@ -1193,19 +1497,9 @@ fun cycle_model() :: String:
           let e = to_string(scoped_models[i])
           if e == cur || e == config.model | i | found
       let next = to_string(scoped_models[(idx + 1) mod scoped_models.length()])
-      set_model(next)
+      set_model(next, ~compact: #false)
   | ~else:
-      let avail:
-        for List (p in provider_ring):
-          skip_when !config.providers.has_key(p)
-          p
-      let idx:
-        for values(found = 0) (i in 0 .. avail.length()):
-          if avail[i] == config.provider | i | found
-      let next = avail[(idx + 1) mod avail.length()]
-      config.provider := next
-      config.model := config.providers[next].get("default_model", config.model)
-      "model: " +& config.provider +& "/" +& config.model
+      guarded_apply(~compact: #false, cycle_next_provider)
 
 registry.register_command(
   ~name: "scoped-models",
@@ -1305,6 +1599,40 @@ fun tui_shell(text :: String) :: String:
       result
 
 fun handle_input_tui(input :: String):
+  prepare_turn()
+  set_turn_ui(
+    ~on_text: fun (s):
+                tui.set_activity("responding")
+                tui.push_delta(s),
+    ~on_thinking: fun (s):
+                    tui.set_activity("thinking")
+                    tui.push_think_delta(s),
+    ~on_tool: fun (name, args):
+                tui.set_activity("tool: " +& name)
+                tui.push("tool",
+                         render_tool("call", name, args)
+                           || "\u25CF " +& name +& " " +& summarize(args)),
+    ~on_tool_result: fun (name, r):
+                       tui.set_activity("thinking")
+                       tui.push_block("tool_result",
+                                      render_tool("result", name, r)
+                                        || "  \u21B3 " +& to_string(r)),
+    ~on_sub_text: fun (s):
+                    let lab = to_string(registry.state.get("subagent_label", "subagent"))
+                    tui.set_activity("sub-agent " +& lab)
+                    tui.push_delta_kind("subagent", s),
+    ~on_sub_think: fun (s):
+                     let lab = to_string(registry.state.get("subagent_label", "subagent"))
+                     tui.set_activity("sub-agent " +& lab +& " thinking")
+                     tui.push_think_delta(s),
+    ~on_sub_tool: fun (name, args):
+                    let lab = to_string(registry.state.get("subagent_label", "subagent"))
+                    tui.set_activity("sub-agent " +& lab +& ": " +& name)
+                    tui.push("tool",
+                             "  \u2502 \u25CF " +& name +& " " +& summarize(args)),
+    ~on_sub_result: fun (name, r):
+                      tui.push_block("tool_result",
+                                     "  \u2502 \u21B3 " +& to_string(r)))
   run_turn(~config: config,
            ~registry: registry,
            ~session: session,
@@ -1340,9 +1668,10 @@ registry.register_command(
                                  +& "Ctrl-C interrupt/clear/quit \u00B7 Esc interrupt (queued follow-ups return to editor)\n"
                                  +& "Ctrl-G external editor \u00B7 Ctrl-X copy last reply \u00B7 Ctrl-O expand/fold tool output\n"
                                  +& "Ctrl-T show/hide chain of thought \u00B7 Shift-Tab or /thinking cycle thinking level\n"
+                                 +& "Ctrl-K kill to EOL \u00B7 Ctrl-W kill word \u00B7 Ctrl-Y yank \u00B7 Alt-Y yank-pop \u00B7 Ctrl-U kill line\n"
                                  +& "Ctrl-P cycle scoped models/providers \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
                                  +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"
-                                 +& "remap: ~/.rho/keybindings.json (external_editor, copy_last, toggle_tool_output, toggle_thinking, cycle_thinking, queue_followup)\n"))
+                                 +& "remap: ~/.rho/keybindings.json (external_editor, copy_last, toggle_tool_output, toggle_thinking, cycle_thinking, queue_followup, kill_line, yank, kill_word, yank_pop)\n"))
 
 // command menu entries: registered commands + prompt templates + quit/exit
 fun tui_commands() :: List:
@@ -1351,7 +1680,7 @@ fun tui_commands() :: List:
           [t["name"], "(prompt) " +& t["description"]])
     ++ [["quit", "exit rho"], ["exit", "exit rho"]]
 
-// argument completions for /model and /provider (available = API key set)
+// argument completions for /model and /provider (env key or /login auth)
 fun tui_arg_complete(cmd :: String, prefix :: String):
   cond
   | cmd == "model":
@@ -1360,14 +1689,23 @@ fun tui_arg_complete(cmd :: String, prefix :: String):
         each entry in available_model_entries()
         let [full, desc] = entry
         skip_when !full.foldcase().contains(lp)
-        [full, full, desc]
+        let slash:
+          for values(found = #false) (i in 0 .. full.length()):
+            found || (full[i] == Char"/" && i)
+        let label:
+          if slash is_a Int
+          | modelsdev.provider_label(full.substring(0 .. slash))
+              +& " / " +& full.substring(slash + 1 ..)
+          | full
+        [full, label, desc]
   | cmd == "provider":
       let lp = prefix.foldcase()
       for List:
         each group in available_provider_groups()
         let [pname, mdls] = group
-        skip_when !pname.foldcase().contains(lp)
-        [pname, pname, mdls.keys().length() +& " models"]
+        let label = modelsdev.provider_label(pname)
+        skip_when !(pname.foldcase().contains(lp) || label.foldcase().contains(lp))
+        [pname, label, mdls.keys().length() +& " models"]
   | cmd == "thinking":
       let lp = prefix.foldcase()
       let supported = model_supports_thinking()
@@ -1516,6 +1854,29 @@ fun run_rpc():
   fun turn_running():
     turn_t && !rkt.#{thread-dead?}(turn_t)
   fun do_run_turn(msg :: String):
+    prepare_turn()
+    set_turn_ui(
+      ~on_text: fun (x): emit_json({ "type": "text", "text": x }),
+      ~on_tool: fun (name, args):
+                  emit_json({ "type": "tool_call", "name": name, "args": args }),
+      ~on_tool_result: fun (name, r):
+                         emit_json({ "type": "tool_result", "name": name, "result": r }),
+      ~on_sub_text: fun (x):
+                      emit_json({ "type": "subagent_text",
+                                  "label": registry.state.get("subagent_label", "subagent"),
+                                  "text": x }),
+      ~on_sub_think: fun (x):
+                       emit_json({ "type": "subagent_thinking",
+                                   "label": registry.state.get("subagent_label", "subagent"),
+                                   "text": x }),
+      ~on_sub_tool: fun (name, args):
+                      emit_json({ "type": "subagent_tool",
+                                  "label": registry.state.get("subagent_label", "subagent"),
+                                  "name": name, "args": args }),
+      ~on_sub_result: fun (name, r):
+                        emit_json({ "type": "subagent_tool_result",
+                                    "label": registry.state.get("subagent_label", "subagent"),
+                                    "name": name, "result": r }))
     run_turn(~config: config,
              ~registry: registry,
              ~session: session,
@@ -1704,6 +2065,7 @@ fun try_subcommand() :: Boolean:
 
 module main:
   modelsdev.refresh_async()
+  refresh_codex_models()
   cond
   | opts.get("export", #false) is_a String:
       run_export_mode()

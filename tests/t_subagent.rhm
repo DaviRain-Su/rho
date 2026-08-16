@@ -1,0 +1,49 @@
+#lang rhombus
+
+// Sub-agent tool filtering and depth limit (no live model).
+
+import:
+  "../src/kernel/registry.rhm" open
+  "../src/kernel/subagent.rhm" as subagent
+  "../src/tools/core.rhm" open
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+def parent = make_registry()
+install_core_tools(parent)
+parent.register_tool(
+  ~name: "agent",
+  ~description: "nested",
+  ~schema: { "type": "object", "properties": {}, "required": [] },
+  ~fn: fun (_args): "no")
+
+def names = subagent.child_tool_names(parent, #false)
+check("drops agent", !names.contains("agent"))
+check("keeps read", names.contains("read_file"))
+check("keeps bash", names.contains("bash"))
+
+def filtered = subagent.child_tool_names(parent, ["read_file", "grep"])
+check("allowlist read", filtered.contains("read_file"))
+check("allowlist no bash", !filtered.contains("bash"))
+check("allowlist no agent", !filtered.contains("agent"))
+
+parent.state["agent_depth"] := 1
+parent.state["max_agent_depth"] := 1
+def err = try:
+            subagent.run_subagent(~config: #false,
+                                  ~parent: parent,
+                                  ~prompt: "hi",
+                                  ~system_prompt: "sys")
+            "no-error"
+            ~catch e :: Exn.Fail:
+              e.message
+check("depth limit", to_string(err).contains("depth limit"))
+
+if failures == 0
+| println("t_subagent OK")
+| error("subagent tests failed: " +& failures)

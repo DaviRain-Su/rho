@@ -241,31 +241,56 @@ fun shell_capture(cmd :: String, timeout :: Int,
   reader.wait()
   values(status, buf.get_string().to_string())
 
+fun prune_bash_spills():
+  try:
+    let dir = to_string(rkt.#{find-system-path}(rkt.#{string->symbol}("temp-dir")))
+    let now = rkt.#{current-seconds}()
+    for (f in filesystem.files(dir)):
+      let name = to_string(f)
+      skip_when !(name.starts_with("rho-bash-") && name.ends_with(".txt"))
+      let path = dir +& "/" +& name
+      when now - rkt.#{file-or-directory-modify-seconds}(path) > 86400
+      | filesystem.delete(path)
+    ~catch _:
+      #void
+
+fun bash_command(args :: Map) :: String:
+  let cmd = args.get("command", args.get("cmd", ""))
+  cond
+  | cmd is_a String: cmd
+  | cmd is_a List:
+      String.join((for List (x in cmd): to_string(x)), " ")
+  | ~else: ""
+
 fun tool_bash(args :: Map):
-  let cmd = args.get("command", "")
-  let timeout = args.get("timeout", 120)
-  let values(status, output) = shell_capture(cmd, timeout, ~stream: #true)
-  let lines = output.split("\n", ~trim: #false)
-  // drop the trailing empty piece from a final newline
-  let lines:
-    if lines.length() > 0 && lines[lines.length() - 1] == ""
-    | lines.delete(lines.length() - 1)
-    | lines
-  let values(kept, truncated) = tail_lines(lines, MAX_LINES, MAX_BYTES)
-  let shown:
-    if truncated
-    | // spill the full output so the model (or user) can dig further
-      let tmp = to_string(rktfile.#{make-temporary-file}("rho-bash-~a.txt"))
-      filesystem.write_string(tmp, output, ~exists: #'truncate)
-      "... [truncated: showing last " +& kept.length() +& " of "
-        +& lines.length() +& " lines (" +& fmt_size(byte_len(output))
-        +& "); full output: " +& tmp +& "]\n"
-        +& String.join(kept, "\n")
-    | output
-  match status
-  | #'timeout: "error: command timed out after " +& timeout +& "s\n" +& shown
-  | 0: (if shown == "" | "(no output)" | shown)
-  | code: "exit code " +& code +& "\n" +& shown
+  let cmd = bash_command(args)
+  cond
+  | cmd == "": "error: bash called with empty command (missing arguments)"
+  | ~else:
+      let timeout = args.get("timeout", 120)
+      let values(status, output) = shell_capture(cmd, timeout, ~stream: #true)
+      let lines = output.split("\n", ~trim: #false)
+      // drop the trailing empty piece from a final newline
+      let lines:
+        if lines.length() > 0 && lines[lines.length() - 1] == ""
+        | lines.delete(lines.length() - 1)
+        | lines
+      let values(kept, truncated) = tail_lines(lines, MAX_LINES, MAX_BYTES)
+      let shown:
+        if truncated
+        | // spill the full output so the model (or user) can dig further
+          prune_bash_spills()
+          let tmp = to_string(rktfile.#{make-temporary-file}("rho-bash-~a.txt"))
+          filesystem.write_string(tmp, output, ~exists: #'truncate)
+          "... [truncated: showing last " +& kept.length() +& " of "
+            +& lines.length() +& " lines (" +& fmt_size(byte_len(output))
+            +& "); full output: " +& tmp +& "]\n"
+            +& String.join(kept, "\n")
+        | output
+      match status
+      | #'timeout: "error: command timed out after " +& timeout +& "s\n" +& shown
+      | 0: (if shown == "" | "(no output)" | shown)
+      | code: "exit code " +& code +& "\n" +& shown
 
 fun shell_quote(s :: String) :: String:
   "'" +& String.join(s.split("'", ~trim: #false), "'\\''") +& "'"

@@ -108,10 +108,15 @@ fun stream_chat(~base_url: base_url :: String,
     if tools == []
     | base
     | base ++ { "tools": tools_payload(tools) }
+  let headers:
+    let base = { "anthropic-version": "2023-06-01" }
+    let base:
+      if extra_headers.get("Authorization", #false) is_a String
+      | base
+      | base ++ { "x-api-key": api_key }
+    base ++ extra_headers
   let resp = http.post(base_url +& "/v1/messages",
-                       ~headers: { "x-api-key": api_key,
-                                   "anthropic-version": "2023-06-01" }
-                                   ++ extra_headers,
+                       ~headers: headers,
                        ~data: http.payload.json(body),
                        ~stream: #true,
                        ~timeouts: http.Timeouts(~lease: 15, ~connect: 15, ~request: 600))
@@ -185,30 +190,32 @@ fun stream_chat(~base_url: base_url :: String,
       | "error":
           error("anthropic: stream error: " +& json.to_string(msg.get("error", {})))
       | ~else: #void
-  sse.each_event(resp.output(), handle)
-  resp.close()
-  let tool_calls:
-    for List:
-      each idx in blocks.keys().sort()
-      let b = blocks[idx]
-      skip_when b.get("type", "") != "tool_use"
-      { "id": b["id"], "name": b["name"],
-        "arguments": if b["arguments"] == "" | "{}" | b["arguments"] }
-  let thinking_blocks:
-    for List:
-      each idx in blocks.keys().sort()
-      let b = blocks[idx]
-      skip_when b.get("type", "") != "thinking" && b.get("type", "") != "redacted_thinking"
-      b
-  let thinking_text:
-    String.join((for List:
-                   each b in thinking_blocks
-                   skip_when b.get("type", "") != "thinking"
-                   to_string(b.get("thinking", ""))),
-                "\n\n")
-  let msg = { "role": "assistant", "content": content, "tool_calls": tool_calls,
-              "finish_reason": finish_reason,
-              "usage": { "input": input_tokens, "output": output_tokens,
-                         "cache_read": cache_read } }
-  let msg = (if thinking_blocks == [] | msg | msg ++ { "thinking_blocks": thinking_blocks })
-  if thinking_text == "" | msg | msg ++ { "thinking": thinking_text }
+  try:
+    sse.each_event(resp.output(), handle)
+    let tool_calls:
+      for List:
+        each idx in blocks.keys().sort()
+        let b = blocks[idx]
+        skip_when b.get("type", "") != "tool_use"
+        { "id": b["id"], "name": b["name"],
+          "arguments": if b["arguments"] == "" | "{}" | b["arguments"] }
+    let thinking_blocks:
+      for List:
+        each idx in blocks.keys().sort()
+        let b = blocks[idx]
+        skip_when b.get("type", "") != "thinking" && b.get("type", "") != "redacted_thinking"
+        b
+    let thinking_text:
+      String.join((for List:
+                     each b in thinking_blocks
+                     skip_when b.get("type", "") != "thinking"
+                     to_string(b.get("thinking", ""))),
+                  "\n\n")
+    let msg = { "role": "assistant", "content": content, "tool_calls": tool_calls,
+                "finish_reason": finish_reason,
+                "usage": { "input": input_tokens, "output": output_tokens,
+                           "cache_read": cache_read } }
+    let msg = (if thinking_blocks == [] | msg | msg ++ { "thinking_blocks": thinking_blocks })
+    if thinking_text == "" | msg | msg ++ { "thinking": thinking_text }
+    ~finally:
+      resp.close()

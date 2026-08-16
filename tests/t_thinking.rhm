@@ -50,6 +50,34 @@ check("openai drops thinking fields",
       !op[0].has_key("thinking") && !op[0].has_key("thinking_blocks")
         && op[0]["content"] == "done")
 
+// Mid-session provider switch: Codex/GPT may have stored empty or truncated
+// tool arguments. OpenAI-compatible hosts (Ollama Cloud, etc.) reject those.
+def dirty = openai.messages_payload(
+  [{ "role": "assistant", "content": "",
+     "tool_calls": [{ "id": "call_1", "name": "bash", "arguments": "" }] },
+   { "role": "tool", "tool_call_id": "call_1", "content": "(no output)" }])
+check("empty tool arguments become {}",
+      dirty[0]["tool_calls"][0]["function"]["arguments"] == "{}")
+
+def broken = openai.messages_payload(
+  [{ "role": "assistant", "content": "",
+     "tool_calls": [{ "id": "call_2", "name": "bash", "arguments": "{not-json" }] }])
+check("invalid tool arguments become {}",
+      broken[0]["tool_calls"][0]["function"]["arguments"] == "{}")
+
+def kept = openai.messages_payload(
+  [{ "role": "assistant", "content": "",
+     "tool_calls": [{ "id": "call_3", "name": "bash",
+                      "arguments": "{\"command\":\"pwd\"}" }] }])
+check("valid tool arguments kept",
+      kept[0]["tool_calls"][0]["function"]["arguments"].contains("pwd"))
+
+def cleaned = openai.sanitize_assistant(
+  { "role": "assistant", "content": "",
+    "tool_calls": [{ "id": "call_4", "name": "bash", "arguments": "" }] })
+check("sanitize_assistant rewrites stored arguments",
+      cleaned["tool_calls"][0]["arguments"] == "{}")
+
 // capability lookup drives the /thinking selector
 check("kimi-k2-thinking supports", models.model_info("kimi-k2-thinking")["thinking"] == #true)
 check("kimi-k2-turbo does not", models.model_info("kimi-k2-turbo-preview")["thinking"] == #false)

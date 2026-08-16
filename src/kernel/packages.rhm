@@ -5,9 +5,11 @@
 // join the discovery paths.
 
 import:
-  rhombus/subprocess
   lib("racket/file.rkt") as rktfile
   "config.rhm"
+  "crypto.rkt" as crypto
+  "skills.rhm" as skills
+  "prompts.rhm" as prompts
 
 export:
   packages_dir
@@ -18,6 +20,8 @@ export:
   package_extension_dirs
   package_skill_dirs
   package_prompt_dirs
+  package_name
+  safe_pkg_name
 
 fun packages_dir() :: String:
   config.config_dir() +& "/packages"
@@ -39,60 +43,66 @@ fun resolve_url(spec :: String) :: String:
       spec
   | ~else: "https://github.com/" +& spec
 
-fun name_of(url :: String) :: String:
+fun safe_pkg_name(name :: String):
+  cond
+  | name == "" || name == "." || name == "..": #false
+  | name.contains("/") || name.contains("\\") || name.contains(".."): #false
+  | name.contains("\n") || name.contains("\r"): #false
+  | ~else: name
+
+fun package_name(url :: String):
   let parts = url.split("/")
   let last = to_string(parts[parts.length() - 1])
-  if last.ends_with(".git") | last.substring(0 .. last.length() - 4) | last
+  let last = if last.ends_with(".git") | last.substring(0 .. last.length() - 4) | last
+  safe_pkg_name(last)
 
 fun install(spec :: String) :: String:
   let url = resolve_url(spec)
-  let name = name_of(url)
-  let dest = packages_dir() +& "/" +& name
+  let name = package_name(url)
   cond
-  | filesystem.directory_exists(dest):
-      "already installed: " +& name +& " (rho remove " +& name +& " first)"
+  | !name: "invalid package name from " +& spec
   | ~else:
-      when !filesystem.directory_exists(packages_dir())
-      | filesystem.make_directory(packages_dir(), ~parents: #true)
-      let sp = subprocess.run_shell("git clone --depth 1 "
-                                      +& "'" +& url +& "' '" +& dest +& "' 2>&1",
-                                    ~in: Port.Input.open_string(""),
-                                    ~out: #'pipe)
-      let buf = Port.Output.open_string()
-      sp.out.copy_to(buf)
-      let code = sp.wait()
-      if code == 0
-      | "installed " +& name +& " -> " +& dest
-      | "install failed (exit " +& code +& "):\n" +& buf.get_string()
+      let dest = packages_dir() +& "/" +& name
+      cond
+      | filesystem.directory_exists(dest):
+          "already installed: " +& name +& " (rho remove " +& name +& " first)"
+      | ~else:
+          when !filesystem.directory_exists(packages_dir())
+          | filesystem.make_directory(packages_dir(), ~parents: #true)
+          let values(code, text) = crypto.#{run-argv}("git", ["clone", "--depth", "1", url, dest])
+          if code == 0
+          | skills.invalidate()
+            prompts.invalidate()
+            "installed " +& name +& " -> " +& dest
+          | "install failed (exit " +& code +& "):\n" +& text
 
 fun update(name :: String) :: String:
   let dest = packages_dir() +& "/" +& name
   cond
-  | name == "" || name.contains("/") || name.contains(".."):
+  | !(safe_pkg_name(name) is_a String):
       "invalid package name: " +& name
   | !filesystem.directory_exists(dest):
       "not installed: " +& name
   | ~else:
-      let sp = subprocess.run_shell("git -C '" +& dest +& "' pull --ff-only 2>&1",
-                                    ~in: Port.Input.open_string(""),
-                                    ~out: #'pipe)
-      let buf = Port.Output.open_string()
-      sp.out.copy_to(buf)
-      let code = sp.wait()
-      let msg = buf.get_string().to_string().trim()
+      let values(code, text) = crypto.#{run-argv}("git", ["-C", dest, "pull", "--ff-only"])
+      let msg = to_string(text).trim()
       if code == 0
-      | name +& ": " +& msg
+      | skills.invalidate()
+        prompts.invalidate()
+        name +& ": " +& msg
       | name +& ": update failed (exit " +& code +& "): " +& msg
 
 fun remove(name :: String) :: String:
   let dest = packages_dir() +& "/" +& name
   cond
-  | name == "" || name.contains("/") || name.contains(".."):
+  | !(safe_pkg_name(name) is_a String):
       "invalid package name: " +& name
   | !filesystem.directory_exists(dest):
       "not installed: " +& name
   | ~else:
       rktfile.#{delete-directory/files}(Path(dest))
+      skills.invalidate()
+      prompts.invalidate()
       "removed " +& name
 
 fun subdirs_of(kind :: String) :: List:

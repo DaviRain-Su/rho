@@ -1,0 +1,88 @@
+#lang rhombus
+
+// Model picker unlocks on auth.json / empty env, not only env API keys.
+
+import:
+  lib("racket/base.rkt") as rkt
+  "../src/kernel/config.rhm" as config
+  "../src/ai/modelsdev.rhm" as modelsdev
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+check("ollama unlocked without key", config.credentials_ok("ollama", ""))
+check("missing auth is empty", !config.has_auth("rho-test-no-such-provider"))
+check("unknown env stays locked",
+      !config.credentials_ok("rho-test-no-such-provider", "RHO_TEST_NO_SUCH_KEY"))
+
+def openai = modelsdev.fallback_models("openai")
+check("openai fallback has gpt-5.2", openai.has_key("gpt-5.2"))
+check("openai fallback has gpt-4o", openai.has_key("gpt-4o"))
+def codex_fb = modelsdev.fallback_models("openai-codex")
+check("codex fallback has gpt-5.6-sol", codex_fb.has_key("gpt-5.6-sol"))
+check("codex fallback has 5.3-codex", codex_fb.has_key("gpt-5.3-codex"))
+check("codex fallback has spark", codex_fb.has_key("gpt-5.3-codex-spark"))
+check("codex fallback has 5.4", codex_fb.has_key("gpt-5.4"))
+check("codex fallback has 5.5", codex_fb.has_key("gpt-5.5"))
+check("codex has no bare gpt-5.6", !codex_fb.has_key("gpt-5.6"))
+check("codex lists sol", modelsdev.listed_model("openai-codex", "gpt-5.6-sol"))
+check("codex lists 5.3-codex", modelsdev.listed_model("openai-codex", "gpt-5.3-codex"))
+check("codex lists 5.4-mini", modelsdev.listed_model("openai-codex", "gpt-5.4-mini"))
+check("codex lists 5.5", modelsdev.listed_model("openai-codex", "gpt-5.5"))
+check("codex hides bare gpt-5.6", !modelsdev.listed_model("openai-codex", "gpt-5.6"))
+check("codex hides gpt-4o", !modelsdev.listed_model("openai-codex", "gpt-4o"))
+check("alias gpt-5.6 -> sol", modelsdev.codex_model_id("gpt-5.6") == "gpt-5.6-sol")
+check("5.4 stays 5.4", modelsdev.codex_model_id("gpt-5.4") == "gpt-5.4")
+check("5.5 stays 5.5", modelsdev.codex_model_id("gpt-5.5") == "gpt-5.5")
+check("codex label", modelsdev.provider_label("openai-codex") == "OpenAI Codex")
+check("anthropic fallback has sonnet",
+      modelsdev.fallback_models("anthropic").has_key("claude-sonnet-4-5"))
+check("empty fallback for unknown",
+      modelsdev.fallback_models("nope").keys().length() == 0)
+
+def catalogish = { "gpt-5.2": { "limit": { "context": 400000 } } }
+def merged = modelsdev.merge_model_maps(catalogish, openai)
+check("merge keeps catalog entry",
+      merged["gpt-5.2"] is_a Map && merged["gpt-5.2"].has_key("limit"))
+check("merge adds missing fallback", merged.has_key("gpt-4o"))
+
+def fake = { "env": ["RHO_TEST_NO_SUCH_KEY"] }
+check("catalog locked without env or auth",
+      !modelsdev.catalog_unlocked("rho-test-no-such-provider", fake))
+
+def _env = rkt.#{putenv}("RHO_TEST_CATALOG_KEY", "x")
+check("catalog unlocked by env is boolean",
+      modelsdev.catalog_unlocked("deepseek", { "env": ["RHO_TEST_CATALOG_KEY"] }) == #true)
+
+check("kimi-for-coding is suppressed", modelsdev.catalog_suppressed("kimi-for-coding"))
+check("kimi-anthropic hidden in menu", modelsdev.hidden_builtin("kimi-anthropic"))
+check("kimi itself is not hidden", !modelsdev.hidden_builtin("kimi"))
+
+check("unique env unlocks",
+      modelsdev.env_unlocks("deepseek", "DEEPSEEK_API_KEY", ["deepseek"]))
+check("shared env prefers opencode-go",
+      modelsdev.env_unlocks("opencode-go", "OPENCODE_API_KEY",
+                            ["opencode", "opencode-go"]))
+check("shared env does not unlock opencode zen",
+      !modelsdev.env_unlocks("opencode", "OPENCODE_API_KEY",
+                             ["opencode", "opencode-go"]))
+check("suppressed id stays locked by env",
+      !modelsdev.env_unlocks("kimi-for-coding", "KIMI_API_KEY",
+                             ["kimi-for-coding"]))
+
+check("openai lists gpt-4o", modelsdev.listed_model("openai", "gpt-4o"))
+check("openai lists gpt-5.2", modelsdev.listed_model("openai", "gpt-5.2"))
+check("openai hides embeddings",
+      !modelsdev.listed_model("openai", "text-embedding-3-small"))
+check("openai hides image models",
+      !modelsdev.listed_model("openai", "gpt-image-1"))
+check("kimi label", modelsdev.provider_label("kimi") == "Kimi")
+check("openai label", modelsdev.provider_label("openai") == "OpenAI")
+
+when failures > 0
+| error("t_models_avail: " +& failures +& " failed")
+println("t_models_avail ok")

@@ -12,6 +12,8 @@ when meta != { "name": "demo", "description": "A demo: with colon" } | error("me
 when !body.contains("Body here") | error("body wrong")
 def (m2, b2) = frontmatter.parse("no frontmatter at all")
 when m2 != {} || b2 != "no frontmatter at all" | error("plain text wrong")
+def (m3, _) = frontmatter.parse("---\nname: \"a\\\"b\"\n---\n")
+when m3.get("name", "") != "a\"b" | error("escaped quote wrong: " +& to_string(m3))
 
 // skills discovery
 def tmp = to_string(rktfile.#{make-temporary-file}("rho-sk-~a", #'directory))

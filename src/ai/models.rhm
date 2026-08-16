@@ -8,6 +8,7 @@
 import:
   json
   "../kernel/config.rhm"
+  "../kernel/errors.rhm" as errors
   "modelsdev.rhm" as modelsdev
 
 export:
@@ -51,16 +52,9 @@ def builtin :: Map:
   }
 
 fun custom_models() :: Map:
-  let path = config.config_dir() +& "/models.json"
-  if filesystem.file_exists(path)
-  | let parsed = try:
-                   json.from_string(filesystem.read_string(path))
-                   ~catch _: {}
-    if parsed is_a Map
-    | let m = parsed.get("models", {})
-      if m is_a Map | m | {}
-    | {}
-  | {}
+  let parsed = errors.read_json_map(config.config_dir() +& "/models.json")
+  let m = parsed.get("models", {})
+  if m is_a Map | m | {}
 
 fun all_models() :: Map:
   for values(m = builtin) ((k, v) in custom_models()):

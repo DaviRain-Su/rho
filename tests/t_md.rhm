@@ -3,7 +3,7 @@
 // markdown span rendering + span wrapping unit tests
 
 import:
-  "../src/ui/tui.rhm" as tui
+  "../src/ui/style.rhm" as tui
 
 def mutable failures = 0
 
@@ -84,6 +84,27 @@ check("wrap wide chars",
 check("wrap empty",
       tui.wrap_spans([[#false, #false, #false, ""]], 10),
       [[[#false, #false, #false, ""]]])
+
+check("editor slash",
+      tui.editor_line_spans("/model gpt", #true, tcolor),
+      [["magenta", #false, "bold", "/model"],
+       [#false, #false, #false, " gpt"]])
+
+check("editor at-file",
+      tui.editor_line_spans("see @src/main.rhm please", #false, tcolor),
+      [[#false, #false, #false, "see "],
+       ["cyan", #false, #false, "@src/main.rhm"],
+       [#false, #false, #false, " please"]])
+
+check("editor shell",
+      tui.editor_line_spans("!ls", #true, tcolor),
+      [["green", #false, "bold", "!"],
+       [#false, #false, #false, "ls"]])
+
+check("editor code",
+      tui.editor_line_spans("run `make`", #false, tcolor),
+      [[#false, #false, #false, "run "],
+       ["yellow", #false, #false, "make"]])
 
 if failures == 0
 | println("ALL PASS")

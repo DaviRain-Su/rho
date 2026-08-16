@@ -13,10 +13,12 @@
 // quit), Escape interrupt (restores queued follow-ups to the editor),
 // Ctrl-G external editor, Ctrl-X copy last assistant message, Ctrl-O
 // expand/collapse tool output, Ctrl-T show/hide chain of thought,
-// Shift-Tab cycle thinking level, Ctrl-P cycle
-// scoped models, Ctrl-L redraw, Ctrl-D quit. ~/.rho/keybindings.json remaps
-// actions (external_editor, copy_last, toggle_tool_output, toggle_thinking,
-// cycle_thinking, queue_followup).
+// Shift-Tab cycle thinking level, Ctrl-P cycle scoped models,
+// Ctrl-K/W/Y/U + Alt-Y kill-ring, Ctrl-L redraw, Ctrl-D quit.
+// ~/.rho/keybindings.json remaps actions (external_editor, copy_last,
+// toggle_tool_output, toggle_thinking, cycle_thinking, queue_followup,
+// kill_line, yank, kill_word, yank_pop).
+// The editor highlights /commands, !shell, @files, and `code`.
 // Assistant output is rendered with lightweight markdown styling (headers,
 // bold, `code`, ``` fences, lists, quotes).
 //
@@ -29,12 +31,15 @@ import:
   lib("racket/file.rkt") as rktfile
   lib("racket/system.rkt") as rktsys
   "term.rkt" as term
+  "style.rhm" open
+  "../kernel/sync.rkt" as sync
 
 export:
   run_tui
   push
   push_block
   push_delta
+  push_delta_kind
   push_think_delta
   set_activity
   set_widget
@@ -42,6 +47,7 @@ export:
   copy_text
   default_theme
   md_line_spans
+  editor_line_spans
   wrap_spans
 
 // ---- shared transcript state (written by turn threads, read by render) ----
@@ -50,6 +56,10 @@ def mutable partial :: String = ""   // streaming tail without newline yet
 def mutable partial_kind :: String = "assistant"  // "assistant" | "think"
 def mutable dirty = #true
 def mutable activity = #false        // "thinking" / "tool: x" / ... while a turn runs
+def trans_lock = sync.#{make-lock}()
+
+fun with_trans(fn):
+  sync.#{with-lock}(trans_lock, fn)
 
 def spinner_frames = ["\u280B", "\u2819", "\u2839", "\u2838", "\u283C",
                       "\u2834", "\u2826", "\u2827", "\u2807", "\u280F"]
@@ -62,25 +72,34 @@ fun wake():
   rkt.#{semaphore-post}(wake_sema)
 
 fun set_activity(s):
-  activity := s
-  dirty := #true
+  fun go():
+    activity := s
+    dirty := #true
+    #void
+  with_trans(go)
   wake()
 
 // extension widgets: id -> text (may be multi-line), rendered above the
 // status row; #false removes the widget
 def mutable widgets :: Map = {}
 fun set_widget(id :: String, text):
-  widgets := (if text is_a String
-              | widgets ++ { id: text }
-              | widgets.remove(id))
-  dirty := #true
+  fun go():
+    widgets := (if text is_a String
+                | widgets ++ { id: text }
+                | widgets.remove(id))
+    dirty := #true
+    #void
+  with_trans(go)
   wake()
 
 // extension-owned suffix appended to the footer line
 def mutable footer_extra :: String = ""
 fun set_footer_extra(s :: String):
-  footer_extra := s
-  dirty := #true
+  fun go():
+    footer_extra := s
+    dirty := #true
+    #void
+  with_trans(go)
   wake()
 
 // module-level debug log (enabled by RHO_TUI_DEBUG=/path in run_tui)
@@ -108,16 +127,22 @@ fun strip_ansi(s :: String) :: String:
 
 fun push(kind :: String, text :: String):
   dlog("push " +& kind +& " at " +& math.exact(math.round(rkt.#{current-inexact-milliseconds}())))
-  for (l in strip_ansi(text).split("\n", ~trim: #false)):
-    lines := lines.add([kind, to_string(l)])
-  dirty := #true
+  fun go():
+    for (l in strip_ansi(text).split("\n", ~trim: #false)):
+      lines := lines.add([kind, to_string(l)])
+    dirty := #true
+    #void
+  with_trans(go)
   wake()
 
 // Keep a multi-line text as ONE transcript entry (kept newlines), so the
 // renderer can fold it to its first line (tool output, Ctrl-O toggles).
 fun push_block(kind :: String, text :: String):
-  lines := lines.add([kind, strip_ansi(text)])
-  dirty := #true
+  fun go():
+    lines := lines.add([kind, strip_ansi(text)])
+    dirty := #true
+    #void
+  with_trans(go)
   wake()
 
 // Copy text to the system clipboard: OSC 52 escape (when the TUI is active)
@@ -140,21 +165,24 @@ fun copy_text(s :: String) :: Boolean:
 fun push_delta_kind(kind :: String, s :: String):
   dlog("delta " +& kind +& " " +& s.length() +& " at "
          +& math.exact(math.round(rkt.#{current-inexact-milliseconds}())))
-  // switching streams (thinking -> text or back) finalizes the partial line
-  when partial != "" && partial_kind != kind
-  | lines := lines.add([partial_kind, strip_ansi(partial)])
-    partial := ""
-  partial_kind := kind
-  partial := partial +& s
-  recur split():
-    let idx:
-      for values(found = #false) (i in 0 .. partial.length()):
-        found || (partial[i] == Char"\n" && i)
-    when idx is_a Int
-    | lines := lines.add([kind, strip_ansi(partial.substring(0 .. idx))])
-      partial := partial.substring(idx + 1 ..)
-      split()
-  dirty := #true
+  fun go():
+    // switching streams (thinking -> text or back) finalizes the partial line
+    when partial != "" && partial_kind != kind
+    | lines := lines.add([partial_kind, strip_ansi(partial)])
+      partial := ""
+    partial_kind := kind
+    partial := partial +& s
+    recur split():
+      let idx:
+        for values(found = #false) (i in 0 .. partial.length()):
+          found || (partial[i] == Char"\n" && i)
+      when idx is_a Int
+      | lines := lines.add([kind, strip_ansi(partial.substring(0 .. idx))])
+        partial := partial.substring(idx + 1 ..)
+        split()
+    dirty := #true
+    #void
+  with_trans(go)
   wake()
 
 fun push_delta(s :: String):
@@ -164,24 +192,38 @@ fun push_delta(s :: String):
 fun push_think_delta(s :: String):
   push_delta_kind("think", s)
 
+fun flush_partial_locked():
+  cond
+  | partial == "": #false
+  | ~else:
+      lines := lines.add([partial_kind, strip_ansi(partial)])
+      partial := ""
+      partial_kind := "assistant"
+      dirty := #true
+      #true
+
 fun flush_partial():
-  when partial != ""
-  | lines := lines.add([partial_kind, strip_ansi(partial)])
-    partial := ""
-    partial_kind := "assistant"
+  let woke = with_trans(flush_partial_locked)
+  when woke | wake()
+
+fun take_frame_locked() :: Map:
+  dirty := #false
+  { "lines": lines,
+    "partial": partial,
+    "partial_kind": partial_kind,
+    "activity": activity,
+    "widgets": widgets,
+    "footer_extra": footer_extra }
+
+fun take_frame() :: Map:
+  with_trans(take_frame_locked)
+
+fun clear_activity():
+  fun go():
+    activity := #false
     dirty := #true
-    wake()
-
-def default_theme :: Map:
-  { "user": "cyan", "assistant": "default", "tool": "yellow",
-    "tool_result": "brblack", "think": "brblack",
-    "notify": "blue", "steer": "magenta",
-    "error": "red", "shell": "green", "sep": "brblack",
-    "footer_fg": "black", "footer_bg": "white", "prompt": "magenta",
-    "md_head": "cyan", "md_code": "yellow", "md_quote": "brblack",
-    "md_bullet": "magenta" }
-
-// ---- helpers ----
+    #void
+  with_trans(go)
 
 // First character index at (or covering) display column col.
 fun idx_at_col(text :: String, col :: Int) :: Int:
@@ -190,142 +232,8 @@ fun idx_at_col(text :: String, col :: Int) :: Int:
     | i >= text.length() || w >= col: i
     | ~else: go(i + 1, w + char_width(text[i]))
 
-// Terminal display width: CJK and other East Asian wide/fullwidth
-// characters occupy two columns.
-fun char_width(c :: Char) :: Int:
-  let n = c.to_int()
-  if (n >= 0x1100 && n <= 0x115F)      // Hangul Jamo
-       || (n >= 0x2E80 && n <= 0xA4CF) // CJK radicals .. Yi
-       || (n >= 0xAC00 && n <= 0xD7A3) // Hangul syllables
-       || (n >= 0xF900 && n <= 0xFAFF) // CJK compatibility ideographs
-       || (n >= 0xFE30 && n <= 0xFE4F) // CJK compatibility forms
-       || (n >= 0xFF00 && n <= 0xFF60) // fullwidth forms
-       || (n >= 0xFFE0 && n <= 0xFFE6)
-       || (n >= 0x20000 && n <= 0x3FFFD) // CJK extension planes
-  | 2
-  | 1
-
-fun display_width(s :: String) :: Int:
-  for values(w = 0) (c in s):
-    w + char_width(c)
-
-// Wrap a row of spans ([fg, bg, style, text]) into rows of at most w columns.
-fun wrap_spans(spans :: List, w :: Int) :: List:
-  recur go(pending = spans, cur :: List = [], cur_w = 0, acc :: List = []):
-    match pending
-    | []: acc.add(cur)
-    | [span, & rest]:
-        let [f, b, st, text0] = span
-        let text = to_string(text0)
-        let len = text.length()
-        let avail = w - cur_w
-        let cut:
-          recur scan(i = 0, tot = 0):
-            cond
-            | i >= len: i
-            | ~else:
-                let cw = char_width(text[i])
-                if tot + cw > avail | i | scan(i + 1, tot + cw)
-        cond
-        | cut >= len:
-            go(rest, cur.add([f, b, st, text]), cur_w + display_width(text), acc)
-        | cut == 0 && cur != []:
-            go(pending, [], 0, acc.add(cur))
-        | ~else:
-            let cut = math.max(1, cut)
-            go([[f, b, st, text.substring(cut ..)]] ++ rest, [], 0,
-               acc.add(cur.add([f, b, st, text.substring(0 .. cut)])))
-
 fun clamp(x, lo, hi):
   math.max(lo, math.min(x, hi))
-
-// ---- lightweight markdown styling for assistant output ----
-
-fun find_str(s :: String, sub :: String, from :: Int):
-  let n = s.length()
-  let m = sub.length()
-  recur go(i = from):
-    cond
-    | i + m > n: #false
-    | s.substring(i .. i + m) == sub: i
-    | ~else: go(i + 1)
-
-// index just past "# ".."###### " when the line is a header
-fun md_header_end(s :: String):
-  recur go(i = 0):
-    cond
-    | i < s.length() && i < 6 && s[i] == Char"#": go(i + 1)
-    | i > 0 && i < s.length() && s[i] == Char" ": i
-    | ~else: #false
-
-// index just past a list marker ("- ", "* ", "+ ", "12. "), or #false
-fun md_bullet_end(s :: String):
-  let n = s.length()
-  fun digit(c :: Char):
-    c.to_int() >= 48 && c.to_int() <= 57
-  recur sp(i = 0):
-    cond
-    | i < n && s[i] == Char" ": sp(i + 1)
-    | ~else:
-        cond
-        | i + 1 < n && (s[i] == Char"-" || s[i] == Char"*" || s[i] == Char"+")
-            && s[i + 1] == Char" ":
-            i + 2
-        | ~else:
-            recur dg(j = i):
-              cond
-              | j < n && digit(s[j]): dg(j + 1)
-              | j > i && j + 1 < n && s[j] == Char"." && s[j + 1] == Char" ":
-                  j + 2
-              | ~else: #false
-
-// inline `code` and **bold** within a normal text line
-fun md_inline(s :: String, code_color) :: List:
-  recur go(rest = s, acc :: List = []):
-    cond
-    | rest == "":
-        if acc == [] | [[#false, #false, #false, ""]] | acc
-    | ~else:
-        let bt = find_str(rest, "`", 0)
-        let bd = find_str(rest, "**", 0)
-        cond
-        | bt is_a Int && (!(bd is_a Int) || bt < bd):
-            match find_str(rest, "`", bt + 1)
-            | j :: Int:
-                let acc2:
-                  if bt > 0
-                  | acc.add([#false, #false, #false, rest.substring(0 .. bt)])
-                  | acc
-                go(rest.substring(j + 1 ..),
-                   acc2.add([code_color, #false, #false, rest.substring(bt + 1 .. j)]))
-            | ~else: acc.add([#false, #false, #false, rest])
-        | bd is_a Int:
-            match find_str(rest, "**", bd + 2)
-            | j :: Int:
-                let acc2:
-                  if bd > 0
-                  | acc.add([#false, #false, #false, rest.substring(0 .. bd)])
-                  | acc
-                go(rest.substring(j + 2 ..),
-                   acc2.add([#false, #false, "bold", rest.substring(bd + 2 .. j)]))
-            | ~else: acc.add([#false, #false, #false, rest])
-        | ~else: acc.add([#false, #false, #false, rest])
-
-// One logical assistant line -> styled spans. in_fence: inside a ``` block.
-fun md_line_spans(text :: String, in_fence, tcolor) :: List:
-  let t = text.trim()
-  cond
-  | t.starts_with("```"): [[tcolor("sep"), #false, "dim", text]]
-  | in_fence: [[tcolor("md_code"), #false, #false, text]]
-  | md_header_end(text) is_a Int: [[tcolor("md_head"), #false, "bold", text]]
-  | t == "---" || t == "***" || t == "___": [[tcolor("sep"), #false, "dim", text]]
-  | t.starts_with(">"): [[tcolor("md_quote"), #false, "italic", text]]
-  | ~else:
-      match md_bullet_end(text)
-      | m :: Int:
-          [[tcolor("md_bullet"), #false, "bold", text.substring(0 .. m)]]
-            ++ md_inline(text.substring(m ..), tcolor("md_code"))
-      | ~else: md_inline(text, tcolor("md_code"))
 
 fun list_dir_safe(dir :: String) :: List:
   if filesystem.directory_exists(dir)
@@ -402,6 +310,13 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable last_trans_h = 20      // visible transcript height from last render
   def mutable tools_expanded = #false  // Ctrl-O: expand tool output blocks
   def mutable thinking_shown = #true   // Ctrl-T: show/hide chain of thought
+  def mutable kill_ring :: List = []   // newest first
+  def mutable kill_idx = 0
+  def mutable last_was_kill = #false
+  def mutable last_was_yank = #false
+  def mutable yank_start = 0
+  def mutable yank_line = 0
+  def mutable yank_len = 0
 
   // mouse text selection (pi-style, app-owned since mouse reporting is on):
   // press anchors, drag extends (inverse-video highlight), release copies.
@@ -467,6 +382,64 @@ fun run_tui(~theme: theme_in :: Map = {},
     set_cur(t.substring(0 .. cur_col) +& s +& t.substring(cur_col ..))
     cur_col := cur_col + s.length()
     dirty := #true
+
+  fun kill_push(s :: String, ~append: append = #false):
+    when s != ""
+    | if append && kill_ring != []
+      | kill_ring := kill_ring.set(0, to_string(kill_ring[0]) +& s)
+      | kill_ring := [s] ++ kill_ring
+        when kill_ring.length() > 32
+        | kill_ring := (for List (i in 0 .. 32): kill_ring[i])
+      last_was_kill := #true
+      kill_idx := 0
+
+  fun kill_line():
+    let t = cur_text()
+    cond
+    | cur_col < t.length():
+        let killed = t.substring(cur_col ..)
+        set_cur(t.substring(0 .. cur_col))
+        kill_push(killed, ~append: last_was_kill)
+    | ~else: #void
+    dirty := #true
+
+  fun kill_word():
+    let t = cur_text()
+    when cur_col > 0
+    | let i:
+        recur go(j = cur_col):
+          if j > 0 && t[j - 1] == Char" " | go(j - 1) | j
+      let start:
+        recur go(j = i):
+          if j > 0 && t[j - 1] != Char" " | go(j - 1) | j
+      let killed = t.substring(start .. cur_col)
+      set_cur(t.substring(0 .. start) +& t.substring(cur_col ..))
+      cur_col := start
+      kill_push(killed, ~append: last_was_kill)
+    dirty := #true
+
+  fun yank():
+    when kill_ring != []
+    | kill_idx := 0
+      yank_line := cur_line
+      yank_start := cur_col
+      let s = to_string(kill_ring[0])
+      insert(s)
+      yank_len := s.length()
+      last_was_yank := #true
+
+  fun yank_pop():
+    when last_was_yank && kill_ring.length() > 1 && cur_line == yank_line
+    | let t = cur_text()
+      let end = yank_start + yank_len
+      when yank_start >= 0 && end <= t.length()
+      | kill_idx := (kill_idx + 1) mod kill_ring.length()
+        let s = to_string(kill_ring[kill_idx])
+        set_cur(t.substring(0 .. yank_start) +& s +& t.substring(end ..))
+        yank_len := s.length()
+        cur_col := yank_start + yank_len
+        last_was_yank := #true
+        dirty := #true
 
   fun insert_newline():
     let t = cur_text()
@@ -626,7 +599,7 @@ fun run_tui(~theme: theme_in :: Map = {},
     | rkt.#{break-thread}(turn_thread)
       rkt.#{thread-wait}(turn_thread)
       turn_thread := #false
-      activity := #false
+      clear_activity()
       flush_partial()
       push("notify", "[turn interrupted]")
       // pi behavior: interrupted queue returns to the editor for re-editing
@@ -691,7 +664,7 @@ fun run_tui(~theme: theme_in :: Map = {},
         dirty := #true
 
   fun start_turn(input :: String):
-    activity := "thinking"
+    set_activity("thinking")
     turn_started := rkt.#{current-inexact-milliseconds}()
     let t = rkt.thread(fun ():
                          try:
@@ -783,11 +756,20 @@ fun run_tui(~theme: theme_in :: Map = {},
         handle_key_core(k)
         // editing keys re-filter the popup; anything else closes it
         if k.length() == 1 || k == "<backspace>" || k == "C-H"
-             || k == "<delete>" || k == "C-U"
+             || k == "<delete>" || k == "C-U" || k == "C-K" || k == "C-W"
+             || k == "C-Y" || k == "M-Y" || k == "M-y"
         | update_ac()
         | close_ac()
 
   fun handle_key_core(k :: String):
+    let killish = k == "C-K" || k == "C-W" || k == "C-U"
+                    || k == kb("kill_line", "C-K") || k == kb("kill_word", "C-W")
+    let yankish = k == "C-Y" || k == "M-Y" || k == "M-y"
+                    || k == kb("yank", "C-Y") || k == kb("yank_pop", "M-Y")
+    when !killish
+    | last_was_kill := #false
+    when !yankish
+    | last_was_yank := #false
     cond
     | k == "C-M": submit()
     | k == "M-C-M" || k == "M-<return>" || k == kb("queue_followup", "M-C-M"):
@@ -875,16 +857,30 @@ fun run_tui(~theme: theme_in :: Map = {},
         when String.join(input_lines, "") == ""
         | running := #false
     | k == "C-U":
+        let t = cur_text()
+        when t != ""
+        | kill_push(t, ~append: last_was_kill)
         set_cur("")
         cur_col := 0
         dirty := #true
+    | k == kb("kill_line", "C-K") || k == "C-K": kill_line()
+    | k == kb("kill_word", "C-W") || k == "C-W": kill_word()
+    | k == kb("yank", "C-Y") || k == "C-Y": yank()
+    | k == kb("yank_pop", "M-Y") || k == "M-Y" || k == "M-y": yank_pop()
     | k.length() == 1: insert(k)
     | ~else: #void
 
   fun render():
-    // clear the flag FIRST: background threads may push during the draw, and
-    // their dirty-mark must survive so the next loop iteration repaints
-    dirty := #false
+    // Snapshot under the lock and clear dirty first: background threads may
+    // push during the draw, and their dirty-mark must survive so the next
+    // loop iteration repaints.
+    let frame = take_frame()
+    let lines = frame["lines"]
+    let partial = frame["partial"]
+    let partial_kind = frame["partial_kind"]
+    let activity = frame["activity"]
+    let widgets = frame["widgets"]
+    let footer_extra = frame["footer_extra"]
     let rows = term.#{term-rows}()
     let cols = term.#{term-cols}()
     let input_h = math.min(input_lines.length(), 8)
@@ -937,6 +933,8 @@ fun run_tui(~theme: theme_in :: Map = {},
               | fence := !fence
               md_line_spans(sub, was, tcolor)
           | kind == "think": [[tcolor("think"), #false, "dim", sub]]
+          | kind == "subagent":
+              [[tcolor("subagent"), #false, "dim", "  \u2502 " +& sub]]
           | ~else: [[tcolor(kind), #false, #false, sub]]
         each row in wrap_spans(spans, cols)
         row
@@ -992,8 +990,8 @@ fun run_tui(~theme: theme_in :: Map = {},
     let input_rows:
       for List (i in win_start .. math.min(input_lines.length(), win_start + input_h)):
         let prompt = (if i == 0 | "\u276F " | "\u2502 ")
-        [[tcolor("prompt"), #false, "bold", prompt],
-         [#false, #false, #false, to_string(input_lines[i])]]
+        [[tcolor("prompt"), #false, "bold", prompt]]
+          ++ editor_line_spans(to_string(input_lines[i]), i == 0, tcolor)
     // extension widgets above the queue/status area
     let widget_rows:
       for List (i in 0 .. widget_h):
@@ -1063,7 +1061,7 @@ fun run_tui(~theme: theme_in :: Map = {},
       | // reap finished turn
         when turn_thread && rkt.#{thread-dead?}(turn_thread)
         | turn_thread := #false
-          activity := #false
+          clear_activity()
           flush_partial()
           dirty := #true
           match followups

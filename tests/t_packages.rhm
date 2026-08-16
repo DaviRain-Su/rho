@@ -1,0 +1,21 @@
+#lang rhombus
+
+import:
+  "../src/kernel/packages.rhm" as packages
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+check("github shorthand", packages.package_name("https://github.com/acme/rho-ext.git") == "rho-ext")
+check("rejects dotdot url", packages.package_name("https://evil.example/..") == #false)
+check("rejects empty", packages.safe_pkg_name("") == #false)
+check("rejects slash name", packages.safe_pkg_name("foo/bar") == #false)
+check("rejects traversal name", packages.safe_pkg_name("../secrets") == #false)
+
+if failures == 0
+| println("t_packages OK")
+| error("t_packages failed: " +& failures)

@@ -3,6 +3,11 @@
 // Central registry: tools, commands, event handlers, extension state.
 // Entries are tagged with a source ("builtin" or extension path) so that
 // extension-contributed entries can be wiped and rebuilt on /reload.
+// Maps are mutex-guarded: the turn thread looks up tools while /reload
+// and the TUI read the same registry.
+
+import:
+  "sync.rkt" as sync
 
 export:
   Tool
@@ -30,11 +35,18 @@ class Registry(tools :: MutableMap,
                state :: MutableMap,
                mutable current_source :: String,
                mutable allow_tools,
-               mutable deny_tools :: List):
+               mutable deny_tools :: List,
+               mu):
+
+  method locked(fn):
+    sync.#{with-lock}(mu, fn)
 
   method set_tool_filter(~allow: allow = #false, ~deny: deny :: List = []):
-    allow_tools := allow
-    deny_tools := deny
+    fun apply_filter():
+      allow_tools := allow
+      deny_tools := deny
+      #void
+    locked(apply_filter)
 
   method tool_visible(name :: String) :: Boolean:
     cond
@@ -46,20 +58,23 @@ class Registry(tools :: MutableMap,
                        ~description: description :: String,
                        ~schema: schema :: Map,
                        ~fn: fn):
-    tools[name] := Tool(name, description, schema, fn, current_source)
+    locked(fun (): tools[name] := Tool(name, description, schema, fn, current_source))
 
   method register_command(~name: name :: String,
                           ~description: description :: String,
                           ~handler: handler):
-    commands[name] := Command(name, description, handler, current_source)
+    locked(fun (): commands[name] := Command(name, description, handler, current_source))
 
   method on(event :: String, fn):
-    handlers[event] := handlers.get(event, []).add([current_source, fn])
+    locked(fun (): handlers[event] := handlers.get(event, []).add([current_source, fn]))
 
   // Runs all handlers for event; returns first Map result that is not #false
   // (used for tool_call interception: {"block": #true, "reason": ...}).
+  // Copy the handler list under the lock, then call out so a handler that
+  // registers tools cannot deadlock.
   method emit(event :: String, data :: Map):
-    for values(result = #false) (entry in handlers.get(event, [])):
+    let hs = locked(fun (): handlers.get(event, []))
+    for values(result = #false) (entry in hs):
       let [_, fn] = entry
       let r = try:
                 fn(data)
@@ -69,33 +84,100 @@ class Registry(tools :: MutableMap,
       result || (r is_a Map && r)
 
   method find_tool(name :: String) :: maybe(Tool):
-    tool_visible(name) && tools.get(name, #false)
+    locked(fun (): tool_visible(name) && tools.get(name, #false))
 
   method tool_list() :: List:
-    for List (name in tools.keys().sort()):
-      skip_when !tool_visible(name)
-      tools[name]
+    fun list_tools() :: List:
+      for List (name in tools.keys().sort()):
+        skip_when !tool_visible(name)
+        tools[name]
+    locked(list_tools)
 
   method tools_wire() :: List:
     for List (t in tool_list()):
       t.wire()
 
   method command_list() :: List:
-    for List (name in commands.keys().sort()):
-      commands[name]
+    fun list_cmds() :: List:
+      for List (name in commands.keys().sort()):
+        commands[name]
+    locked(list_cmds)
 
   method find_command(name :: String) :: maybe(Command):
-    commands.get(name, #false)
+    locked(fun (): commands.get(name, #false))
 
-  // Remove everything not contributed by "builtin" (used before reload).
+  method snapshot_unlocked() :: Map:
+    let ts:
+      for List (name in tools.keys()):
+        skip_when (tools[name] :: Tool).source == "builtin"
+        [name, tools[name]]
+    let cs:
+      for List (name in commands.keys()):
+        skip_when (commands[name] :: Command).source == "builtin"
+        [name, commands[name]]
+    let hs:
+      for List (event in handlers.keys()):
+        let ext:
+          for List (entry in handlers[event]):
+            skip_when entry[0] == "builtin"
+            entry
+        skip_when ext == []
+        [event, ext]
+    let renderers:
+      match state.get("tool_renderers", #false)
+      | mm :: MutableMap:
+          for List (k in mm.keys()):
+            [k, mm[k]]
+      | ~else: []
+    { "tools": ts,
+      "commands": cs,
+      "handlers": hs,
+      "tool_renderers": renderers,
+      "message_renderers": state.get("message_renderers", []) }
+
+  method snapshot_extensions() :: Map:
+    locked(fun (): snapshot_unlocked())
+
+  method restore_extensions(snap :: Map):
+    locked(fun (): restore_unlocked(snap))
+
+  method restore_unlocked(snap :: Map):
+    for (pair in snap.get("tools", [])):
+      tools[pair[0]] := pair[1]
+    for (pair in snap.get("commands", [])):
+      commands[pair[0]] := pair[1]
+    for (pair in snap.get("handlers", [])):
+      let event = pair[0]
+      handlers[event] := handlers.get(event, []) ++ pair[1]
+    state["message_renderers"] := snap.get("message_renderers", [])
+    let rows = snap.get("tool_renderers", [])
+    when rows is_a List && rows != []
+    | let mm = MutableMap()
+      for (pair in rows):
+        mm[pair[0]] := pair[1]
+      state["tool_renderers"] := mm
+    #void
+
   method clear_extensions():
-    for (name in tools.keys()):
-      when (tools[name] :: Tool).source != "builtin"
-      | tools.remove(name)
-    for (name in commands.keys()):
-      when (commands[name] :: Command).source != "builtin"
-      | commands.remove(name)
-    for (event in handlers.keys()):
+    locked(fun (): clear_unlocked())
+
+  method clear_unlocked():
+    let doomed_tools:
+      for List (name in tools.keys()):
+        skip_when (tools[name] :: Tool).source == "builtin"
+        name
+    for (name in doomed_tools):
+      tools.remove(name)
+    let doomed_cmds:
+      for List (name in commands.keys()):
+        skip_when (commands[name] :: Command).source == "builtin"
+        name
+    for (name in doomed_cmds):
+      commands.remove(name)
+    let events:
+      for List (event in handlers.keys()):
+        event
+    for (event in events):
       handlers[event] := (for List (entry in handlers[event]):
                             skip_when entry[0] != "builtin"
                             entry)
@@ -103,10 +185,13 @@ class Registry(tools :: MutableMap,
     state["message_renderers"] := []
     match state.get("tool_renderers", #false)
     | mm :: MutableMap:
-        for (k in mm.keys()):
+        let ks:
+          for List (k in mm.keys()):
+            k
+        for (k in ks):
           mm.remove(k)
     | ~else: #void
 
 fun make_registry() :: Registry:
   Registry(MutableMap(), MutableMap(), MutableMap(), MutableMap(), "builtin",
-           #false, [])
+           #false, [], sync.#{make-lock}())

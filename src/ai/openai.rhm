@@ -11,6 +11,8 @@ import:
 export:
   stream_chat
   messages_payload
+  function_arguments
+  sanitize_assistant
 
 // Convert canonical tool defs to OpenAI wire format
 fun tools_payload(tools :: List) :: List:
@@ -20,19 +22,53 @@ fun tools_payload(tools :: List) :: List:
                     "description": t["description"],
                     "parameters": t["schema"] } }
 
+// OpenAI-compatible servers require function.arguments to be a JSON object
+// string. Empty or truncated values from another provider (e.g. Codex) 400
+// as "invalid tool call arguments" if replayed as-is.
+fun function_arguments(v) :: String:
+  cond
+  | v is_a Map: json.to_string(v)
+  | v is_a List: json.to_string({ "value": v })
+  | v is_a String:
+      let t = v.trim()
+      cond
+      | t == "": "{}"
+      | ~else:
+          let parsed = try:
+                         json.from_string(t)
+                         ~catch _: #false
+          cond
+          | parsed is_a Map: t
+          | parsed is_a String && parsed != "": json.to_string({ "command": parsed })
+          | parsed is_a List: json.to_string({ "value": parsed })
+          | ~else: "{}"
+  | ~else: "{}"
+
+fun sanitize_assistant(msg :: Map) :: Map:
+  let tcs = msg.get("tool_calls", [])
+  if !(tcs is_a List) || tcs == []
+  | msg
+  | msg ++ { "tool_calls":
+               for List (tc in tcs):
+                 { "id": to_string(tc.get("id", "")),
+                   "name": to_string(tc.get("name", "")),
+                   "arguments": function_arguments(tc.get("arguments", "")) } }
+
 // Canonical messages -> clean OpenAI wire format (strips extra keys)
 fun messages_payload(messages :: List) :: List:
   for List (m in messages):
     match m.get("role", "")
     | "assistant":
         let base = { "role": "assistant", "content": m.get("content", "") }
-        if m.get("tool_calls", []) == []
+        let tcs = m.get("tool_calls", [])
+        if !(tcs is_a List) || tcs == []
         | base
         | base ++ { "tool_calls":
-                      for List (tc in m["tool_calls"]):
-                        { "id": tc["id"],
+                      for List (tc in tcs):
+                        { "id": to_string(tc.get("id", "")),
                           "type": "function",
-                          "function": { "name": tc["name"], "arguments": tc["arguments"] } } }
+                          "function": { "name": to_string(tc.get("name", "")),
+                                        "arguments": function_arguments(tc.get("arguments", "")) } } }
     | "tool":
         { "role": "tool",
           "tool_call_id": m.get("tool_call_id", ""),
@@ -140,11 +176,13 @@ fun stream_chat(~base_url: base_url :: String,
                 "name": prev["name"] +& fn.get("name", ""),
                 "arguments": prev["arguments"] +& fn.get("arguments", "") }
             acc[idx] := next
-  sse.each_event(resp.output(), handle)
-  resp.close()
-  let tool_calls:
-    for List (idx in acc.keys().sort()):
-      acc[idx]
-  let msg = { "role": "assistant", "content": content, "tool_calls": tool_calls,
-              "finish_reason": finish_reason, "usage": usage }
-  if reasoning == "" | msg | msg ++ { "thinking": reasoning }
+  try:
+    sse.each_event(resp.output(), handle)
+    let tool_calls:
+      for List (idx in acc.keys().sort()):
+        acc[idx]
+    let msg = { "role": "assistant", "content": content, "tool_calls": tool_calls,
+                "finish_reason": finish_reason, "usage": usage }
+    if reasoning == "" | msg | msg ++ { "thinking": reasoning }
+    ~finally:
+      resp.close()

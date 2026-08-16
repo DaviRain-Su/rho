@@ -7,6 +7,8 @@ import:
   json
   rhombus/envvar
   lib("racket/base.rkt") as rkt
+  "errors.rhm" as errors
+  "sync.rkt" as sync
 
 export:
   Config
@@ -19,10 +21,28 @@ export:
   set_api_key_override
   auth_list
   auth_set
+  auth_set_record
+  auth_record
   auth_remove
+  has_auth
+  credentials_ok
+  has_chatgpt_auth
+  migrate_chatgpt_auth
+  auth_is_oauth
+  home
 
 fun home() :: String:
-  envvar.getenv("HOME") || "/tmp"
+  match envvar.getenv("HOME")
+  | s :: String:
+      if s != "" | s | home_dir()
+  | ~else: home_dir()
+
+fun home_dir() :: String:
+  try:
+    let p = to_string(rkt.#{find-system-path}(rkt.#{string->symbol}("home-dir")))
+    if p != "" | p | error("HOME is unset; refusing to store credentials under /tmp")
+    ~catch _:
+      error("HOME is unset; refusing to store credentials under /tmp")
 
 fun config_dir() :: String:
   home() +& "/.rho"
@@ -55,13 +75,38 @@ fun set_api_key_override(k :: String):
 fun auth_path() :: String:
   config_dir() +& "/auth.json"
 
+def mutable auth_cache = #false
+def mutable auth_mtime = -1
+def auth_lock = sync.#{make-lock}()
+
+fun load_auth_file(path :: String, mt) :: Map:
+  let parsed:
+    if mt < 0 | {} | errors.read_json_map(path)
+  if parsed is_a Map | parsed | {}
+
+fun read_auth_locked() :: Map:
+  let path = auth_path()
+  let mt:
+    if filesystem.file_exists(path)
+    | rkt.#{file-or-directory-modify-seconds}(path)
+    | -1
+  cond
+  | auth_cache is_a Map && mt == auth_mtime: auth_cache
+  | ~else:
+      let m = load_auth_file(path, mt)
+      auth_cache := m
+      auth_mtime := mt
+      m
+
 fun read_auth() :: Map:
-  if filesystem.file_exists(auth_path())
-  | let parsed = try:
-                   json.from_string(filesystem.read_string(auth_path()))
-                   ~catch _: {}
-    if parsed is_a Map | parsed | {}
-  | {}
+  sync.#{with-lock}(auth_lock, read_auth_locked)
+
+fun write_auth_locked(m :: Map):
+  auth_cache := m
+  auth_mtime := (if filesystem.file_exists(auth_path())
+                 | rkt.#{file-or-directory-modify-seconds}(auth_path())
+                 | -1)
+  #void
 
 fun write_auth(m :: Map):
   when !filesystem.directory_exists(config_dir())
@@ -70,12 +115,60 @@ fun write_auth(m :: Map):
   try:
     rkt.#{file-or-directory-permissions}(Path(auth_path()), 0o600)
     ~catch _: #void
+  sync.#{with-lock}(auth_lock, fun (): write_auth_locked(m))
 
 fun auth_list() :: List:
   read_auth().keys().sort()
 
 fun auth_set(provider :: String, key :: String):
   write_auth(read_auth() ++ { provider: key })
+
+fun auth_set_record(provider :: String, rec):
+  write_auth(read_auth() ++ { provider: rec })
+
+fun auth_record(provider :: String):
+  read_auth().get(provider, #false)
+
+fun token_from_record(rec) :: String:
+  match rec
+  | k :: String: k
+  | m :: Map: to_string(m.get("access_token", m.get("key", "")))
+  | ~else: ""
+
+fun has_auth(provider :: String) :: Boolean:
+  token_from_record(auth_record(provider)) != ""
+
+fun auth_is_oauth(provider :: String) :: Boolean:
+  match auth_record(provider)
+  | m :: Map: m.get("type", "") == "oauth"
+  | ~else: #false
+
+fun has_chatgpt_auth() :: Boolean:
+  (has_auth("openai-codex") && auth_is_oauth("openai-codex"))
+    || (has_auth("openai") && auth_is_oauth("openai"))
+
+// Older builds stored ChatGPT OAuth under "openai". Copy it to openai-codex.
+fun migrate_chatgpt_auth():
+  when has_auth("openai") && auth_is_oauth("openai") && !has_auth("openai-codex")
+  | auth_set_record("openai-codex", auth_record("openai"))
+
+fun env_set(env_name :: String) :: Boolean:
+  env_name != "" && (block:
+                       let v = envvar.getenv(env_name)
+                       v is_a String && v != "")
+
+// A provider can be used when an env key, auth.json entry, or --api-key is set.
+// ChatGPT OAuth unlocks openai-codex only, never the platform `openai` API.
+fun credentials_ok(provider :: String, env_name :: String) :: Boolean:
+  cond
+  | api_key_override is_a String: #true
+  | provider == "openai-codex":
+      has_chatgpt_auth() || env_set(env_name)
+  | provider == "openai":
+      (has_auth("openai") && !auth_is_oauth("openai")) || env_set(env_name)
+  | has_auth(provider): #true
+  | env_name == "": #true
+  | ~else: env_set(env_name)
 
 fun auth_remove(provider :: String) :: Boolean:
   let m = read_auth()
@@ -99,13 +192,19 @@ class Config(mutable provider :: String,
     cond
     | api_key_override is_a String: api_key_override
     | ~else:
-        match read_auth().get(provider, #false)
-        | k :: String: k
-        | ~else:
-            let env_name = profile().get("api_key_env", "")
-            if env_name == ""
+        let stored = token_from_record(read_auth().get(provider, #false))
+        let stored:
+          if stored != ""
+          | stored
+          | if provider == "openai-codex"
+            | token_from_record(read_auth().get("openai", #false))
             | ""
-            | envvar.getenv(env_name) || ""
+        if stored != ""
+        | stored
+        | let env_name = profile().get("api_key_env", "")
+          if env_name == ""
+          | ""
+          | envvar.getenv(env_name) || ""
   method kind() :: String:
     // "openai" (chat completions) or "anthropic" (messages API)
     profile().get("kind", "openai")
@@ -130,6 +229,26 @@ def default_providers :: Map:
       "api_key_env": "OPENAI_API_KEY",
       "default_model": "gpt-5.2"
     },
+    "openai-codex": {
+      "kind": "openai",
+      "base_url": "https://chatgpt.com/backend-api/codex",
+      "api_key_env": "OPENAI_CODEX_API_KEY",
+      "default_model": "gpt-5.6-sol",
+      "oauth": {
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "authorize_url": "https://auth.openai.com/oauth/authorize",
+        "token_url": "https://auth.openai.com/oauth/token",
+        "redirect_uri": "http://localhost:1455/auth/callback",
+        "scope": "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        "mode": "localhost",
+        "callback_port": 1455,
+        "extra_auth_params": {
+          "id_token_add_organizations": "true",
+          "codex_cli_simplified_flow": "true",
+          "originator": "codex_cli_rs"
+        }
+      }
+    },
     "openrouter": {
       "kind": "openai",
       "base_url": "https://openrouter.ai/api/v1",
@@ -146,22 +265,26 @@ def default_providers :: Map:
       "kind": "anthropic",
       "base_url": "https://api.anthropic.com",
       "api_key_env": "ANTHROPIC_API_KEY",
-      "default_model": "claude-sonnet-4-5"
+      "default_model": "claude-sonnet-4-5",
+      "oauth": {
+        "client_id": "9d1c250a-e61b-44d9-88e4-5944d1962f5e",
+        "authorize_url": "https://claude.ai/oauth/authorize",
+        "token_url": "https://platform.claude.com/v1/oauth/token",
+        "redirect_uri": "https://console.anthropic.com/oauth/code/callback",
+        "scope": "org:create_api_key user:profile user:inference",
+        "mode": "paste",
+        "extra_auth_params": { "code": "true" }
+      }
     }
   }
 
 fun read_config_file() :: Map:
-  let path = config_dir() +& "/config.json"
-  if filesystem.file_exists(path)
-  | try:
-      json.from_string(filesystem.read_string(path))
-      ~catch _:
-        {}
-  | {}
+  errors.read_json_map(config_dir() +& "/config.json")
 
 fun load_config(~provider: provider_arg :: maybe(String) = #false,
                 ~model: model_arg :: maybe(String) = #false,
                 ~thinking: thinking :: maybe(String) = #false) :: Config:
+  migrate_chatgpt_auth()
   let file_cfg = read_config_file()
   let providers:
     let extra = file_cfg.get("providers", {})

@@ -5,8 +5,10 @@
 // ~/.rho/models_dev.json, refreshed in the background when older than 7 days.
 //
 // A provider is *usable* when rho speaks its protocol (openai-compatible or
-// anthropic, inferred from the npm field) and *available* when one of its
-// API-key env vars is set.
+// anthropic, inferred from the npm field) and *available* when credentials
+// exist. Shared env vars do not unlock every catalog product that lists
+// them (OPENCODE_API_KEY → OpenCode Go only; Kimi For Coding is the
+// built-in `kimi` provider, not a second listing).
 
 import:
   json
@@ -14,14 +16,25 @@ import:
   rhombus/envvar
   lib("racket/base.rkt") as rkt
   "../kernel/config.rhm" as config
+  "../kernel/errors.rhm" as errors
+  "../kernel/sync.rkt" as sync
 
 export:
   refresh_async
   catalog
   provider_profile
   env_key_present
+  catalog_unlocked
   available_providers
   lookup_model
+  fallback_models
+  merge_model_maps
+  env_unlocks
+  catalog_suppressed
+  listed_model
+  provider_label
+  hidden_builtin
+  codex_model_id
 
 def url = "https://models.dev/api.json"
 
@@ -29,6 +42,7 @@ fun cache_file() :: String:
   config.config_dir() +& "/models_dev.json"
 
 def mutable mem = #false
+def mem_lock = sync.#{make-lock}()
 
 fun fetch_now() :: Boolean:
   try:
@@ -43,7 +57,7 @@ fun fetch_now() :: Boolean:
         when !filesystem.directory_exists(config.config_dir())
         | filesystem.make_directory(config.config_dir(), ~parents: #true)
         filesystem.write_string(cache_file(), body, ~exists: #'truncate)
-        mem := parsed
+        sync.#{with-lock}(mem_lock, fun (): mem := parsed)
         #true
     | ~else: #false
     ~catch _:
@@ -60,14 +74,13 @@ fun refresh_async():
   | rkt.thread(fun (): fetch_now())
     #void
 
-fun catalog() :: Map:
+fun catalog_locked() :: Map:
   when mem == #false
-  | mem := (if filesystem.file_exists(cache_file())
-            | try:
-                json.from_string(filesystem.read_string(cache_file()))
-                ~catch _: {}
-            | {})
+  | mem := errors.read_json_map(cache_file())
   if mem is_a Map | mem | {}
+
+fun catalog() :: Map:
+  sync.#{with-lock}(mem_lock, catalog_locked)
 
 // rho provider profile for a models.dev entry, or #false when the protocol
 // is unsupported.
@@ -101,8 +114,139 @@ fun env_key_present(p :: Map):
                 let v = envvar.getenv(n)
                 if v is_a String && v != "" | n | #false)
 
+// models.dev id -> rho auth.json keys that unlock it
+fun auth_names_for(id :: String) :: List:
+  match id
+  | "moonshotai": ["moonshotai", "kimi"]
+  | "kimi-for-coding": ["kimi-for-coding", "kimi"]
+  | ~else: [id]
+
+// Catalog ids that are the same product as a built-in provider.
+fun catalog_suppressed(id :: String) :: Boolean:
+  id == "kimi-for-coding"
+
+// Built-in protocol aliases that should not appear as a second product.
+fun hidden_builtin(id :: String) :: Boolean:
+  id == "kimi-anthropic"
+
+// When several catalog providers share one env var, only the preferred
+// product auto-unlocks. Others need /login <id> or config.json.
+def prefer_shared_env :: Map:
+  { "OPENCODE_API_KEY": "opencode-go" }
+
+fun env_owners() :: Map:
+  let cat = catalog()
+  for values(acc = {}) ((id, p) in cat):
+    if !(p is_a Map)
+    | acc
+    | let envs = p.get("env", [])
+      let envs = (if envs is_a List | envs | [])
+      for values(acc = acc) (name in envs):
+        let n = to_string(name)
+        let prev = acc.get(n, [])
+        let prev = (if prev is_a List | prev | [])
+        acc ++ { n: prev.add(to_string(id)) }
+
+// owners = catalog ids that list this env var (may be empty in tests).
+fun env_unlocks(id :: String, env_name :: String, owners :: List) :: Boolean:
+  cond
+  | catalog_suppressed(id): #false
+  | prefer_shared_env.get(env_name, "") == id: #true
+  | owners.length() <= 1: #true
+  | ~else: #false
+
+fun catalog_unlocked(id, p :: Map) :: Boolean:
+  let id = to_string(id)
+  cond
+  | (for values(ok = #false) (n in auth_names_for(id)):
+       ok || config.has_auth(n)):
+      #true
+  | catalog_suppressed(id):
+      #false
+  | ~else:
+      let owners_map = env_owners()
+      let envs = p.get("env", [])
+      let envs = (if envs is_a List | envs | [])
+      for values(ok = #false) (name in envs):
+        ok || (block:
+                 let n = to_string(name)
+                 let v = envvar.getenv(n)
+                 let set = v is_a String && v != ""
+                 let owners = owners_map.get(n, [])
+                 let owners = (if owners is_a List | owners | [])
+                 set && env_unlocks(id, n, owners))
+
+fun provider_label(id :: String) :: String:
+  cond
+  | id == "kimi" || id == "kimi-anthropic": "Kimi"
+  | id == "openai": "OpenAI"
+  | id == "openai-codex": "OpenAI Codex"
+  | id == "anthropic": "Anthropic"
+  | id == "openrouter": "OpenRouter"
+  | id == "ollama": "Ollama"
+  | ~else:
+      let p = catalog().get(id, #false)
+      if p is_a Map
+      | let n = to_string(p.get("name", id))
+        if n == "" | id | n
+      | id
+
+// Drop image / audio / embedding ids from the OpenAI picker so GPT chat
+// models stay visible after /login openai.
+// Bare gpt-5.6 400s on ChatGPT accounts. Named 5.3/5.4/5.5/5.6-* stay as-is.
+fun codex_model_id(mid :: String) :: String:
+  let id = mid.foldcase()
+  if id == "gpt-5.6" || id == "gpt-5" | "gpt-5.6-sol" | mid
+
+fun listed_model(pname :: String, mid :: String) :: Boolean:
+  cond
+  | pname == "openai-codex":
+      let id = mid.foldcase()
+      id != "gpt-5.6" && !id.contains("-wm")
+        && (id.contains("codex")
+              || id.starts_with("gpt-5.3")
+              || id.starts_with("gpt-5.4")
+              || id.starts_with("gpt-5.5")
+              || id.starts_with("gpt-5.6-"))
+  | pname == "openai":
+      let id = mid.foldcase()
+      !id.contains("embedding")
+        && !id.starts_with("gpt-image")
+        && !id.starts_with("chatgpt-image")
+        && !id.contains("realtime")
+        && !id.contains("whisper")
+        && !id.contains("tts")
+        && !id.contains("transcribe")
+  | ~else: #true
+
+// Known chat models when models.dev is empty or missing an id the user
+// expects after /login. Catalog entries win on merge (they have pricing).
+fun fallback_models(pname :: String) :: Map:
+  cond
+  | pname == "openai-codex":
+      { "gpt-5.3-codex": {}, "gpt-5.3-codex-spark": {},
+        "gpt-5.4": {}, "gpt-5.4-mini": {}, "gpt-5.5": {},
+        "gpt-5.6-sol": {}, "gpt-5.6-terra": {}, "gpt-5.6-luna": {} }
+  | pname == "openai":
+      { "gpt-5.2": {}, "gpt-5": {}, "gpt-5-mini": {}, "gpt-4.1": {},
+        "gpt-4o": {}, "gpt-4o-mini": {}, "o3": {}, "o3-mini": {},
+        "o4-mini": {} }
+  | pname == "anthropic":
+      { "claude-sonnet-4-5": {}, "claude-opus-4-5": {}, "claude-haiku-4-5": {} }
+  | pname == "kimi" || pname == "kimi-anthropic" || pname == "kimi-for-coding":
+      { "k3": {}, "k3-256k": {}, "kimi-for-coding": {},
+        "kimi-for-coding-highspeed": {}, "kimi-k2-turbo-preview": {},
+        "kimi-k2-0905-preview": {}, "kimi-k2-thinking": {} }
+  | ~else: {}
+
+fun merge_model_maps(a, b) :: Map:
+  let left = (if a is_a Map | a | {})
+  let right = (if b is_a Map | b | {})
+  for values(m = left) ((k, v) in right):
+    if m.has_key(k) | m | m ++ { k: v }
+
 // [id, profile, models] for every catalog provider that rho can use and
-// that has an API key configured.
+// that has credentials (env key or auth.json).
 fun available_providers() :: List:
   let cat = catalog()
   for List:
@@ -111,9 +255,15 @@ fun available_providers() :: List:
     skip_when !(p is_a Map)
     let prof = provider_profile(p)
     skip_when !prof
-    skip_when !env_key_present(p)
+    skip_when !catalog_unlocked(id, p)
     let models = p.get("models", {})
-    [to_string(id), prof, if models is_a Map | models | {}]
+    let models = (if models is_a Map | models | {})
+    let id = to_string(id)
+    let models = merge_model_maps(models, fallback_models(id))
+    let models:
+      for values(m = {}) ((mid, info) in models):
+        if listed_model(id, to_string(mid)) | m ++ { mid: info } | m
+    [id, prof, models]
 
 // Search the whole catalog for a model id; returns info in models.rhm
 // format, or #false.

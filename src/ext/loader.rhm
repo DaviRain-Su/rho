@@ -40,6 +40,7 @@ fun discover_extensions(~extra_dirs: extra_dirs :: List = [],
 fun load_extensions(registry, api, ~notify: notify = fun (s): println(s),
                     ~extra_dirs: extra_dirs :: List = [],
                     ~include_project: include_project = #true) :: List:
+  let snap = registry.snapshot_extensions()
   registry.clear_extensions()
   def mutable ok = 0
   def mutable failed = 0
@@ -57,4 +58,7 @@ fun load_extensions(registry, api, ~notify: notify = fun (s): println(s),
         failed := failed + 1
         notify("extension error in " +& path +& ": " +& e.message)
   registry.current_source := "builtin"
+  when ok == 0 && failed > 0 && snap.get("tools", []) != []
+  | registry.restore_extensions(snap)
+    notify("reload failed; restored previous extensions")
   [ok, failed]

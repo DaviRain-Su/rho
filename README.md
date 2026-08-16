@@ -62,7 +62,8 @@ Built-in provider profiles (override or extend in `~/.rho/config.json`):
 |---|---|---|
 | `kimi` (default) | OpenAI chat completions | `KIMI_API_KEY` |
 | `kimi-anthropic` | Anthropic messages | `KIMI_API_KEY` |
-| `openai` | OpenAI chat completions | `OPENAI_API_KEY` |
+| `openai` | OpenAI platform API | `OPENAI_API_KEY` |
+| `openai-codex` | ChatGPT subscription (Codex) | `/login openai oauth` |
 | `openrouter` | OpenAI chat completions | `OPENROUTER_API_KEY` |
 | `ollama` | OpenAI chat completions | (none) |
 | `anthropic` | Anthropic messages | `ANTHROPIC_API_KEY` |
@@ -94,7 +95,9 @@ message.
 - `/session` shows the file plus token totals and cost (from the model
   registry); `/compact [instructions]` summarizes old turns manually, and
   compaction runs automatically when the context nears the window
-  (`CompactionEntry` in the tree; context is rebuilt as summary + kept turns)
+  (`CompactionEntry` in the tree; context is rebuilt as summary + kept turns).
+  `/model` to a smaller window compacts with the outgoing model first so the
+  history still fits; Ctrl-P defers that compact until the next turn.
 
 ## TUI
 
@@ -109,6 +112,13 @@ shell command; `!!cmd` also appends the output to the model context. Themes:
 While a turn runs you can keep typing: plain lines become steering messages
 injected after the current tool batch; `/follow <msg>` queues a follow-up
 turn. The same works in the plain REPL and via `steer` in RPC mode.
+
+The editor highlights `/commands`, `!shell`, `@files`, and `` `code` ``.
+Kill-ring: Ctrl-K (to end of line), Ctrl-W (word), Ctrl-U (whole line),
+Ctrl-Y yank, Alt-Y yank-pop. Consecutive kills append.
+Chain of thought streams dim into the transcript (`Ctrl-T` hides it;
+`/thinking` or Shift-Tab sets the effort). Mouse drag selects transcript
+text and copies on release (Shift+drag uses the terminal's native selection).
 
 ## Skills and prompt templates
 
@@ -137,13 +147,24 @@ extensions/skills/prompts are ignored (headless runs use the
 
 `/help` `/hotkeys` `/model` `/provider` `/reload` `/session` `/tree` `/fork`
 `/clone` `/new` `/name` `/resume` `/export` `/import` `/compact` `/clear`
-`/skills` `/prompts` `/packages` `/share` `/quit` — plus extension commands,
-`/skill:name`, and `/template-name`.
+`/login` `/logout` `/skills` `/prompts` `/packages` `/share` `/quit` — plus
+extension commands, `/skill:name`, and `/template-name`.
+
+`/login <provider> oauth` opens the browser and returns immediately (TUI
+must not block). After authorizing, paste the code or redirect URL:
+`/login anthropic oauth <code#state-or-url>`. OpenAI also completes on
+the localhost callback in the background. API keys: `/login kimi sk-...`.
+Tokens live in `~/.rho/auth.json` (0600) and refresh automatically.
 
 ## Tools
 
 `read_file` `write_file` `edit_file` `bash` `grep` `find` `ls`
-`reload_extensions` — filterable with `--tools`/`--exclude-tools`/`--no-tools`.
+`agent` `reload_extensions` — filterable with `--tools`/`--exclude-tools`/`--no-tools`.
+
+`agent` runs a nested sub-agent with its own session (no further nesting).
+Pass `prompt`, optional `label`, and optional `tools` (comma-separated allowlist).
+The TUI streams the child's text and tool calls live (indented, status
+`sub-agent <label>: <tool>`); Ctrl-O still folds long tool output.
 
 ## Extensions
 
@@ -172,7 +193,8 @@ API surface:
   `agent_start`/`agent_end`, `turn_start`/`turn_end`, `before_request`
   (return `{"messages": [...]}` to inject transient context), `tool_call`
   (return `{"block": #true, "reason": ...}` to veto),
-  `tool_execution_start`/`tool_execution_end`, `tool_result`
+  `tool_execution_start`/`tool_execution_end`, `tool_result`,
+  `subagent_start`/`subagent_end`
 - `rho.state` — mutable map, survives `/reload`
 - `rho.session` / `rho.append_entry(data)` — session access + custom entries
 - `rho.ui.confirm(msg)` / `rho.ui.select(msg, options)` / `rho.ui.input(msg)`
@@ -218,8 +240,11 @@ src/
     registry.rhm      tools / commands / event handlers / state / filters
     session.rhm       session tree, JSONL persistence (~/.rho/sessions/)
     loop.rhm          agent loop: stream, execute tools, steering, events
+    subagent.rhm      nested agent tool (isolated session, depth 1)
+    oauth.rhm         PKCE login + token refresh
+    crypto.rkt        PKCE / url-encode / localhost callback
     context.rhm       AGENTS.md hierarchy, SYSTEM.md/APPEND_SYSTEM.md
-    compaction.rhm    token estimation + summarization compaction
+    compaction.rhm    token estimation + split-summarize compaction
     skills.rhm        skill discovery + XML injection
     prompts.rhm       prompt templates
     frontmatter.rhm   minimal YAML frontmatter parser
@@ -240,6 +265,7 @@ src/
   ui/
     repl.rhm          readline REPL (steering, /follow, Ctrl-C)
     tui.rhm           raart full-screen TUI
+    style.rhm         markdown + editor highlighting, width wrap
     term.rkt          raart lux-chaos shim
 examples/extensions/  greet.rhm (tool macro), guard.rhm (tool_call veto)
 examples/themes/      solarized.json
@@ -248,6 +274,6 @@ tests/                runnable test modules (t_*.rhm)
 
 ## Known limitations
 
-- No sub-agents, OAuth login flows, or image input (pi has no MCP either)
-- Compaction keeps oversized single turns whole rather than split-summarizing
-- TUI editor is plain (no syntax highlighting or kill-ring)
+- No MCP, and no OAuth for providers that only accept API keys (Kimi, Ollama, …)
+- ChatGPT subscription login is the `openai-codex` provider (`/login openai oauth`). It calls `chatgpt.com/backend-api/codex/responses`. Platform `openai` still needs `OPENAI_API_KEY` with billing.
+- TUI editor highlighting is command/`@file`/`code`, not full language syntax

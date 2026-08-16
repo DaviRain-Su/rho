@@ -8,6 +8,7 @@ install_core_tools(reg)
 
 // bash
 def bash = reg.find_tool("bash")
+println(bash.fn({}))
 println(bash.fn({ "command": "echo hello && echo err >&2" }))
 println(bash.fn({ "command": "exit 3" }))
 println(bash.fn({ "command": "sleep 5", "timeout": 1 }))

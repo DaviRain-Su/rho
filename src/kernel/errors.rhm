@@ -1,0 +1,38 @@
+#lang rhombus
+
+// Shared diagnostics and optional-file JSON reads.
+//
+// Error policy:
+//   error() / raise   — invariants (missing HOME, empty OAuth token)
+//   "error: ..."      — tool results and slash-command outcomes
+//   warn() + fallback — optional user files (config / settings / auth / models)
+//   silent catch      — expected-malformed stream fragments (SSE, tool args)
+
+import:
+  json
+  lib("racket/base.rkt") as rkt
+
+export:
+  warn
+  parse_json_map
+  read_json_map
+
+fun warn(src :: String, msg :: String):
+  rkt.#{eprintf}("[rho] ~a: ~a\n", src, msg)
+
+fun parse_json_map(text :: String, ~src: src :: String) :: Map:
+  try:
+    let v = json.from_string(text)
+    cond
+    | v is_a Map: v
+    | ~else:
+        warn(src, "JSON root is not an object")
+        {}
+    ~catch e :: Exn.Fail:
+      warn(src, "invalid JSON: " +& e.message)
+      {}
+
+fun read_json_map(path :: String) :: Map:
+  if filesystem.file_exists(path)
+  | parse_json_map(filesystem.read_string(path), ~src: path)
+  | {}

@@ -17,6 +17,7 @@ import:
   json
   lib("racket/base.rkt") as rkt
   "config.rhm"
+  "crypto.rkt" as crypto
 
 export:
   Session
@@ -24,6 +25,7 @@ export:
   session_dir_for
   list_sessions
   encode_cwd
+  encode_cwd_legacy
 
 class Session(mutable path,
               mutable entries :: List,
@@ -97,6 +99,17 @@ class Session(mutable path,
             skip_when e["id"] < first_kept
             each m in entry_messages(e)
             m
+        let kept:
+          match c.get("keep_suffix", #false)
+          | n :: Int:
+              cond
+              | kept == []: kept
+              | ~else:
+                  let head = kept[0]
+                  let content = to_string(head.get("content", ""))
+                  let trimmed = apply_suffix(head, content, n)
+                  [trimmed] ++ kept.rest
+          | ~else: kept
         [{ "role": "user",
            "content": "[Conversation summary of earlier context]\n\n"
                         +& c.get("summary", "") }]
@@ -128,6 +141,12 @@ class Session(mutable path,
   method clear():
     set_leaf(#false)
 
+fun apply_suffix(head :: Map, content :: String, n :: Int) :: Map:
+  if content.length() <= n
+  | head
+  | let marker = "[... earlier content summarized ...]\n"
+    head ++ { "content": marker +& content.substring(content.length() - n ..) }
+
 // Which model-visible messages an entry contributes.
 fun entry_messages(e :: Map) :: List:
   match e["kind"]
@@ -145,11 +164,20 @@ fun entry_messages(e :: Map) :: List:
            "content": "[Summary of an abandoned conversation branch]\n\n" +& s }]
   | ~else: []
 
-fun encode_cwd(cwd :: String) :: String:
+fun encode_cwd_legacy(cwd :: String) :: String:
   String.join(cwd.split("/", ~trim: #false), "-")
 
+// Percent-encode so /a/b and /a-b cannot collide.
+fun encode_cwd(cwd :: String) :: String:
+  crypto.#{url-encode}(cwd)
+
 fun session_dir_for(cwd :: String) :: String:
-  config.sessions_dir() +& "/" +& encode_cwd(cwd)
+  let neu = config.sessions_dir() +& "/" +& encode_cwd(cwd)
+  let old = config.sessions_dir() +& "/" +& encode_cwd_legacy(cwd)
+  cond
+  | filesystem.directory_exists(neu): neu
+  | filesystem.directory_exists(old): old
+  | ~else: neu
 
 fun new_session_path(dir :: String) :: String:
   when !filesystem.directory_exists(dir)

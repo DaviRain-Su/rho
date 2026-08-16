@@ -6,12 +6,26 @@
 export:
   parse
 
+fun unescape_dq(s :: String) :: String:
+  let out = Port.Output.open_string()
+  recur go(i = 0):
+    cond
+    | i >= s.length(): out.get_string().to_string()
+    | s[i] == Char"\\" && i + 1 < s.length():
+        let n = s[i + 1]
+        out.write_char(if n == Char"\"" || n == Char"\\" || n == Char"'" | n | n)
+        go(i + 2)
+    | ~else:
+        out.write_char(s[i])
+        go(i + 1)
+
 fun unquote(v :: String) :: String:
-  if v.length() >= 2
-       && ((v.starts_with("\"") && v.ends_with("\""))
-             || (v.starts_with("'") && v.ends_with("'")))
-  | v.substring(1 .. v.length() - 1)
-  | v
+  cond
+  | v.length() >= 2 && v.starts_with("\"") && v.ends_with("\""):
+      unescape_dq(v.substring(1 .. v.length() - 1))
+  | v.length() >= 2 && v.starts_with("'") && v.ends_with("'"):
+      v.substring(1 .. v.length() - 1)
+  | ~else: v
 
 // Returns values(meta :: Map, body :: String)
 fun parse(text :: String) :: values(Map, String):

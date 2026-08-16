@@ -117,6 +117,7 @@ fun parse_args() :: Map:
             | parse(more, acc ++ { "export": v })
         | ~else: parse(more, acc ++ { "export": v })
     | ["--no-extensions", & more]: parse(more, acc ++ { "no_extensions": #true })
+    | ["--offline", & more]: parse(more, acc ++ { "offline": #true })
     | [a, & more]:
         cond
         | a.length() > 0 && a.substring(0..1) == "@" && filesystem.file_exists(a.substring(1..)):
@@ -2181,8 +2182,10 @@ fun try_subcommand() :: Boolean:
   | ~else: #false
 
 module main:
-  modelsdev.refresh_async()
-  refresh_codex_models()
+  when !opts.get("offline", #false) && settings.get("offline", #false) == #false
+  | modelsdev.refresh_async()
+  when !opts.get("offline", #false) && settings.get("offline", #false) == #false
+  | refresh_codex_models()
   cond
   | opts.get("export", #false) is_a String:
       run_export_mode()

@@ -20,6 +20,7 @@ export:
   package_extension_dirs
   package_skill_dirs
   package_prompt_dirs
+  package_theme_dirs
   package_name
   safe_pkg_name
 
@@ -34,13 +35,15 @@ fun installed() :: List:
       f +& ""
   | []
 
-// Accepts "git:<url>", a plain URL, or "owner/repo" GitHub shorthand.
+// Accepts "npm:<pkg>", "git:<url>", a plain URL, a local path, or "owner/repo" GitHub shorthand.
 fun resolve_url(spec :: String) :: String:
   cond
+  | spec.starts_with("npm:"): spec // handled separately
   | spec.starts_with("git:"): spec.substring(4..)
   | spec.starts_with("http://") || spec.starts_with("https://")
       || spec.starts_with("git@"):
       spec
+  | filesystem.file_exists(spec) || filesystem.directory_exists(spec): spec
   | ~else: "https://github.com/" +& spec
 
 fun safe_pkg_name(name :: String):
@@ -57,24 +60,29 @@ fun package_name(url :: String):
   safe_pkg_name(last)
 
 fun install(spec :: String) :: String:
-  let url = resolve_url(spec)
-  let name = package_name(url)
   cond
-  | !name: "invalid package name from " +& spec
+  | spec.starts_with("npm:"): install_npm(spec)
+  | filesystem.file_exists(spec) || filesystem.directory_exists(spec):
+      install_local(spec)
   | ~else:
-      let dest = packages_dir() +& "/" +& name
+      let url = resolve_url(spec)
+      let name = package_name(url)
       cond
-      | filesystem.directory_exists(dest):
-          "already installed: " +& name +& " (rho remove " +& name +& " first)"
+      | !name: "invalid package name from " +& spec
       | ~else:
-          when !filesystem.directory_exists(packages_dir())
-          | filesystem.make_directory(packages_dir(), ~parents: #true)
-          let values(code, text) = crypto.#{run-argv}("git", ["clone", "--depth", "1", url, dest])
-          if code == 0
-          | skills.invalidate()
-            prompts.invalidate()
-            "installed " +& name +& " -> " +& dest
-          | "install failed (exit " +& code +& "):\n" +& text
+          let dest = packages_dir() +& "/" +& name
+          cond
+          | filesystem.directory_exists(dest):
+              "already installed: " +& name +& " (rho remove " +& name +& " first)"
+          | ~else:
+              when !filesystem.directory_exists(packages_dir())
+              | filesystem.make_directory(packages_dir(), ~parents: #true)
+              let values(code, text) = crypto.#{run-argv}("git", ["clone", "--depth", "1", url, dest])
+              if code == 0
+              | skills.invalidate()
+                prompts.invalidate()
+                "installed " +& name +& " -> " +& dest
+              | "install failed (exit " +& code +& "):\n" +& text
 
 fun update(name :: String) :: String:
   let dest = packages_dir() +& "/" +& name
@@ -119,3 +127,120 @@ fun package_skill_dirs() :: List:
 
 fun package_prompt_dirs() :: List:
   subdirs_of("prompts")
+
+fun package_theme_dirs() :: List:
+  subdirs_of("themes")
+
+fun npm_package_name(pkg :: String) :: String:
+  // strip @version and @scope/
+  let name = pkg.split("@")[0]
+  let parts = name.split("/")
+  to_string(parts[parts.length() - 1])
+
+fun find_tarball(dir :: String):
+  if filesystem.directory_exists(dir)
+  | for values(found = #false) (f in filesystem.files(dir)):
+      let fname = to_string(f)
+      if fname.ends_with(".tgz") | fname | found
+  | #false
+
+fun install_npm(spec :: String) :: String:
+  // spec is like "npm:@scope/pkg" or "npm:pkg@1.2.3"
+  let pkg = spec.substring(4..) // strip "npm:"
+  let name = npm_package_name(pkg)
+  let dest = packages_dir() +& "/" +& name
+  cond
+  | !name: "invalid npm package name"
+  | filesystem.directory_exists(dest):
+      "already installed: " +& name +& " (rho remove " +& name +& " first)"
+  | ~else:
+      when !filesystem.directory_exists(packages_dir())
+      | filesystem.make_directory(packages_dir(), ~parents: #true)
+      // Use npm pack to download, then extract
+      let tmpdir = dest +& ".tmp"
+      filesystem.make_directory(tmpdir, ~parents: #true)
+      let values(code, text) = crypto.#{run-argv}("npm", ["pack", pkg, "--pack-destination", tmpdir])
+      cond
+      | code != 0:
+          rktfile.#{delete-directory/files}(Path(tmpdir))
+          "npm pack failed (exit " +& code +& "):\n" +& text
+      | ~else:
+          // find the tarball
+          let tgz = find_tarball(tmpdir)
+          cond
+          | !tgz:
+              rktfile.#{delete-directory/files}(Path(tmpdir))
+              "npm pack succeeded but no tarball found"
+          | ~else:
+              // extract
+              let values(code2, text2) = crypto.#{run-argv}("tar", ["xzf", tgz, "-C", tmpdir])
+              cond
+              | code2 != 0:
+                  rktfile.#{delete-directory/files}(Path(tmpdir))
+                  "tar extract failed (exit " +& code2 +& "):\n" +& text2
+              | ~else:
+                  // move package/ contents to dest
+                  let pkg_dir = tmpdir +& "/package"
+                  cond
+                  | !filesystem.directory_exists(pkg_dir):
+                      rktfile.#{delete-directory/files}(Path(tmpdir))
+                      "npm pack extracted but no package/ directory found"
+                  | ~else:
+                      filesystem.rename(Path(pkg_dir), Path(dest))
+                      // cleanup tmp
+                      rktfile.#{delete-directory/files}(Path(tmpdir))
+                      skills.invalidate()
+                      prompts.invalidate()
+                      "installed " +& name +& " from npm -> " +& dest
+
+fun copy_tree(src :: String, dest :: String):
+  filesystem.make_directory(dest, ~parents: #true)
+  for (f in filesystem.files(src)):
+    let s = src +& "/" +& to_string(f)
+    let d = dest +& "/" +& to_string(f)
+    if filesystem.directory_exists(s)
+    | copy_tree(s, d)
+    | filesystem.write_string(d, filesystem.read_string(s), ~exists: #'error)
+
+fun install_local(spec :: String) :: String:
+  cond
+  | !filesystem.file_exists(spec): "path not found: " +& spec
+  | filesystem.directory_exists(spec):
+      // directory: copy into packages
+      let name = safe_pkg_name(to_string(spec.split("/").last()))
+      cond
+      | !name: "invalid package path: " +& spec
+      | ~else:
+          let dest = packages_dir() +& "/" +& name
+          cond
+          | filesystem.directory_exists(dest):
+              "already installed: " +& name +& " (rho remove " +& name +& " first)"
+          | ~else:
+              when !filesystem.directory_exists(packages_dir())
+              | filesystem.make_directory(packages_dir(), ~parents: #true)
+              copy_tree(spec, dest)
+              skills.invalidate()
+              prompts.invalidate()
+              "installed " +& name +& " from " +& spec
+  | spec.ends_with(".rhm"):
+      // single extension file: copy into packages as a package
+      let base = to_string(spec.split("/").last())
+      let name = safe_pkg_name(base.substring(0 .. base.length() - 4))
+      cond
+      | !name: "invalid package path: " +& spec
+      | ~else:
+          let dest = packages_dir() +& "/" +& name
+          cond
+          | filesystem.directory_exists(dest):
+              "already installed: " +& name +& " (rho remove " +& name +& " first)"
+          | ~else:
+              when !filesystem.directory_exists(packages_dir())
+              | filesystem.make_directory(packages_dir(), ~parents: #true)
+              filesystem.make_directory(dest, ~parents: #true)
+              filesystem.write_string(dest +& "/" +& name +& ".rhm",
+                                      filesystem.read_string(spec),
+                                      ~exists: #'error)
+              skills.invalidate()
+              prompts.invalidate()
+              "installed " +& name +& " from " +& spec
+  | ~else: "unsupported local path: " +& spec

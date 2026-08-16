@@ -149,9 +149,10 @@ disclosure: the agent reads the full file with `read_file` when needed);
 
 ## Packages and trust
 
-`rho install git:<url>` (or `owner/repo`) clones into `~/.rho/packages/`;
-a package's `extensions/`, `skills/` and `prompts/` directories join the
-discovery paths. `/packages` lists them, `/share` uploads the session as a
+`rho install <source>` clones into `~/.rho/packages/`; a package's
+`extensions/`, `skills/`, `prompts/`, and `themes/` directories join the
+discovery paths. Sources: `git:<url>`, `owner/repo` shorthand, `npm:<pkg>`,
+or a local path. `/packages` lists them, `/share` uploads the session as a
 gist via the `gh` CLI.
 
 The first time rho runs in a project with a `.rho/` directory it asks whether
@@ -265,11 +266,31 @@ can call on itself) recompiles only changed modules, wipes all
 extension-contributed registry entries, and re-runs each `init(rho)`. Kernel
 state — the session, provider connections, and `rho.state` — survives reloads.
 
+## SDK
+
+Embed rho programmatically via `lib("rho/src/sdk.rhm")`:
+
+```
+#lang rhombus
+import: lib("rho/src/sdk.rhm") open
+def agent = create_agent_session(~provider: "kimi",
+                                 ~on_text: fun (s): Port.Output.current().write_string(s),
+                                 ~on_done: fun (): println("\n[done]"))
+agent.prompt("list files in the current directory")
+agent.dispose()
+```
+
+`AgentSession` methods: `prompt(msg)`, `prompt_async(msg)`,
+`set_model(m)`, `set_thinking_level(level)`, `get_model()`,
+`get_thinking_level()`, `compact(~instructions:)`, `entries()`,
+`messages()`, `session_info()`, `dispose()`.
+
 ## Layout
 
 ```
 src/
   main.rhm            CLI entry, commands, system prompt, mode dispatch
+  sdk.rhm             programmatic SDK (AgentSession)
   kernel/
     config.rhm        provider profiles, ~/.rho/config.json
     registry.rhm      tools / commands / event handlers / state / filters
@@ -283,7 +304,7 @@ src/
     skills.rhm        skill discovery + XML injection
     prompts.rhm       prompt templates
     frontmatter.rhm   minimal YAML frontmatter parser
-    packages.rhm      ~/.rho/packages (git clone)
+    packages.rhm      ~/.rho/packages (git clone, npm pack, local paths)
     trust.rhm         ~/.rho/trust.json
     reload.rkt        dynamic-rerequire + rhombus-dynamic-require shim
   ai/

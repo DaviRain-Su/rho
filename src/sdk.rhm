@@ -1,0 +1,161 @@
+#lang rhombus
+
+// rho SDK: embed rho programmatically in other Rhombus/Racket applications.
+// Provides a high-level AgentSession API with event subscription.
+
+import:
+  lib("racket/base.rkt") as rkt
+  json
+  "kernel/config.rhm" open
+  "kernel/registry.rhm" open
+  "kernel/session.rhm" open
+  "kernel/loop.rhm" open
+  "kernel/compaction.rhm" as compaction
+  "kernel/context.rhm" as context
+  "kernel/skills.rhm" as skills
+  "kernel/settings.rhm" as settings
+  "kernel/trust.rhm" as trust
+  "kernel/subagent.rhm" as subagent
+  "ai/models.rhm" as models
+  "ai/modelsdev.rhm" as modelsdev
+  "tools/core.rhm" open
+  "ext/api.rhm" open
+  "ext/loader.rhm" as loader
+
+export:
+  create_agent_session
+  AgentSession
+
+// Create an agent session. Options:
+//   ~provider: provider name (default "kimi")
+//   ~model: model name
+//   ~thinking: thinking level
+//   ~cwd: working directory (default current)
+//   ~session_path: resume a session file
+//   ~no_session: ephemeral (don't persist)
+//   ~no_extensions: skip extension loading
+//   ~system_prompt: override system prompt
+//   ~on_text: callback for streaming text deltas
+//   ~on_thinking: callback for thinking deltas
+//   ~on_tool: callback for tool calls (name, args)
+//   ~on_tool_result: callback for tool results (name, result)
+//   ~on_done: callback when a turn completes
+//   ~on_error: callback for errors
+fun create_agent_session(~provider: provider :: String = "kimi",
+                         ~model: model :: String = "",
+                         ~thinking: thinking :: String = "off",
+                         ~cwd: cwd :: String = "",
+                         ~session_path: session_path :: maybe(String) = #false,
+                         ~no_session: no_session = #false,
+                         ~no_extensions: no_extensions = #false,
+                         ~system_prompt: system_prompt :: String = "",
+                         ~on_text: on_text = fun (s): #void,
+                         ~on_thinking: on_thinking = fun (s): #void,
+                         ~on_tool: on_tool = fun (n, a): #void,
+                         ~on_tool_result: on_tool_result = fun (n, r): #void,
+                         ~on_done: on_done = fun (): #void,
+                         ~on_error: on_error = fun (e): #void):
+  let real_cwd = if cwd == "" | to_string(rkt.#{current-directory}()) | cwd
+  let cfg = load_config(~provider: provider,
+                        ~model: (if model == "" | #false | model),
+                        ~thinking: (if thinking == "off" | #false | thinking))
+  settings.reload()
+  cfg.settings := cfg.settings ++ settings.all()
+  let reg = make_registry()
+  install_core_tools(reg)
+  let sess = start_session(~cwd: real_cwd,
+                           ~resume: session_path,
+                           ~no_session: no_session)
+  let ui_hooks = MutableMap()
+  let api_obj = PiAPI(reg, fun (): #false, fun (): sess, [], ui_hooks, fun (): cfg)
+  when !no_extensions
+  | loader.load_extensions(reg, api_obj, ~notify: fun (s): #void)
+  let default_sp = "You are rho, a coding agent written in Rhombus, running in a terminal.\nWorking directory: " +& real_cwd +& "\nUse the available tools to read, write, and edit files and to run shell commands.\nBe concise. Prefer tools over guessing."
+  let sp = if system_prompt == "" | default_sp | system_prompt
+  AgentSession(cfg, reg, sess, api_obj, sp, real_cwd,
+               on_text, on_thinking, on_tool, on_tool_result, on_done, on_error,
+               rkt.#{make-custodian}())
+
+class AgentSession(config, registry, mutable session, api_obj,
+                   system_prompt :: String, cwd :: String,
+                   on_text, on_thinking, on_tool, on_tool_result,
+                   on_done, on_error, cust):
+
+  // Send a prompt to the agent. Returns when the turn completes.
+  method prompt(msg :: String):
+    let r = try:
+              run_turn(~config: config,
+                       ~registry: registry,
+                       ~session: session,
+                       ~system_prompt: system_prompt,
+                       ~input: msg,
+                       ~on_text: on_text,
+                       ~on_thinking: on_thinking,
+                       ~on_tool: on_tool,
+                       ~on_tool_result: on_tool_result,
+                       ~on_steer: fun (s): #void)
+              on_done()
+              #false
+              ~catch e :: Exn.Fail:
+                on_error(e.message)
+                #true
+    r
+
+  // Run a prompt in a background thread. Returns immediately.
+  method prompt_async(msg :: String):
+    rkt.thread(fun ():
+                 try:
+                   run_turn(~config: config,
+                            ~registry: registry,
+                            ~session: session,
+                            ~system_prompt: system_prompt,
+                            ~input: msg,
+                            ~on_text: on_text,
+                            ~on_thinking: on_thinking,
+                            ~on_tool: on_tool,
+                            ~on_tool_result: on_tool_result,
+                            ~on_steer: fun (s): #void)
+                   on_done()
+                   ~catch:
+                   | e :: Exn.Fail: on_error(e.message))
+
+  // Set the model.
+  method set_model(m :: String):
+    config.model := m
+
+  // Set the thinking level.
+  method set_thinking_level(level :: String):
+    if level == "off" | config.thinking := #false | config.thinking := level
+
+  // Get the current model.
+  method get_model() :: String:
+    config.model
+
+  // Get the current thinking level.
+  method get_thinking_level() :: String:
+    if config.thinking | to_string(config.thinking) | "off"
+
+  // Trigger compaction.
+  method compact(~instructions: instructions :: String = ""):
+    compaction.compact(~session: session, ~config: config, ~instructions: instructions)
+
+  // Get the session entries.
+  method entries() :: List:
+    session.entries
+
+  // Get the session messages (for LLM context).
+  method messages() :: List:
+    session.messages()
+
+  // Get session info.
+  method session_info() :: Map:
+    { "path": (if session.path is_a String | session.path | ""),
+      "name": session.name,
+      "leaf": (if session.leaf is_a Int | session.leaf | -1),
+      "provider": config.provider,
+      "model": config.model,
+      "thinking": (if config.thinking | to_string(config.thinking) | "off") }
+
+  // Dispose of the session (kills background threads).
+  method dispose():
+    rkt.#{custodian-shutdown-all}(cust)

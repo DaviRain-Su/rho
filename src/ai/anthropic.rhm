@@ -87,7 +87,11 @@ fun stream_chat(~base_url: base_url :: String,
                 ~on_thinking: on_thinking = fun (s): #void,
                 ~max_tokens: max_tokens :: Int = 8192,
                 ~thinking: thinking :: maybe(String) = #false,
-                ~extra_headers: extra_headers :: Map = {}) :: Map:
+                ~extra_headers: extra_headers :: Map = {},
+                ~transport: transport :: String = "auto") :: Map:
+  // transport: "websocket" would use a WS connection; for now all
+  // Anthropic requests use SSE, so we fall back silently.
+  // The setting is plumbed through for future websocket support.
   let (system_text, converted) = convert_messages(messages)
   let budget:
     match thinking

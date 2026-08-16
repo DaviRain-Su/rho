@@ -42,6 +42,7 @@ fun call_provider(config, messages, tools, on_text,
 fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: Map):
   oauth.ensure_fresh(config)
   let headers = headers ++ oauth.provider_headers(config)
+  let transport = to_string(config.settings.get("transport", "auto"))
   match config.kind()
   | "anthropic":
       anthropic.stream_chat(~base_url: config.base_url(),
@@ -52,7 +53,8 @@ fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: M
                             ~on_text: on_text,
                             ~on_thinking: on_thinking,
                             ~thinking: config.thinking,
-                            ~extra_headers: headers)
+                            ~extra_headers: headers,
+                            ~transport: transport)
   | ~else:
       if oauth.is_chatgpt_oauth(config)
       | codex.stream_responses(~base_url: oauth.chatgpt_codex_url,
@@ -72,7 +74,8 @@ fun do_call_provider(config, messages, tools, on_text, on_thinking, headers :: M
                            ~on_text: on_text,
                            ~on_thinking: on_thinking,
                            ~thinking: config.thinking,
-                           ~extra_headers: headers)
+                           ~extra_headers: headers,
+                           ~transport: transport)
 
 // Drain steering messages (sent to the current thread's mailbox by the REPL
 // while a turn runs) into the session. Returns #true if any arrived.

@@ -50,7 +50,7 @@ import:
   "ai/models.rhm" as models
   "ai/modelsdev.rhm" as modelsdev
   "ai/codex.rhm" as codex
-  rhombus/envvar
+  rhombus/envvar open
   "tools/core.rhm" open
   "ext/api.rhm" open
   "ext/loader.rhm" as loader
@@ -1145,7 +1145,25 @@ fun auto_compact():
     api.notify(compaction.compact(~session: session, ~config: config))
     registry.emit("session_compact", { "auto": #true })
 
+// Refresh session-scoped environment variables so bash commands and
+// subprocesses spawned by the agent see the current session/provider/model.
+// Also exposes them via registry.state for extensions.
+fun refresh_session_env():
+  let sid = (if session.path is_a String | session.path | "")
+  let thinking = (if config.thinking | config.thinking | "off")
+  registry.state["env_session_id"] := sid
+  registry.state["env_session_file"] := sid
+  registry.state["env_provider"] := config.provider
+  registry.state["env_model"] := config.model
+  registry.state["env_thinking"] := thinking
+  putenv("RHO_SESSION_ID", sid)
+  putenv("RHO_SESSION_FILE", sid)
+  putenv("RHO_PROVIDER", config.provider)
+  putenv("RHO_MODEL", config.model)
+  putenv("RHO_REASONING_LEVEL", thinking)
+
 fun prepare_turn():
+  refresh_session_env()
   let r = drain_pending_fit()
   when r != ""
   | api.notify(r)
@@ -1823,7 +1841,7 @@ fun run_tui_mode():
                              match settings.get("external_editor", #false)
                              | s :: String: s
                              | ~else:
-                                 envvar.getenv("VISUAL") || envvar.getenv("EDITOR") || "",
+                                 getenv("VISUAL") || getenv("EDITOR") || "",
               ~last_assistant: last_assistant_text,
               ~keybind: fun (action, default):
                           settings.keybinding(action, to_string(default)))
@@ -2182,6 +2200,10 @@ fun try_subcommand() :: Boolean:
   | ~else: #false
 
 module main:
+  // Process-level environment variables: visible to every subprocess spawned
+  // by the agent (bash tool, grep, find, ...) and to extensions. Matches Pi.
+  putenv("AI_AGENT", "rho")
+  putenv("RHO_CODING_AGENT", "true")
   when !opts.get("offline", #false) && settings.get("offline", #false) == #false
   | modelsdev.refresh_async()
   when !opts.get("offline", #false) && settings.get("offline", #false) == #false

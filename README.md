@@ -333,3 +333,5 @@ tests/                runnable test modules (t_*.rhm)
 - No MCP, and no OAuth for providers that only accept API keys (Kimi, Ollama, …)
 - ChatGPT subscription login is the `openai-codex` provider (`/login openai oauth`). It calls `chatgpt.com/backend-api/codex/responses`. Platform `openai` still needs `OPENAI_API_KEY` with billing.
 - TUI editor highlighting is command/`@file`/`code`, not full language syntax
+- `transport: "websocket"` is plumbed but falls back to SSE (websocket client not yet implemented)
+- Google Gemini requires a native protocol client (not OpenAI-compatible); not yet implemented

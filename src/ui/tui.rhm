@@ -365,6 +365,12 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable sel_dragged = #false
   def mutable visible_plain :: List = []  // plain text of rendered transcript rows
 
+  // transcript search (Ctrl-S): query, matches, current index
+  def mutable search_active = #false      // #false or search query being typed
+  def mutable search_query :: String = ""
+  def mutable search_matches :: List = []  // row indices in transcript
+  def mutable search_idx = 0              // current match (0-based)
+
   fun norm_sel() :: List:
     let [ar, ac] = sel_anchor
     let [fr, fc] = sel_focus
@@ -800,7 +806,48 @@ fun run_tui(~theme: theme_in :: Map = {},
         | update_ac()
         | close_ac()
 
+  fun handle_search_key(k :: String) :: Boolean:
+    // returns #true if the key was consumed by search mode
+    if !search_active
+    | #false
+    | cond
+      | k == "<escape>" || k == "C-[":
+          search_active := #false
+          search_query := ""
+          dirty := #true
+          #true
+      | k == "C-M":
+          // perform search
+          let q = search_query.foldcase()
+          when q != ""
+          | search_matches := (for List (i in 0 .. lines.length()):
+                                 skip_when !to_string(lines[i].get(1, "")).foldcase().contains(q)
+                                 i)
+            search_idx := 0
+            when search_matches != []
+            | scroll := math.max(0, search_matches[0] - 2)
+              push("notify", "[" +& (search_idx + 1) +& "/" +& search_matches.length() +& " matches]")
+          search_active := #false
+          dirty := #true
+          #true
+      | k == "<backspace>" || k == "C-H" || k == "C-?":
+          when search_query.length() > 0
+          | search_query := search_query.substring(0 .. search_query.length() - 1)
+          dirty := #true
+          #true
+      | k.length() == 1:
+          search_query := search_query +& k
+          dirty := #true
+          #true
+      | ~else: #true
+
   fun handle_key_core(k :: String):
+    // search mode intercepts all keys until Enter / Esc / Backspace
+    if handle_search_key(k)
+    | #void
+    | handle_key_main(k)
+
+  fun handle_key_main(k :: String):
     let killish = k == "C-K" || k == "C-W" || k == "C-U"
                     || k == kb("kill_line", "C-K") || k == kb("kill_word", "C-W")
     let yankish = k == "C-Y" || k == "M-Y" || k == "M-y"
@@ -810,6 +857,20 @@ fun run_tui(~theme: theme_in :: Map = {},
     when !yankish
     | last_was_yank := #false
     cond
+    | k == "C-S":
+        search_active := #true
+        search_query := ""
+        dirty := #true
+    | k == "C-N" && search_matches != []:
+        search_idx := (search_idx + 1) mod search_matches.length()
+        scroll := math.max(0, search_matches[search_idx] - 2)
+        push("notify", "[" +& (search_idx + 1) +& "/" +& search_matches.length() +& " matches]")
+        dirty := #true
+    | k == "C-P" && search_matches != []:
+        search_idx := (search_idx - 1) mod search_matches.length()
+        scroll := math.max(0, search_matches[search_idx] - 2)
+        push("notify", "[" +& (search_idx + 1) +& "/" +& search_matches.length() +& " matches]")
+        dirty := #true
     | k == "C-M": submit()
     | k == "M-C-M" || k == "M-<return>" || k == kb("queue_followup", "M-C-M"):
         queue_followup()
@@ -947,8 +1008,9 @@ fun run_tui(~theme: theme_in :: Map = {},
           [[tcolor("muted"), #false, "dim", " " +& header_extra]]
       | ~else: []
     let header_h = header_rows.length()
-    // rows = header + transcript + widgets + queue + status(1) + separator(1) + editor + popup + footer(1)
-    let trans_h = math.max(3, rows - input_h - 3 - popup_h - queue_h - widget_h - header_h)
+    let search_h = (if search_active | 1 | 0)
+    // rows = header + transcript + widgets + queue + status(1) + search(?) + separator(1) + editor + popup + footer(1)
+    let trans_h = math.max(3, rows - input_h - 3 - search_h - popup_h - queue_h - widget_h - header_h)
     last_trans_h := trans_h
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
@@ -1032,6 +1094,26 @@ fun run_tui(~theme: theme_in :: Map = {},
               skip_when sp[3] == ""
               sp
       | trans_rows
+    // search match highlighting: invert the query substring in rows that
+    // contain it (case-insensitive)
+    let trans_rows:
+      if search_matches == [] || search_query == ""
+      | trans_rows
+      | let q = search_query.foldcase()
+        for List (r in 0 .. trans_rows.length()):
+          let t = to_string(visible_plain[r])
+          let tf = t.foldcase()
+          let qpos = tf.indexOf(q)
+          if qpos is_a Int
+          | let c0 = idx_at_col(t, qpos)
+            let c1 = idx_at_col(t, qpos + q.length())
+            for List:
+              each sp in [[#false, #false, #false, t.substring(0 .. c0)],
+                          [#false, #false, "invert", t.substring(c0 .. c1)],
+                          [#false, #false, #false, t.substring(c1 ..)]]
+              skip_when sp[3] == ""
+              sp
+          | [trans_rows[r]]
     // separator; shows position while scrolled back
     let sep_text:
       if off > 0
@@ -1075,6 +1157,11 @@ fun run_tui(~theme: theme_in :: Map = {},
          [tcolor("tool_result"), #false, #false,
           msg +& " " +& secs +& "s (esc to interrupt \u00B7 type to steer)"]]
       | [[#false, #false, #false, ""]]
+    // search prompt row (shown while typing a query in search mode)
+    let search_row:
+      if search_active
+      | [[tcolor("prompt"), #false, "bold", " search: " +& search_query +& "_"]]
+      | [[#false, #false, #false, ""]]
     // autocomplete popup below the editor (pi-style select list)
     let popup_rows:
       if popup_h == 0
@@ -1095,10 +1182,10 @@ fun run_tui(~theme: theme_in :: Map = {},
       let padding = math.max(0, cols - display_width(ftext))
       ftext.substring(0 .. math.min(ftext.length(), cols)) +& String.make(padding, Char" ")
     let foot = [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
-    let cursor_row = header_h + trans_h + widget_h + queue_h + 2 + (cur_line - win_start)
+    let cursor_row = header_h + trans_h + widget_h + queue_h + search_h + 2 + (cur_line - win_start)
     let cursor_col = clamp(2 + display_width(cur_text().substring(0 .. cur_col)),
                            0, cols - 1)
-    term.#{term-draw!}(header_rows ++ trans_rows ++ widget_rows ++ queue_rows ++ [status_row] ++ [sep]
+    term.#{term-draw!}(header_rows ++ trans_rows ++ widget_rows ++ queue_rows ++ [status_row] ++ [search_row] ++ [sep]
                          ++ input_rows ++ popup_rows ++ [foot],
                        [cursor_row, cursor_col])
 

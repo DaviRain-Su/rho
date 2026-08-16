@@ -97,7 +97,11 @@ fun stream_chat(~base_url: base_url :: String,
                 ~on_text: on_text = fun (s): #void,
                 ~on_thinking: on_thinking = fun (s): #void,
                 ~thinking: thinking :: maybe(String) = #false,
-                ~extra_headers: extra_headers :: Map = {}) :: Map:
+                ~extra_headers: extra_headers :: Map = {},
+                ~transport: transport :: String = "auto") :: Map:
+  // transport: "websocket" would use a WS connection; for now all
+  // OpenAI-compatible providers use SSE, so we fall back silently.
+  // The setting is plumbed through for future websocket support.
   let body:
     let base = { "model": model,
                  "messages": messages_payload(messages),

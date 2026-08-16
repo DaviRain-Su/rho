@@ -1,0 +1,92 @@
+#lang rhombus
+
+// Nested agent tool. Runtime is kernel `run_subagent` (like Pi exporting
+// createAgentSession); this file only registers the tool.
+
+import:
+  "../../kernel/subagent.rhm" as subagent
+
+export:
+  init
+
+fun call1(rho, key :: String, fallback :: String, a):
+  let f = rho.state.get(key, #false)
+  let f:
+    cond
+    | f is_a Function: f
+    | ~else: rho.state.get(fallback, #false)
+  when f is_a Function
+  | f(a)
+
+fun call2(rho, key :: String, fallback :: String, a, b):
+  let f = rho.state.get(key, #false)
+  let f:
+    cond
+    | f is_a Function: f
+    | ~else: rho.state.get(fallback, #false)
+  when f is_a Function
+  | f(a, b)
+
+fun split_tools(raw) :
+  cond
+  | raw is_a String:
+      for List (x in raw.split(",")):
+        skip_when x.trim() == ""
+        x.trim()
+  | raw is_a List:
+      for List (x in raw):
+        to_string(x)
+  | ~else: #false
+
+fun child_prompt(rho) :: String:
+  match rho.state.get("build_system_prompt", #false)
+  | fn :: Function: to_string(fn())
+  | ~else: "You are a coding agent. Use tools. Be concise."
+
+fun init(rho):
+  rho.register_tool(
+    ~name: "agent",
+    ~description: "Delegate a focused subtask to a nested agent with its own session. Use for isolated research, a series of commands, or a draft change. The sub-agent cannot spawn further agents. Returns its final text answer.",
+    ~schema: { "type": "object",
+               "properties": {
+                 "prompt": { "type": "string", "description": "The task for the sub-agent" },
+                 "label": { "type": "string", "description": "Short name shown in the transcript" },
+                 "tools": { "type": "string",
+                            "description": "Optional comma-separated tool allowlist, e.g. read_file,grep,bash" }
+               },
+               "required": ["prompt"] },
+    ~fn: fun (args):
+           let prompt = to_string(args.get("prompt", ""))
+           let label = to_string(args.get("label", "subagent"))
+           let tools = split_tools(args.get("tools", #false))
+           let cfg = rho.current_config()
+           cond
+           | prompt == "": "error: prompt is required"
+           | cfg == #false: "error: no live config"
+           | ~else:
+               try:
+                 rho.state["subagent_label"] := label
+                 rho.notify("sub-agent " +& label +& " started")
+                 let r = subagent.run_subagent(
+                   ~config: cfg,
+                   ~parent: rho.events,
+                   ~prompt: prompt,
+                   ~system_prompt: child_prompt(rho),
+                   ~label: label,
+                   ~tools: tools,
+                   ~on_text: fun (s): call1(rho, "on_sub_text", "on_text", s),
+                   ~on_thinking: fun (s): call1(rho, "on_sub_think", "on_thinking", s),
+                   ~on_tool: fun (name, a):
+                               call2(rho, "on_sub_tool", "on_tool", name, a),
+                   ~on_tool_result: fun (name, res):
+                                      call2(rho, "on_sub_result", "on_tool_result", name, res))
+                 rho.notify("sub-agent " +& label +& " done")
+                 r
+                 ~catch e :: Exn.Fail:
+                   "error: " +& e.message)
+  rho.register_renderer(
+    ~tool: "agent",
+    ~fn: fun (phase, name, data):
+           if phase == "call" && data is_a Map
+           | "\u25CF agent " +& to_string(data.get("label", "subagent"))
+           | #false)

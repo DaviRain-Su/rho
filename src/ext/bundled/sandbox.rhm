@@ -1,0 +1,60 @@
+#lang rhombus
+
+// Optional OS wrap for bash, installed via the kernel spawn hook.
+// macOS: sandbox-exec named profile `no-network`. Off by default.
+
+import:
+  lib("racket/base.rkt") as rkt
+
+export:
+  init
+  sh_quote
+  wrap_command
+
+fun sh_quote(s :: String) :: String:
+  "'" +& String.join(s.split("'"), "'\\''") +& "'"
+
+fun has_exe(name :: String) :: Boolean:
+  rkt.#{find-executable-path}(name) != #false
+
+fun wrap_command(cmd :: String) :: String:
+  cond
+  | has_exe("sandbox-exec"):
+      "sandbox-exec -n no-network bash -lc " +& sh_quote(cmd)
+  | has_exe("unshare"):
+      "unshare -n -- bash -lc " +& sh_quote(cmd)
+  | ~else: cmd
+
+fun sandbox_on(rho) :: Boolean:
+  rho.state.get("sandbox_on", #false)
+
+fun hook(rho, data :: Map):
+  let cmd = to_string(data.get("command", ""))
+  if sandbox_on(rho) | wrap_command(cmd) | cmd
+
+fun describe(rho) :: String:
+  cond
+  | !sandbox_on(rho): "sandbox off"
+  | has_exe("sandbox-exec"): "sandbox on (sandbox-exec no-network)"
+  | has_exe("unshare"): "sandbox on (unshare -n)"
+  | ~else: "sandbox on (no wrapper on PATH; bash is unchanged)"
+
+fun init(rho):
+  rho.state["sandbox_on"] := #false
+  rho.set_bash_spawn_hook(fun (data): hook(rho, data))
+  rho.register_command(
+    ~name: "sandbox",
+    ~description: "OS network sandbox for bash: /sandbox [on|off]",
+    ~handler: fun (args):
+                let a = args.trim().foldcase()
+                cond
+                | a == "on" || a == "enable":
+                    rho.state["sandbox_on"] := #true
+                    rho.notify(describe(rho))
+                | a == "off" || a == "disable":
+                    rho.state["sandbox_on"] := #false
+                    rho.notify(describe(rho))
+                | a == "" || a == "status":
+                    rho.notify(describe(rho))
+                | ~else:
+                    rho.notify("usage: /sandbox [on|off]"))

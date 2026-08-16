@@ -1,0 +1,23 @@
+#lang rhombus
+
+// /context — estimated token use of the active session path.
+
+import:
+  "../../kernel/compaction.rhm" as compaction
+
+export:
+  init
+
+fun init(rho):
+  rho.register_command(
+    ~name: "context",
+    ~description: "show estimated context-window usage",
+    ~handler: fun (_args):
+                match rho.session
+                | #false:
+                    rho.notify("no session")
+                | s:
+                    let msgs = s.messages()
+                    rho.notify("messages: " +& msgs.length()
+                                 +& "\nestimated tokens: "
+                                 +& compaction.context_tokens(s)))

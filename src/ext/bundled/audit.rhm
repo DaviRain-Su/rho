@@ -1,0 +1,51 @@
+#lang rhombus
+
+// Session + tool activity log under ~/.rho/logs/ (or rho.state["audit_dir"]).
+
+import:
+  lib("racket/base.rkt") as rkt
+  "../../kernel/config.rhm" as config
+
+export:
+  init
+
+fun audit_dir(rho) :: String:
+  match rho.state.get("audit_dir", #false)
+  | s :: String: s
+  | ~else: config.config_dir() +& "/logs"
+
+fun stamp() :: String:
+  to_string(rkt.#{current-seconds}())
+
+fun append_line(rho, file :: String, line :: String):
+  let dir = audit_dir(rho)
+  when !filesystem.directory_exists(dir)
+  | filesystem.make_directory(dir, ~parents: #true)
+  let path = dir +& "/" +& file
+  let prev = if filesystem.file_exists(path) | filesystem.read_string(path) | ""
+  filesystem.write_string(path, prev +& line +& "\n", ~exists: #'truncate)
+
+fun clip(s :: String, n :: Int) :: String:
+  if s.length() <= n | s | s.substring(0 .. n) +& "…"
+
+fun init(rho):
+  rho.on("agent_start",
+         fun (ev :: Map):
+           append_line(rho, "session.log",
+                       stamp() +& " start " +& clip(to_string(ev.get("input", "")), 120))
+           #false)
+  rho.on("agent_end",
+         fun (_ev):
+           append_line(rho, "session.log", stamp() +& " end")
+           #false)
+  rho.on("tool_execution_start",
+         fun (ev :: Map):
+           let name = to_string(ev.get("toolName", ""))
+           let input = ev.get("input", {})
+           let detail:
+             if input is_a Map
+             | to_string(input.get("command", input.get("path", "")))
+             | to_string(input)
+           append_line(rho, "tools.log",
+                       stamp() +& " " +& name +& " " +& clip(detail, 160))
+           #false)

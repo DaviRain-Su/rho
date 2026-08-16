@@ -1,0 +1,222 @@
+#lang rhombus
+
+// MCP stdio client. Servers are listed in ~/.rho/mcp.json and, for a
+// trusted project, .rho/mcp.json (project wins on the same name).
+//
+// {
+//   "mcpServers": {
+//     "echo": { "command": "npx", "args": ["-y", "pkg"], "env": {} }
+//   }
+// }
+
+import:
+  json
+  lib("racket/base.rkt") as rkt
+  "../kernel/config.rhm" as config
+  "../kernel/errors.rhm" as errors
+  "../kernel/registry.rhm" open
+  "mcp.rkt" as wire
+
+export:
+  parse_servers
+  safe_id
+  tool_id
+  config_paths
+  load_servers
+  connect_all
+  connect_map
+  disconnect_all
+  reload
+  status
+  PROTOCOL
+
+def PROTOCOL = "2024-11-05"
+
+def mutable sessions :: Map = {}
+def mutable next_ids :: Map = {}
+def mutable last_status :: List = []
+
+def ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+fun safe_id(s :: String) :: String:
+  let buf = Port.Output.open_string()
+  for (c in s):
+    if ID_CHARS.contains(to_string(c))
+    | buf.write_string(to_string(c))
+    | buf.write_string("_")
+  let out = buf.get_string().to_string()
+  if out == "" | "x" | out
+
+fun tool_id(server :: String, tool :: String) :: String:
+  "mcp_" +& safe_id(server) +& "_" +& safe_id(tool)
+
+fun parse_servers(raw :: Map) :: Map:
+  let inner = raw.get("mcpServers", raw)
+  if inner is_a Map | inner | {}
+
+fun config_paths(~include_project: include_project = #true) :: List:
+  [config.config_dir() +& "/mcp.json"]
+    ++ (if include_project | [".rho/mcp.json"] | [])
+
+fun load_servers(~include_project: include_project = #true) :: Map:
+  for values(acc = {}) (path in config_paths(~include_project: include_project)):
+    acc ++ parse_servers(errors.read_json_map(path))
+
+fun spec_args(spec :: Map) :: List:
+  match spec.get("args", [])
+  | l :: List:
+      for List (a in l):
+        to_string(a)
+  | ~else: []
+
+fun spec_env(spec :: Map) :: List:
+  match spec.get("env", {})
+  | m :: Map:
+      for List ((k, v) in m):
+        [to_string(k), to_string(v)]
+  | ~else: []
+
+fun next_id(server :: String) :: Int:
+  let n = next_ids.get(server, 1)
+  next_ids := next_ids ++ { server: n + 1 }
+  n
+
+fun rpc(conn, server :: String, method :: String, params,
+        ~timeout: timeout = 15):
+  let req = json.to_string({ "jsonrpc": "2.0",
+                             "id": next_id(server),
+                             "method": method,
+                             "params": params })
+  let raw = wire.#{mcp-rpc}(conn, req, timeout)
+  let msg = json.from_string(to_string(raw))
+  cond
+  | !(msg is_a Map):
+      error("mcp " +& server +& ": non-object reply")
+  | msg.has_key("error"):
+      let err = msg["error"]
+      let m:
+        cond
+        | err is_a Map: to_string(err.get("message", err))
+        | ~else: to_string(err)
+      error("mcp " +& server +& " " +& method +& ": " +& m)
+  | ~else: msg.get("result", {})
+
+fun notify(conn, method :: String, params):
+  wire.#{mcp-notify}(conn,
+                     json.to_string({ "jsonrpc": "2.0",
+                                      "method": method,
+                                      "params": params }))
+
+fun content_text(result) :: String:
+  cond
+  | result is_a Map:
+      let err = result.get("isError", #false)
+      let parts:
+        match result.get("content", [])
+        | l :: List:
+            for List (c in l):
+              skip_when !(c is_a Map)
+              to_string(c.get("text", ""))
+        | ~else: []
+      let text = String.join(parts, "\n")
+      if err | "error: " +& (if text == "" | "mcp tool failed" | text) | text
+  | ~else: to_string(result)
+
+fun drop_mcp_tools(registry):
+  let names:
+    for List (t in registry.tool_list()):
+      skip_when !to_string(t.source).starts_with("mcp:")
+      t.name
+  registry.locked(fun ():
+                    for (n in names):
+                      registry.tools.remove(n)
+                    #void)
+
+fun disconnect_all():
+  for ((_, c) in sessions):
+    try:
+      wire.#{mcp-close}(c)
+      ~catch _: #void
+  sessions := {}
+  next_ids := {}
+  last_status := []
+
+fun register_mcp_tool(registry, server :: String, tool :: Map, conn):
+  let remote = to_string(tool.get("name", ""))
+  when remote != ""
+  | let name = tool_id(server, remote)
+    let desc = to_string(tool.get("description", remote))
+    let schema:
+      match tool.get("inputSchema", { "type": "object", "properties": {} })
+      | m :: Map: m
+      | ~else: { "type": "object", "properties": {} }
+    let prev = registry.current_source
+    registry.current_source := "mcp:" +& server
+    try:
+      registry.register_tool(
+        ~name: name,
+        ~description: "[" +& server +& "] " +& desc,
+        ~schema: schema,
+        ~fn: fun (args):
+               let result = rpc(conn, server, "tools/call",
+                                { "name": remote, "arguments": args },
+                                ~timeout: 60)
+               content_text(result))
+      ~finally:
+        registry.current_source := prev
+
+fun connect_one(registry, server :: String, spec :: Map, notify_fn):
+  let cmd = to_string(spec.get("command", "")).trim()
+  when cmd == ""
+  | error("missing command")
+  let conn = wire.#{mcp-open}(cmd, spec_args(spec), spec_env(spec))
+  try:
+    rpc(conn, server, "initialize",
+        { "protocolVersion": PROTOCOL,
+          "capabilities": {},
+          "clientInfo": { "name": "rho", "version": "0.1" } })
+    notify(conn, "notifications/initialized", {})
+    let listed = rpc(conn, server, "tools/list", {})
+    let tools:
+      match (if listed is_a Map | listed.get("tools", []) | [])
+      | l :: List: l
+      | ~else: []
+    for (t in tools):
+      when t is_a Map
+      | register_mcp_tool(registry, server, t, conn)
+    sessions := sessions ++ { server: conn }
+    last_status := last_status.add([server, tools.length()])
+    notify_fn("mcp " +& server +& ": " +& tools.length() +& " tools")
+    ~catch e :: Exn.Fail:
+      try:
+        wire.#{mcp-close}(conn)
+        ~catch _: #void
+      error(e.message)
+
+fun connect_map(registry, cfg :: Map,
+                ~notify: notify_fn = fun (s): #void):
+  drop_mcp_tools(registry)
+  disconnect_all()
+  for ((name, spec) in cfg):
+    skip_when !(spec is_a Map)
+    skip_when spec.get("disabled", #false)
+    try:
+      connect_one(registry, to_string(name), spec, notify_fn)
+      ~catch e :: Exn.Fail:
+        notify_fn("mcp " +& name +& ": " +& e.message)
+  last_status
+
+fun connect_all(registry,
+                ~notify: notify_fn = fun (s): #void,
+                ~include_project: include_project = #true):
+  connect_map(registry,
+              load_servers(~include_project: include_project),
+              ~notify: notify_fn)
+
+fun reload(registry,
+           ~notify: notify_fn = fun (s): #void,
+           ~include_project: include_project = #true):
+  connect_all(registry, ~notify: notify_fn, ~include_project: include_project)
+
+fun status() :: List:
+  last_status

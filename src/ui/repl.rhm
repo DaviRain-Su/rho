@@ -26,9 +26,16 @@ fun add_history(s :: String):
 
 // handle_command(name, args) is called for "/cmd args" lines; it returns
 // #'quit to exit. handle_input(line) runs an agent turn.
+fun repl_no_ask():
+  #false
+fun repl_ignore_ask(_d):
+  #void
+
 fun run_repl(~banner: banner :: String,
              ~handle_command: handle_command,
-             ~handle_input: handle_input):
+             ~handle_input: handle_input,
+             ~pending_ask: pending_ask = repl_no_ask,
+             ~answer_ask: answer_ask = repl_ignore_ask):
   let out = Port.Output.current()
   let stdin = rkt.#{current-input-port}()
   def mutable followups :: List = []
@@ -46,6 +53,7 @@ fun run_repl(~banner: banner :: String,
       try:
         rkt.sync(dead, rktport.#{read-line-evt}(stdin, #'any))
         ~catch e :: Exn.Break:
+          answer_ask("deny")
           rkt.#{break-thread}(t)
           rkt.#{thread-wait}(t)
           #'interrupted
@@ -55,6 +63,9 @@ fun run_repl(~banner: banner :: String,
     | r is_a ReadableString:
         let line = to_string(r).trim()
         cond
+        | pending_ask() is_a Map:
+            answer_ask(line)
+            monitor(t)
         | line == "": monitor(t)
         | line == "/quit" || line == "/exit":
             rkt.#{break-thread}(t)

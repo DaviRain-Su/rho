@@ -1,0 +1,63 @@
+#lang rhombus
+
+// Status strip + /dashboard. Pi's status-line / custom-footer pattern.
+
+import:
+  "../../kernel/loop.rhm" as loop
+  "../../ext/mcp.rhm" as mcp
+
+export:
+  init
+
+fun cfg_mode(rho) :: String:
+  match rho.current_config()
+  | #false: "allow"
+  | cfg: loop.permission_mode(cfg)
+
+fun cfg_model(rho) :: String:
+  match rho.current_config()
+  | #false: "?"
+  | cfg: to_string(cfg.provider) +& "/" +& to_string(cfg.model)
+
+fun msg_count(rho) :: Int:
+  match rho.session
+  | #false: 0
+  | s: s.messages().length()
+
+fun mcp_count() :: Int:
+  mcp.status().length()
+
+fun cfg_steps(rho) :: String:
+  match rho.current_config()
+  | #false: to_string(loop.MAX_STEPS)
+  | cfg: to_string(loop.step_limit(cfg))
+
+fun snapshot(rho) :: String:
+  "model: " +& cfg_model(rho)
+    +& "\npermission: " +& cfg_mode(rho)
+    +& "\nmessages: " +& msg_count(rho)
+    +& "\ntools: " +& rho.get_all_tools().length()
+    +& "\nmcp: " +& mcp_count()
+    +& "\nsteps: " +& cfg_steps(rho)
+
+fun strip(rho) :: String:
+  cfg_model(rho)
+    +& " \u00B7 " +& cfg_mode(rho)
+    +& " \u00B7 " +& msg_count(rho) +& " msgs"
+    +& " \u00B7 " +& rho.get_all_tools().length() +& " tools"
+    +& (if mcp_count() == 0 | "" | " \u00B7 mcp " +& mcp_count())
+
+fun refresh(rho):
+  rho.set_widget("dashboard", strip(rho))
+
+fun init(rho):
+  rho.register_command(
+    ~name: "dashboard",
+    ~description: "show session status (model, permissions, tools, MCP)",
+    ~handler: fun (_args):
+                rho.notify(snapshot(rho))
+                refresh(rho))
+  rho.on("agent_start", fun (_e): refresh(rho))
+  rho.on("agent_end", fun (_e): refresh(rho))
+  rho.on("turn_end", fun (_e): refresh(rho))
+  refresh(rho)

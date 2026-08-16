@@ -9,7 +9,8 @@
          racket/string
          racket/match
          racket/tcp
-         racket/list)
+         racket/list
+         racket/treelist)
 
 (provide pkce-verifier
          pkce-challenge
@@ -37,13 +38,19 @@
 
 ;; argv subprocess: no shell, so caller-supplied paths/URLs cannot inject.
 ;; Returns (values exit-code combined-output).
+(define (->arg-list args)
+  (cond
+    [(treelist? args) (treelist->list args)]
+    [(list? args) args]
+    [else (list args)]))
+
 (define (run-argv program args)
   (define exe (find-executable-path program))
   (cond
     [(not exe) (values 127 (string-append program " not found"))]
     [else
      (define-values (sp out in err)
-       (apply subprocess #f #f #f exe args))
+       (apply subprocess #f #f #f exe (->arg-list args)))
      (close-output-port in)
      (define text
        (bytes->string/utf-8

@@ -1,0 +1,188 @@
+#lang rhombus
+
+/// Startup animation extension for RHO.
+///
+/// On agent startup, plays a short terminal text effect using the `ttfx`
+/// binary (a Rust port of TerminalTextEffects). The effect is randomly
+/// chosen from a curated set of fast, visually striking effects.
+///
+/// The wordmark is a scaled block-letter "ρ RHO": scale 1/2/3 is picked
+/// from the live tty size so the splash fills a normal or wide terminal
+/// instead of a 5-character line. ttfx then uses the full terminal as
+/// the canvas and centers the art.
+///
+/// Requirements:
+///   - `ttfx` binary on PATH (install from github.com/omacom-io/ttfx)
+///   - stdout must be a TTY (skipped in headless/piped mode)
+///
+/// The animation only plays once per process — on the first init call.
+/// Reloads do not replay it. `/startup-animation [effect]` replays.
+
+import:
+  lib("racket/base.rkt") as rkt
+  lib("racket/file.rkt") as rktfile
+  lib("racket/port.rkt") as rktport
+  lib("racket/system.rkt") as sys
+
+export:
+  init
+  render_banner
+  pick_scale
+
+/// Effects that stay readable as a splash (not the multi-second ones).
+def startup_effects: [
+  "expand",
+  "scattered",
+  "slide",
+  "orbit",
+  "crumble",
+  "wipe",
+  "sweep",
+  "beams",
+  "fireworks",
+  "rings",
+  "spray",
+  "bubbles",
+]
+
+/// 5x7 bitmaps. P is a rho (bowl + tail).
+def glyphs :: Map = {
+  "P": ["01110", "10001", "10001", "10001", "01111", "00001", "00110"],
+  "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+  "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+  "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"]
+}
+
+def word: ["P", "R", "H", "O"]
+def tagline: "hot-reloadable \u00B7 rhombus"
+def block_ch = Char"\u2588"
+
+def played = rkt.#{box}(#false)
+
+fun pixel(on :: Boolean, scale :: Int) :: String:
+  if on
+  | String.make(scale, block_ch)
+  | String.make(scale, Char" ")
+
+fun glyph_row(name :: String, row :: Int) :: String:
+  let rows = glyphs.get(name, [])
+  cond
+  | row >= 0 && row < rows.length(): to_string(rows[row])
+  | ~else: "00000"
+
+fun letter_cells(name :: String, row :: Int, scale :: Int) :: String:
+  let bits = glyph_row(name, row)
+  let cells:
+    for List (c in 0 .. bits.length()):
+      pixel(bits.substring(c .. c + 1) == "1", scale)
+  String.join(cells, "")
+
+fun render_scanline(row :: Int, scale :: Int) :: String:
+  let parts:
+    for List (i in 0 .. word.length()):
+      let chunk = letter_cells(to_string(word[i]), row, scale)
+      if i == 0 | chunk | String.make(scale, Char" ") +& chunk
+  String.join(parts, "")
+
+fun center_pad(width :: Int, n :: Int) :: Int:
+  let raw = width - n
+  cond
+  | raw <= 0: 0
+  | ~else: math.exact(math.floor(raw / 2))
+
+fun center_line(s :: String, width :: Int) :: String:
+  String.make(center_pad(width, s.length()), Char" ") +& s
+
+fun art_width(body :: List) :: Int:
+  cond
+  | body == []: 0
+  | ~else: body[0].length()
+
+fun render_banner(scale :: Int) :: String:
+  let body:
+    for List (r in 0 .. 7):
+      let line = render_scanline(r, scale)
+      each _ in 0 .. scale
+      line
+  let lines:
+    cond
+    | scale <= 1: body
+    | ~else: body ++ [""] ++ [center_line(tagline, art_width(body))]
+  String.join(lines, "\n")
+
+fun pick_scale(cols :: Int, rows :: Int) :: Int:
+  cond
+  | cols < 48 || rows < 16: 1
+  | cols < 90 || rows < 30: 2
+  | ~else: 3
+
+fun run_stty():
+  sys.#{system}("stty size < /dev/tty 2>/dev/null")
+
+fun term_size() :: List:
+  let raw = to_string(rktport.#{with-output-to-string}(run_stty)).trim()
+  let parts = raw.split(" ")
+  cond
+  | parts.length() != 2: [24, 80]
+  | ~else:
+      match [String.maybe_to_int(to_string(parts[0])),
+             String.maybe_to_int(to_string(parts[1]))]
+      | [r :: Int, c :: Int]:
+          if r > 0 && c > 0 | [r, c] | [24, 80]
+      | ~else: [24, 80]
+
+fun pick_effect(want :: String) :: String:
+  let w = want.trim().foldcase()
+  if startup_effects.contains(w)
+  | w
+  | startup_effects[rkt.#{random}(startup_effects.length())]
+
+fun init(rho):
+  rho.register_command(
+    ~name: "startup-animation",
+    ~description: "Replay the RHO startup animation: /startup-animation [effect]",
+    ~handler: fun (args):
+                play_animation(rho, #true, args))
+  when !rkt.#{unbox}(played)
+  | play_animation(rho, #false, "")
+
+fun maybe_note(rho, force, msg :: String):
+  when force
+  | rho.notify(msg)
+
+fun run_ttfx(ttfx, art :: String, effect :: String):
+  let tmp = to_string(rktfile.#{make-temporary-file}("rho-splash-~a"))
+  filesystem.write_string(tmp, art, ~exists: #'truncate)
+  // 24 fps + a hold: the TUI wipes the screen the instant ttfx exits.
+  sys.#{system*}(ttfx,
+                 "--input-file", tmp,
+                 "--frame-rate", "24",
+                 "--canvas-width", "0",
+                 "--canvas-height", "0",
+                 "--anchor-canvas", "c",
+                 "--anchor-text", "c",
+                 effect)
+  try:
+    rkt.#{delete-file}(tmp)
+    ~catch _: #void
+  rkt.#{flush-output}()
+  rkt.sleep(2.0)
+
+fun play_animation(rho, force, want :: String):
+  rkt.#{set-box!}(played, #true)
+  cond
+  | rho.flag("print") || rho.flag("no-extensions"):
+      #void
+  | ~else:
+      let ttfx = rkt.#{find-executable-path}("ttfx")
+      let is_tty = rkt.#{terminal-port?}(rkt.#{current-output-port}())
+      cond
+      | ttfx == #false:
+          maybe_note(rho, force, "ttfx not on PATH")
+      | !is_tty:
+          maybe_note(rho, force, "startup animation needs a tty")
+      | ~else:
+          let size = term_size()
+          run_ttfx(ttfx,
+                   render_banner(pick_scale(size[1], size[0])),
+                   pick_effect(want))

@@ -136,6 +136,13 @@ Ctrl-Y yank, Alt-Y yank-pop. Consecutive kills append.
 Chain of thought streams dim into the transcript (`Ctrl-T` hides it;
 `/thinking` or Shift-Tab sets the effort). Mouse drag selects transcript
 text and copies on release (Shift+drag uses the terminal's native selection).
+`/permission ask` (or `/ask`) pauses the turn on write/bash tools and shows
+an Allow/Deny card: `1`/`y`/Enter or a click allows, `2`/`n`/Esc denies.
+Read-only tools (`read_file`, `grep`, `find`, `ls`) skip the prompt.
+Headless/`-p` stays on `/permission allow` so CI does not hang.
+
+A turn stops after 200 tool-loop steps (soft stop, not a crash). Send another
+message to continue, or raise the cap with `/steps 400` / `/settings max_steps 400`.
 
 ## Skills and prompt templates
 
@@ -165,8 +172,10 @@ extensions/skills/prompts are ignored (headless runs use the
 
 `/help` `/hotkeys` `/model` `/provider` `/reload` `/session` `/tree` `/fork`
 `/clone` `/new` `/name` `/resume` `/export` `/import` `/compact` `/clear`
-`/login` `/logout` `/skills` `/prompts` `/packages` `/share` `/quit` — plus
-extension commands, `/skill:name`, and `/template-name`.
+`/login` `/logout` `/skills` `/prompts` `/packages` `/share` `/quit`
+`/remember` `/doctor` `/context` `/verify` `/permission` `/allow` `/ask`
+`/steps` `/mcp` `/dashboard` `/sandbox` — plus other extension commands,
+`/skill:name`, and `/template-name`.
 
 `/login <provider> oauth` opens the browser and returns immediately (TUI
 must not block). After authorizing, paste the code or redirect URL:
@@ -177,18 +186,28 @@ Tokens live in `~/.rho/auth.json` (0600) and refresh automatically.
 ## Tools
 
 `read_file` `write_file` `edit_file` `bash` `grep` `find` `ls`
-`agent` `reload_extensions` — filterable with `--tools`/`--exclude-tools`/`--no-tools`.
+`reload_extensions` — filterable with `--tools`/`--exclude-tools`/`--no-tools`.
 
-`agent` runs a nested sub-agent with its own session (no further nesting).
-Pass `prompt`, optional `label`, and optional `tools` (comma-separated allowlist).
+The `agent` tool is a bundled extension (`src/ext/bundled/agent.rhm`): a nested
+sub-agent with its own session (no further nesting). Pass `prompt`, optional
+`label`, and optional `tools` (comma-separated allowlist). `--no-extensions`
+drops it. `--no-builtin-tools` keeps it.
 The TUI streams the child's text and tool calls live (indented, status
 `sub-agent <label>: <tool>`); Ctrl-O still folds long tool output.
 
+`/dashboard` prints a session snapshot (model, permission mode, tools, MCP,
+steps) and refreshes a TUI widget. `/sandbox [on|off]` wraps `bash` through
+an OS network jail (`sandbox-exec -n no-network` on macOS, `unshare -n` on
+Linux) via `rho.set_bash_spawn_hook`. Sandbox is off by default.
+
 ## Extensions
 
-Extensions are Rhombus modules exporting `init(rho)`, discovered from
-`~/.rho/extensions/*.rhm`, installed packages, and (if trusted)
-`.rho/extensions/*.rhm`.
+Extensions are Rhombus modules exporting `init(rho)`. rho always loads
+`src/ext/bundled/` (guards, audit, memory, doctor, usage, verify, agent,
+dashboard, sandbox). Then it picks
+up `~/.rho/extensions/*.rhm`, installed packages, and (if trusted)
+`.rho/extensions/*.rhm`. `examples/extensions/` is documentation only
+and is not loaded.
 
 ```
 #lang rhombus
@@ -230,6 +249,7 @@ API surface:
 - `rho.register_message_renderer(~fn)` / `rho.register_entry_renderer(~fn)` —
   custom transcript entry rendering
 - `rho.register_shortcut(~key, ~description, ~fn)` — keyboard shortcut
+- `rho.register_click(~id, ~fn)` — TUI click handler for a hit-rect id
 - `rho.register_markdown_transformer(~fn)` — transform displayed markdown
 - `rho.register_provider(~name, ~profile)` — dynamic provider registration
 - `rho.set_model(model)` / `rho.get_thinking_level()` / `rho.set_thinking_level(level)`
@@ -238,6 +258,9 @@ API surface:
   — inject messages (`deliver_as`: `"steer"`/`"followUp"`/`"next_turn"`)
 - `rho.set_label(entry_id, label)` / `rho.set_session_name(name)` / `rho.get_session_name()`
 - `rho.events` — shared event bus for inter-extension communication
+- `rho.current_config()` — live kernel config, or `#false` when headless
+- `rho.set_bash_spawn_hook(fn)` — wrap bash before spawn; `fn({"command": ...})`
+  returns a string or `{"command": ...}`
 - `rho.set_status(s)` / `rho.set_widget(id, text)` / `rho.set_footer(s)` — TUI hooks
 - `rho.notify(msg)`
 
@@ -297,7 +320,7 @@ src/
     registry.rhm      tools / commands / event handlers / state / filters
     session.rhm       session tree, JSONL persistence (~/.rho/sessions/)
     loop.rhm          agent loop: stream, execute tools, steering, events
-    subagent.rhm      nested agent tool (isolated session, depth 1)
+    subagent.rhm      nested-run primitive (the `agent` tool is an extension)
     oauth.rhm         PKCE login + token refresh
     crypto.rkt        PKCE / url-encode / localhost callback
     context.rhm       AGENTS.md hierarchy, SYSTEM.md/APPEND_SYSTEM.md
@@ -320,6 +343,9 @@ src/
     api.rhm           the `rho` object handed to extensions
     loader.rhm        discovery + hot reload
     tool.rhm          `tool` definition macro
+    bundled/          shipped plugins: guards, audit, memory, doctor, usage,
+                      verify, agent, dashboard, sandbox
+    mcp.rhm           MCP stdio client (~/.rho/mcp.json)
   ui/
     repl.rhm          readline REPL (steering, /follow, Ctrl-C)
     tui.rhm           raart full-screen TUI
@@ -330,10 +356,21 @@ examples/themes/      solarized.json
 tests/                runnable test modules (t_*.rhm)
 ```
 
+## MCP
+
+Stdio servers in `~/.rho/mcp.json` (and trusted `.rho/mcp.json`):
+
+```json
+{ "mcpServers": { "echo": { "command": "npx", "args": ["-y", "pkg"] } } }
+```
+
+`/mcp` lists them, `/mcp reload` reconnects. Each tool is registered as
+`mcp_<server>_<tool>`.
+
 ## Known limitations
 
-- No MCP, and no OAuth for providers that only accept API keys (Kimi, Ollama, …)
+- No OAuth for providers that only accept API keys (Kimi, Ollama, …)
 - ChatGPT subscription login is the `openai-codex` provider (`/login openai oauth`). It calls `chatgpt.com/backend-api/codex/responses`. Platform `openai` still needs `OPENAI_API_KEY` with billing.
 - TUI editor highlighting is command/`@file`/`code`, not full language syntax
 - `transport: "websocket"` falls back to SSE (see `src/ai/ws.rhm`)
-- Google Gemini requires a native protocol client (not OpenAI-compatible); not yet implemented
+- ACP is not implemented (Pi uses `--mode rpc`; rho has `--rpc`)

@@ -7,8 +7,11 @@
 // row above the editor, so it never covers the footer stats.
 // Keys: Enter submit, Ctrl-J newline, Alt-Enter queue follow-up, Tab path
 // completion, Up/Down history (or cursor movement in multi-line input),
-// PgUp/PgDn or mouse wheel scroll, mouse drag selects transcript text and
-// copies it on release (OSC 52 + clipboard tools; Shift+drag falls back to
+// PgUp/PgDn or mouse wheel scroll, click tool output to fold/expand, click
+// the status row to interrupt, click autocomplete / editor / footer (footer
+// cycles the model). A pending tool-permission card is clickable
+// ([1] Allow / [2] Deny; y/n/Enter/Esc). Mouse drag still selects transcript text and copies
+// it on release (OSC 52 + clipboard tools; Shift+drag falls back to
 // native terminal selection), Ctrl-C interrupt turn (or clear input /
 // quit), Escape interrupt (restores queued follow-ups to the editor),
 // Ctrl-G external editor, Ctrl-X copy last assistant message, Ctrl-O
@@ -31,6 +34,7 @@ import:
   lib("racket/file.rkt") as rktfile
   lib("racket/system.rkt") as rktsys
   lib("net/base64.rkt") as rkt64
+  json
   "term.rkt" as term
   "style.rhm" open
   "../kernel/sync.rkt" as sync
@@ -53,7 +57,15 @@ export:
   md_line_spans
   editor_line_spans
   wrap_spans
+  highlight_search_row
+  search_prompt_rows
+  fit_tui_layout
   take_paste_images
+  make_hit
+  hit_at
+  ask_card_rows
+  ask_card_hits
+  ASK_CARD_H
 
 // Images pasted from the clipboard (Ctrl-V / Alt-V) while the TUI is
 // running.  Each entry is an attachment map shaped like encode_image's
@@ -291,6 +303,133 @@ fun idx_at_col(text :: String, col :: Int) :: Int:
 fun clamp(x, lo, hi):
   math.max(lo, math.min(x, hi))
 
+// Return the original-string range for a case-insensitive match. We map the
+// folded match back through prefix lengths because Unicode folds such as
+// ß -> ss can expand one source character into multiple folded characters.
+fun casefold_match_range(text :: String, query :: String):
+  let folded_query = query.foldcase()
+  let folded_text = text.foldcase()
+  if folded_query == ""
+  | #false
+  | match folded_text.find(folded_query)
+    | folded_start :: Int:
+        let folded_end = folded_start + folded_query.length()
+        fun source_start(i :: Int) :: Int:
+          if i >= text.length()
+          | text.length()
+          | if text.substring(0 .. i + 1).foldcase().length() > folded_start
+            | i
+            | source_start(i + 1)
+        fun source_end(i :: Int) :: Int:
+          if i >= text.length()
+          | text.length()
+          | if text.substring(0 .. i + 1).foldcase().length() >= folded_end
+            | i + 1
+            | source_end(i + 1)
+        [source_start(0), source_end(0)]
+    | ~else: #false
+
+// Highlight one case-insensitive search match while preserving the required
+// row shape: a row is a list of spans, never a list containing a row.
+fun highlight_search_row(row :: List, query :: String) :: List:
+  let text:
+    for values(acc = "") (sp in row):
+      acc +& to_string(sp[3])
+  match casefold_match_range(text, query)
+  | [start, end]:
+      for List:
+        each sp in [[#false, #false, #false, text.substring(0 .. start)],
+                    [#false, #false, "invert", text.substring(start .. end)],
+                    [#false, #false, #false, text.substring(end ..)]]
+        skip_when sp[3] == ""
+        sp
+  | ~else: row
+
+// Search consumes a screen row only while its prompt is visible.
+fun search_prompt_rows(active :: Boolean, query :: String, tcolor) :: List:
+  if active
+  | [[[tcolor("prompt"), #false, "bold", " search: " +& query +& "_"]]]
+  | []
+
+// Fit optional regions into the terminal while reserving the fixed status,
+// separator, footer, editor, and at least one transcript row. Popup rows get
+// first priority because they are interactive.
+fun fit_tui_layout(rows :: Int,
+                   editor_want :: Int,
+                   header_want :: Int,
+                   widget_want :: Int,
+                   queue_want :: Int,
+                   popup_want :: Int,
+                   search_h :: Int,
+                   ~ask_h: ask_h :: Int = 0) :: Map:
+  let fixed_h = 3 + search_h + ask_h
+  let editor_h = math.min(editor_want, math.max(0, rows - fixed_h - 1))
+  def mutable budget = math.max(0, rows - fixed_h - editor_h - 1)
+  let popup_h = math.min(popup_want, budget)
+  budget := budget - popup_h
+  let header_h = math.min(header_want, budget)
+  budget := budget - header_h
+  let queue_h = math.min(queue_want, budget)
+  budget := budget - queue_h
+  let widget_h = math.min(widget_want, budget)
+  let trans_h = math.max(0, rows - fixed_h - editor_h - popup_h
+                            - header_h - queue_h - widget_h)
+  { "editor": editor_h,
+    "header": header_h,
+    "widget": widget_h,
+    "queue": queue_h,
+    "popup": popup_h,
+    "transcript": trans_h }
+
+def ASK_CARD_H = 3
+
+fun clip_cols(s :: String, cols :: Int) :: String:
+  if s.length() <= cols | s | s.substring(0 .. math.max(0, cols))
+
+fun ask_detail(ask :: Map) :: String:
+  let reason = to_string(ask.get("reason", "")).trim()
+  cond
+  | reason != "": reason
+  | ~else:
+      let input = ask.get("input", {})
+      if input is_a Map
+      | to_string(input.get("command",
+                            input.get("path",
+                                      input.get("old_string", ""))))
+      | to_string(input)
+
+fun ask_card_rows(ask :: Map, tcolor, cols :: Int) :: List:
+  let name = to_string(ask.get("toolName", "tool"))
+  [[[tcolor("prompt"), #false, "bold",
+     clip_cols(" Allow " +& name +& "?", cols)]],
+   [[tcolor("tool_result"), #false, #false,
+     clip_cols("   " +& ask_detail(ask), cols)]],
+   [[tcolor("prompt"), #false, #false,
+     clip_cols("  [1] Allow    [2] Deny", cols)]]]
+
+fun ask_card_hits(y0 :: Int) :: List:
+  [make_hit(y0 + 2, 2, 12, "ask_allow", #false),
+   make_hit(y0 + 2, 16, 26, "ask_deny", #false)]
+
+// Click hit-rects: row is a screen row, [c0, c1) is a column range.
+// Later hits on the same cell win (popup over transcript, etc.).
+fun make_hit(row :: Int, c0 :: Int, c1 :: Int, id :: String, data) :: Map:
+  { "row": row, "c0": c0, "c1": c1, "id": id, "data": data }
+
+fun hit_at(hits :: List, row :: Int, col :: Int):
+  for values(found = #false) (h in hits):
+    if row == h["row"] && col >= h["c0"] && col < h["c1"] | h | found
+
+fun list_find_index(xs :: List, target):
+  recur loop(i = 0):
+    cond
+    | i >= xs.length(): #false
+    | xs[i] == target: i
+    | ~else: loop(i + 1)
+
+fun list_prefix(xs :: List, n :: Int) :: List:
+  for List (i in 0 .. math.min(n, xs.length())): xs[i]
+
 fun list_dir_safe(dir :: String) :: List:
   if filesystem.directory_exists(dir)
   | for List (f in filesystem.files(dir).sort()): f +& ""
@@ -343,15 +482,36 @@ fun run_tui(~theme: theme_in :: Map = {},
             ~arg_complete: arg_complete = fun (cmd, prefix): #false,
             ~editor_cmd: editor_cmd = fun (): "",
             ~last_assistant: last_assistant = fun (): "",
-            ~keybind: keybind = fun (action, default): default):
-  let theme = default_theme ++ theme_in
-  fullscreen_mode := (tui_mode_in == "fullscreen")
+            ~keybind: keybind = fun (action, default): default,
+            ~shortcuts: shortcuts = fun (): {},
+            ~markdown_transformers: md_transformers = fun (): [],
+            ~theme_loader: theme_loader = fun (): theme_in,
+            ~clicks: clicks = fun (): #false,
+            ~pending_ask: pending_ask = fun (): #false,
+            ~bind_ask: bind_ask = fun (w): #void):
+  def mutable current_theme = default_theme ++ theme_in
+  def mutable last_theme_json = json.to_string(theme_in)
   fun tcolor(kind :: String):
-    let c = theme.get(kind, "default")
+    let c = current_theme.get(kind, "default")
     if c == "default" | #false | c
   // keybindings.json can remap these action names
   fun kb(action :: String, default :: String) :: String:
     to_string(keybind(action, default))
+
+  // Apply registered markdown transformers to a text line, chaining them
+  // left-to-right.  Each transformer takes and returns a string; failures
+  // fall back to the previous value so a broken extension can't break the
+  // render pipeline.
+  fun apply_transformers(text :: String) :: String:
+    recur go(t = text, rest = md_transformers()):
+      match rest
+      | []: t
+      | [fn, & more]:
+          let next = try:
+                       let r = fn(t)
+                       if r is_a String | r | t
+                       ~catch _: t
+          go(next, more)
 
   def mutable input_lines :: List = [""]
 
@@ -396,9 +556,14 @@ fun run_tui(~theme: theme_in :: Map = {},
   def mutable turn_started = 0
   def mutable last_size_poll = rkt.#{current-inexact-milliseconds}()
   def mutable last_trans_h = 20      // visible transcript height from last render
+  def mutable last_trans_y = 0       // first transcript screen row
+  def mutable last_hits :: List = [] // click regions from the last render
+  def mutable ask_sema = #false
+  def mutable ask_answer = "deny"
+  def mutable ask_waiting = #false
   def mutable tools_expanded = #false  // Ctrl-O: expand tool output blocks
   def mutable thinking_shown = #true   // Ctrl-T: show/hide chain of thought
-  def mutable fullscreen_mode = #false  // experimental fullscreen scroll (Alt-F)
+  def mutable fullscreen_mode = (tui_mode_in == "fullscreen")  // Alt-F toggles
   def mutable kill_ring :: List = []   // newest first
   def mutable kill_idx = 0
   def mutable last_was_kill = #false
@@ -418,8 +583,9 @@ fun run_tui(~theme: theme_in :: Map = {},
   // transcript search (Ctrl-S): query, matches, current index
   def mutable search_active = #false      // #false or search query being typed
   def mutable search_query :: String = ""
-  def mutable search_matches :: List = []  // row indices in transcript
+  def mutable search_matches :: List = []  // raw entry indices in transcript
   def mutable search_idx = 0              // current match (0-based)
+  def mutable search_target = #false      // raw entry to reveal on next render
 
   fun norm_sel() :: List:
     let [ar, ac] = sel_anchor
@@ -689,6 +855,84 @@ fun run_tui(~theme: theme_in :: Map = {},
     close_ac()
     dirty := #true
 
+  fun click_fn(id :: String):
+    match clicks()
+    | mm :: MutableMap: mm.get(id, #false)
+    | m :: Map: m.get(id, #false)
+    | ~else: #false
+
+  fun wait_ask():
+    ask_sema := rkt.#{make-semaphore}(0)
+    ask_answer := "deny"
+    ask_waiting := #true
+    dirty := #true
+    wake()
+    rkt.#{semaphore-wait}(ask_sema)
+    ask_answer
+
+  fun answer_ask(decision :: String):
+    when ask_waiting
+    | ask_waiting := #false
+      ask_answer := decision
+      match ask_sema
+      | #false: #void
+      | sema: rkt.#{semaphore-post}(sema)
+      dirty := #true
+      wake()
+
+  fun handle_ask_key(k :: String) :: Boolean:
+    match pending_ask()
+    | ask :: Map:
+        cond
+        | k == "1" || k == "y" || k == "Y" || k == "C-M":
+            answer_ask("allow")
+            #true
+        | k == "2" || k == "n" || k == "N" || k == "<escape>" || k == "C-[":
+            answer_ask("deny")
+            #true
+        | k == "C-C":
+            answer_ask("deny")
+            interrupt_turn()
+            #true
+        | ~else: #true
+    | ~else: #false
+
+  fun dispatch_hit(h :: Map, col :: Int):
+    let id = to_string(h.get("id", ""))
+    cond
+    | id == "ask_allow": answer_ask("allow")
+    | id == "ask_deny": answer_ask("deny")
+    | id == "stop": interrupt_turn()
+    | id == "tool_fold":
+        tools_expanded := !tools_expanded
+        push("notify", (if tools_expanded
+                        | "[tool output expanded]"
+                        | "[tool output folded]"))
+        dirty := #true
+    | id == "ac_pick":
+        match h.get("data", #false)
+        | i :: Int:
+            when i >= 0 && i < ac_items.length()
+            | ac_sel := i
+              apply_ac()
+        | ~else: #void
+    | id == "editor":
+        match h.get("data", #false)
+        | line :: Int:
+            when line >= 0 && line < input_lines.length()
+            | cur_line := line
+              cur_col := clamp(idx_at_col(cur_text(), math.max(0, col - 2)),
+                               0, cur_text().length())
+              dirty := #true
+        | ~else: #void
+    | ~else:
+        match click_fn(id)
+        | #false:
+            when id == "footer"
+            | let msg = cycle_model()
+              when msg != "" | push("notify", msg)
+        | fn: fn(h.get("data", {}))
+
   fun interrupt_turn():
     when turn_thread
     | rkt.#{break-thread}(turn_thread)
@@ -823,6 +1067,11 @@ fun run_tui(~theme: theme_in :: Map = {},
           start_turn(text)
 
   fun handle_key(k :: String):
+    if handle_ask_key(k)
+    | #void
+    | handle_key_rest(k)
+
+  fun handle_key_rest(k :: String):
     cond
     | ac_open && k == "<up>":
         ac_sel := (if ac_sel == 0 | ac_items.length() - 1 | ac_sel - 1)
@@ -871,11 +1120,19 @@ fun run_tui(~theme: theme_in :: Map = {},
           let q = search_query.foldcase()
           when q != ""
           | search_matches := (for List (i in 0 .. lines.length()):
-                                 skip_when !to_string(lines[i].get(1, "")).foldcase().contains(q)
+                                 let [kind, raw_text] = lines[i]
+                                 let shown = to_string(tool_line(kind, raw_text) || raw_text)
+                                 let searchable:
+                                   cond
+                                   | kind == "think" && !thinking_shown: ""
+                                   | kind == "tool_result" && !tools_expanded:
+                                       to_string(shown.split("\n", ~trim: #false)[0])
+                                   | ~else: shown
+                                 skip_when !searchable.foldcase().contains(q)
                                  i)
             search_idx := 0
             when search_matches != []
-            | scroll := math.max(0, search_matches[0] - 2)
+            | search_target := search_matches[0]
               push("notify", "[" +& (search_idx + 1) +& "/" +& search_matches.length() +& " matches]")
           search_active := #false
           dirty := #true
@@ -906,19 +1163,31 @@ fun run_tui(~theme: theme_in :: Map = {},
     | last_was_kill := #false
     when !yankish
     | last_was_yank := #false
+    let shortcut:
+      let table = shortcuts()
+      if table is_a Map | table.get(k, #false) | #false
     cond
+    | shortcut is_a Map:
+        match shortcut.get("fn", #false)
+        | fn :: Function:
+            try:
+              fn()
+              ~catch e :: Exn.Fail:
+                push("error", "shortcut " +& k +& ": " +& e.message)
+            dirty := #true
+        | ~else: #void
     | k == "C-S":
         search_active := #true
         search_query := ""
         dirty := #true
     | k == "C-N" && search_matches != []:
         search_idx := (search_idx + 1) mod search_matches.length()
-        scroll := math.max(0, search_matches[search_idx] - 2)
+        search_target := search_matches[search_idx]
         push("notify", "[" +& (search_idx + 1) +& "/" +& search_matches.length() +& " matches]")
         dirty := #true
     | k == "C-P" && search_matches != []:
         search_idx := (search_idx - 1) mod search_matches.length()
-        scroll := math.max(0, search_matches[search_idx] - 2)
+        search_target := search_matches[search_idx]
         push("notify", "[" +& (search_idx + 1) +& "/" +& search_matches.length() +& " matches]")
         dirty := #true
     | k == "C-M": submit()
@@ -1006,9 +1275,9 @@ fun run_tui(~theme: theme_in :: Map = {},
         // Paste an image from the clipboard (pi-style).
         match read_clipboard_image()
         | img :: Map:
-            pending_image_count := pending_image_count + 1
             pending_images := pending_images.add(img)
-            insert("[image: clipboard-" +& pending_image_count +& ".png]")
+            insert("[image: " +& img["name"] +& "]")
+            pending_image_count := pending_image_count + 1
             push("notify", "[pasted image " +& img["data"].length() +& " base64 chars]")
             dirty := #true
         | ~else:
@@ -1053,16 +1322,16 @@ fun run_tui(~theme: theme_in :: Map = {},
     let spinner_frames_custom = frame["spinner_frames_custom"]
     let rows = term.#{term-rows}()
     let cols = term.#{term-cols}()
-    let input_h = math.min(input_lines.length(), 8)
-    let popup_h = (if ac_open && ac_items != [] | math.min(5, ac_items.length()) | 0)
-    let queue_h = math.min(followups.length(), 3)
+    let input_h_want = math.min(input_lines.length(), 8)
+    let popup_h_want = (if ac_open && ac_items != [] | math.min(5, ac_items.length()) | 0)
+    let queue_h_want = math.min(followups.length(), 3)
     // extension widgets, one row per line (total capped at 4 rows)
     let widget_lines:
       for List:
         each key in widgets.keys().sort()
         each l in to_string(widgets[key]).split("\n")
         l
-    let widget_h = math.min(widget_lines.length(), 4)
+    let widget_h_want = math.min(widget_lines.length(), 4)
     // header rows (title / header_extra) shown above the transcript
     let header_rows:
       cond
@@ -1074,22 +1343,45 @@ fun run_tui(~theme: theme_in :: Map = {},
       | header_extra != "":
           [[tcolor("muted"), #false, "dim", " " +& header_extra]]
       | ~else: []
-    let header_h = header_rows.length()
+    let header_h_want = header_rows.length()
     let search_h = (if search_active | 1 | 0)
-    // fullscreen: shrink the editor to its minimum (1 line) so the
-    // transcript fills nearly the whole screen
-    let fs_input_h = (if fullscreen_mode | 1 | input_h)
-    // rows = header + transcript + widgets + queue + status(1) + search(?) + separator(1) + editor + popup + footer(1)
-    let trans_h = math.max(3, rows - fs_input_h - 3 - search_h - popup_h - queue_h - widget_h - header_h)
+    let ask = pending_ask()
+    let ask_h:
+      cond
+      | ask is_a Map: ASK_CARD_H
+      | ~else: 0
+    let ask_rows:
+      cond
+      | ask is_a Map: ask_card_rows(ask, tcolor, cols)
+      | ~else: []
+    let editor_h_want = (if fullscreen_mode | 1 | input_h_want)
+    let layout = fit_tui_layout(rows, editor_h_want, header_h_want,
+                                widget_h_want, queue_h_want, popup_h_want,
+                                search_h, ~ask_h: ask_h)
+    let ed_h = layout["editor"]
+    let header_h = layout["header"]
+    let widget_h = layout["widget"]
+    let queue_h = layout["queue"]
+    let popup_h = layout["popup"]
+    let trans_h = layout["transcript"]
+    let header_rows = list_prefix(header_rows, header_h)
     last_trans_h := trans_h
+    last_trans_y := header_h
     // wrap only the tail of the transcript that can possibly be visible
     // (each raw line wraps to >= 1 row, so this many raw lines suffice)
     let all_lines = (if partial == "" | lines | lines.add([partial_kind, partial]))
     let need = trans_h + scroll + 4
-    let tail_start = math.max(0, all_lines.length() - need)
+    // A search target must be included before wrapped-row coordinates can be
+    // calculated. Normal scrolling still wraps only the needed transcript tail.
+    let tail_start:
+      match search_target
+      | target :: Int: math.max(0, target - 4)
+      | ~else: math.max(0, all_lines.length() - need)
     // assistant lines get markdown styling; ``` fences are tracked while
     // walking the tail (a fence opened before the window is missed — rare)
     def mutable fence = #false
+    def mutable wrapped_sources :: List = []
+    def mutable wrapped_kinds :: List = []
     let wrapped:
       for List:
         each i in tail_start .. all_lines.length()
@@ -1115,6 +1407,7 @@ fun run_tui(~theme: theme_in :: Map = {},
           cond
           | kind == "assistant":
               let was = fence
+              let sub = apply_transformers(sub)
               when sub.trim().starts_with("```")
               | fence := !fence
               md_line_spans(sub, was, tcolor)
@@ -1123,7 +1416,20 @@ fun run_tui(~theme: theme_in :: Map = {},
               [[tcolor("subagent"), #false, "dim", "  \u2502 " +& sub]]
           | ~else: [[tcolor(kind), #false, #false, sub]]
         each row in wrap_spans(spans, cols)
+        wrapped_sources := wrapped_sources.add(i)
+        wrapped_kinds := wrapped_kinds.add(kind)
         row
+    // Convert a raw transcript match to the bottom-relative wrapped-row
+    // offset used by scrolling. Keep two rows of context above the match.
+    match search_target
+    | target :: Int:
+        match list_find_index(wrapped_sources, target)
+        | pos :: Int:
+            let desired_first = math.max(0, pos - 2)
+            scroll := math.max(0, wrapped.length() - trans_h - desired_first)
+        | ~else: #void
+        search_target := #false
+    | ~else: #void
     let max_scroll:
       if tail_start > 0
       | scroll  // older lines exist beyond the wrapped tail; allow scrolling on
@@ -1165,25 +1471,13 @@ fun run_tui(~theme: theme_in :: Map = {},
               sp
       | trans_rows
     // search match highlighting: invert the query substring in rows that
-    // contain it (case-insensitive)
+    // contain it (case-insensitive). Every branch must return one row (a
+    // list of spans); wrapping a non-match in another list breaks term-draw!.
     let trans_rows:
       if search_matches == [] || search_query == ""
       | trans_rows
-      | let q = search_query.foldcase()
-        for List (r in 0 .. trans_rows.length()):
-          let t = to_string(visible_plain[r])
-          let tf = t.foldcase()
-          let qpos = tf.indexOf(q)
-          if qpos is_a Int
-          | let c0 = idx_at_col(t, qpos)
-            let c1 = idx_at_col(t, qpos + q.length())
-            for List:
-              each sp in [[#false, #false, #false, t.substring(0 .. c0)],
-                          [#false, #false, "invert", t.substring(c0 .. c1)],
-                          [#false, #false, #false, t.substring(c1 ..)]]
-              skip_when sp[3] == ""
-              sp
-          | [trans_rows[r]]
+      | for List (r in 0 .. trans_rows.length()):
+          highlight_search_row(trans_rows[r], search_query)
     // separator; shows position while scrolled back
     let total_visible = wrapped.length()
     let sep_text:
@@ -1201,7 +1495,6 @@ fun run_tui(~theme: theme_in :: Map = {},
           String.make(cols, Char"\u2500")
     let sep = [[tcolor("sep"), #false, #false, sep_text]]
     // editor window containing the cursor
-    let ed_h = (if fullscreen_mode | fs_input_h | input_h)
     let win_start = clamp(cur_line - ed_h + 1, 0, math.max(0, input_lines.length() - ed_h))
     let input_rows:
       for List (i in win_start .. math.min(input_lines.length(), win_start + ed_h)):
@@ -1237,11 +1530,10 @@ fun run_tui(~theme: theme_in :: Map = {},
          [tcolor("tool_result"), #false, #false,
           msg +& " " +& secs +& "s (esc to interrupt \u00B7 type to steer)"]]
       | [[#false, #false, #false, ""]]
-    // search prompt row (shown while typing a query in search mode)
-    let search_row:
-      if search_active
-      | [[tcolor("prompt"), #false, "bold", " search: " +& search_query +& "_"]]
-      | [[#false, #false, #false, ""]]
+    // search prompt row (present only while typing a query). Keeping an
+    // idle placeholder here would draw one row more than search_h budgets,
+    // clipping the footer and placing the cursor on the separator.
+    let search_rows = search_prompt_rows(search_active, search_query, tcolor)
     // autocomplete popup below the editor (pi-style select list)
     let popup_rows:
       if popup_h == 0
@@ -1262,10 +1554,47 @@ fun run_tui(~theme: theme_in :: Map = {},
       let padding = math.max(0, cols - display_width(ftext))
       ftext.substring(0 .. math.min(ftext.length(), cols)) +& String.make(padding, Char" ")
     let foot = [[tcolor("footer_fg"), tcolor("footer_bg"), #false, fpad]]
-    let cursor_row = header_h + trans_h + widget_h + queue_h + search_h + 2 + (cur_line - win_start)
+    let cursor_row = clamp(header_h + trans_h + widget_h + queue_h + ask_h
+                             + search_h + 2 + (cur_line - win_start),
+                           0, math.max(0, rows - 1))
     let cursor_col = clamp(2 + display_width(cur_text().substring(0 .. cur_col)),
                            0, cols - 1)
-    term.#{term-draw!}(header_rows ++ trans_rows ++ widget_rows ++ queue_rows ++ [status_row] ++ [search_row] ++ [sep]
+    let y_trans = header_h
+    let y_widget = y_trans + trans_h
+    let y_queue = y_widget + widget_h
+    let y_status = y_queue + queue_h
+    let y_ask = y_status + 1
+    let y_search = y_ask + ask_h
+    let y_sep = y_search + search_h
+    let y_ed = y_sep + 1
+    let y_pop = y_ed + ed_h
+    let y_foot = y_pop + popup_h
+    let hits:
+      let trans_hits:
+        for List (i in first .. math.min(wrapped.length(), first + trans_h)):
+          skip_when to_string(wrapped_kinds[i]) != "tool_result"
+          make_hit(y_trans + (i - first), 0, cols, "tool_fold", i)
+      let status_hits:
+        if turn_thread
+        | [make_hit(y_status, 0, cols, "stop", #false)]
+        | []
+      let ed_hits:
+        for List (i in win_start .. math.min(input_lines.length(), win_start + ed_h)):
+          make_hit(y_ed + (i - win_start), 0, cols, "editor", i)
+      let pop_hits:
+        if popup_h == 0
+        | []
+        | let win = clamp(ac_sel - popup_h + 1, 0, math.max(0, ac_items.length() - popup_h))
+          for List (i in win .. win + popup_h):
+            make_hit(y_pop + (i - win), 0, cols, "ac_pick", i)
+      let ask_hits:
+        cond
+        | ask is_a Map: ask_card_hits(y_ask)
+        | ~else: []
+      trans_hits ++ status_hits ++ ask_hits ++ ed_hits ++ pop_hits
+        ++ [make_hit(y_foot, 0, cols, "footer", #false)]
+    last_hits := hits
+    term.#{term-draw!}(header_rows ++ trans_rows ++ widget_rows ++ queue_rows ++ [status_row] ++ ask_rows ++ search_rows ++ [sep]
                          ++ input_rows ++ popup_rows ++ [foot],
                        [cursor_row, cursor_col])
 
@@ -1276,6 +1605,7 @@ fun run_tui(~theme: theme_in :: Map = {},
   | ~else: #void
 
   // main loop
+  bind_ask(wait_ask)
   term.#{term-start!}()
   try:
     recur loop():
@@ -1307,6 +1637,14 @@ fun run_tui(~theme: theme_in :: Map = {},
         | last_size_poll := now
           when term.#{term-poll-size!}()
           | dirty := #true
+          // hot-reload theme: re-read the theme file and update if it changed
+          let new_t = theme_loader()
+          when new_t is_a Map
+          | let new_json = json.to_string(new_t)
+            when new_json != last_theme_json
+            | last_theme_json := new_json
+              current_theme := default_theme ++ new_t
+              dirty := #true
         let e = term.#{term-wait-event}((if turn_thread | 0.05 | 0.5), wake_sema)
         fun dispatch_key(k :: String):
           dlog("key " +& k)
@@ -1331,23 +1669,30 @@ fun run_tui(~theme: theme_in :: Map = {},
               let c = mcol - 1
               cond
               | mt == "press" && btn == 1:
-                  if r < last_trans_h
-                  | sel_anchor := [r, c]
-                    sel_focus := [r, c]
+                  if r >= last_trans_y && r < last_trans_y + last_trans_h
+                  | let rr = r - last_trans_y
+                    sel_anchor := [rr, c]
+                    sel_focus := [rr, c]
                     sel_dragged := #false
                     dirty := #true
                   | clear_selection()
               | mt == "drag" && sel_anchor:
-                  sel_focus := [clamp(r, 0, last_trans_h - 1), math.max(0, c)]
+                  sel_focus := [clamp(r - last_trans_y, 0, last_trans_h - 1), math.max(0, c)]
                   sel_dragged := #true
                   dirty := #true
               | mt == "release":
-                  when sel_anchor && sel_dragged
-                  | let text = selection_text()
-                    when text.trim() != ""
-                    | copy_text(text)
-                      push("notify", "[copied " +& text.length() +& " chars]")
-                  clear_selection()
+                  cond
+                  | sel_anchor && sel_dragged:
+                      let text = selection_text()
+                      when text.trim() != ""
+                      | copy_text(text)
+                        push("notify", "[copied " +& text.length() +& " chars]")
+                      clear_selection()
+                  | ~else:
+                      clear_selection()
+                      match hit_at(last_hits, r, c)
+                      | h :: Map: dispatch_hit(h, c)
+                      | ~else: #void
               | ~else: #void
           | [#'key, k]:
               let k = to_string(k)
@@ -1369,6 +1714,12 @@ fun run_tui(~theme: theme_in :: Map = {},
         handle_event(e)
         loop()
     ~catch e :: Exn.Break:
+      answer_ask("deny")
       when turn_thread
       | rkt.#{break-thread}(turn_thread)
+  let was_asking = ask_waiting
+  answer_ask("deny")
+  when was_asking && turn_thread
+  | rkt.#{break-thread}(turn_thread)
+    rkt.#{thread-wait}(turn_thread)
   term.#{term-stop!}()

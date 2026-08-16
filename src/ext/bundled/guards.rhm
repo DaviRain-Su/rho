@@ -1,0 +1,83 @@
+#lang rhombus
+
+// Shipped safety gates (Grok-style PreToolUse).
+// Blocks destructive bash and recursive grep that can OOM a large tree.
+
+export:
+  init
+
+def destructive = ["rm -rf /", "rm -rf ~", "sudo rm -rf", "mkfs",
+                   "> /dev/sd", "> /dev/nvme", ":(){ :|:& };:",
+                   ":(){:|:&};:"]
+
+fun bash_command(ev :: Map) :: String:
+  let input = ev.get("input", {})
+  cond
+  | input is_a Map:
+      to_string(input.get("command", input.get("cmd", "")))
+  | input is_a String: input
+  | ~else: ""
+
+fun words_of(cmd :: String) :: List:
+  for List (w in cmd.split(" ")):
+    skip_when w == ""
+    w
+
+fun flag_is_recursive(flag :: String) :: Boolean:
+  cond
+  | flag == "--recursive" || flag == "--dereference-recursive": #true
+  | flag.starts_with("--"): #false
+  | flag.starts_with("-") && flag != "-e" && flag != "-f":
+      flag.contains("r") || flag.contains("R")
+  | ~else: #false
+
+fun grep_flags_recursive(ws :: List, start :: Int) :: Boolean:
+  let st:
+    for values(acc = [#'flags, #false]) (j in start .. ws.length()):
+      let mode = acc[0]
+      let hit = acc[1]
+      let a = to_string(ws[j])
+      cond
+      | mode == #'done: acc
+      | mode == #'skip: [#'flags, hit]
+      | a == "--": [#'done, hit]
+      | a == "-e" || a == "-f": [#'skip, hit]
+      | a == "-d": [#'d, hit]
+      | mode == #'d: [#'flags, hit || a == "recurse"]
+      | a.starts_with("-"): [#'flags, hit || flag_is_recursive(a)]
+      | ~else: [#'done, hit]
+  st[1]
+
+fun grep_recursive_at(ws :: List, i :: Int) :: Boolean:
+  let w = to_string(ws[i])
+  cond
+  | w == "rgrep" || w.ends_with("/rgrep"): #true
+  | w == "grep" || w.ends_with("/grep"): grep_flags_recursive(ws, i + 1)
+  | ~else: #false
+
+fun is_recursive_grep(cmd :: String) :: Boolean:
+  let ws = words_of(cmd)
+  for values(hit = #false) (i in 0 .. ws.length()):
+    hit || grep_recursive_at(ws, i)
+
+fun is_destructive(cmd :: String) :: Boolean:
+  let s = cmd.foldcase()
+  (for any (pat in destructive):
+     s.contains(pat.foldcase()))
+    || (s.contains("dd ") && (s.contains("of=/dev/") || s.contains("if=/dev/")))
+
+fun init(rho):
+  rho.on("tool_call",
+         fun (ev :: Map):
+           let name = ev.get("toolName", "")
+           let cmd = bash_command(ev)
+           cond
+           | name == "bash" && is_destructive(cmd):
+               rho.state["guard_blocks"] := rho.state.get("guard_blocks", 0) + 1
+               { "block": #true,
+                 "reason": "guards: blocked destructive command" }
+           | name == "bash" && is_recursive_grep(cmd):
+               rho.state["guard_blocks"] := rho.state.get("guard_blocks", 0) + 1
+               { "block": #true,
+                 "reason": "guards: blocked recursive grep (use the grep tool)" }
+           | ~else: #false)

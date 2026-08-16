@@ -1,0 +1,90 @@
+#lang rhombus
+
+// TUI regression tests for search row shape and conditional layout rows.
+
+import:
+  "../src/ui/tui.rhm" as tui
+
+
+def mutable failures = 0
+fun check(label :: String, got, want):
+  if got == want
+  | println("ok   " +& label)
+  | println("FAIL " +& label +& "\n  got:  " +& to_string(got)
+              +& "\n  want: " +& to_string(want))
+    failures := failures + 1
+
+fun tcolor(_kind :: String): "magenta"
+
+def plain = [[#false, #false, #false, "alpha beta"]]
+check("search non-match preserves row shape",
+      tui.highlight_search_row(plain, "gamma"),
+      plain)
+check("search match highlights substring",
+      tui.highlight_search_row(plain, "BETA"),
+      [[#false, #false, #false, "alpha "],
+       [#false, #false, "invert", "beta"]])
+check("search maps partial expanding Unicode fold",
+      tui.highlight_search_row([[#false, #false, #false, "ß"]], "s"),
+      [[#false, #false, "invert", "ß"]])
+check("inactive search consumes no layout row",
+      tui.search_prompt_rows(#false, "", tcolor),
+      [])
+check("active search consumes exactly one layout row",
+      tui.search_prompt_rows(#true, "abc", tcolor),
+      [[["magenta", #false, "bold", " search: abc_"]]])
+
+def small_layout = tui.fit_tui_layout(10, 8, 2, 4, 3, 5, 0)
+check("layout fits terminal exactly",
+      small_layout["editor"] + small_layout["header"] + small_layout["widget"]
+        + small_layout["queue"] + small_layout["popup"] + small_layout["transcript"] + 3,
+      10)
+check("layout always keeps transcript row on ordinary small terminal",
+      small_layout["transcript"],
+      1)
+
+def hits = [tui.make_hit(2, 0, 80, "stop", #false),
+            tui.make_hit(5, 0, 10, "ac_pick", 0),
+            tui.make_hit(5, 0, 10, "ac_pick", 3)]
+check("hit miss", tui.hit_at(hits, 0, 0), #false)
+check("hit stop", tui.hit_at(hits, 2, 4)["id"], "stop")
+check("hit later wins", tui.hit_at(hits, 5, 2)["data"], 3)
+check("hit col exclusive", tui.hit_at(hits, 5, 10), #false)
+
+def ask = { "toolName": "bash", "input": { "command": "rm -rf /tmp/x" },
+            "reason": "" }
+def ask_rows = tui.ask_card_rows(ask, tcolor, 80)
+check("ask title names tool",
+      to_string(ask_rows[0][0][3]).contains("bash"),
+      #true)
+check("ask detail uses command",
+      to_string(ask_rows[1][0][3]).contains("rm -rf /tmp/x"),
+      #true)
+check("ask buttons",
+      to_string(ask_rows[2][0][3]).contains("Allow")
+        && to_string(ask_rows[2][0][3]).contains("Deny"),
+      #true)
+def reason_ask = { "toolName": "write_file",
+                   "input": { "path": "x" },
+                   "reason": "overwrite" }
+def reason_rows = tui.ask_card_rows(reason_ask, tcolor, 80)
+check("ask detail prefers reason",
+      to_string(reason_rows[1][0][3]).contains("overwrite"),
+      #true)
+
+def ask_hits = tui.ask_card_hits(10)
+check("ask allow hit", tui.hit_at(ask_hits, 12, 5)["id"], "ask_allow")
+check("ask deny hit", tui.hit_at(ask_hits, 12, 20)["id"], "ask_deny")
+check("ask miss title row", tui.hit_at(ask_hits, 10, 5), #false)
+check("ask card height", tui.ASK_CARD_H, 3)
+
+def ask_layout = tui.fit_tui_layout(20, 2, 0, 0, 0, 0, 0, ~ask_h: tui.ASK_CARD_H)
+check("layout with ask card fits exactly",
+      ask_layout["editor"] + ask_layout["header"] + ask_layout["widget"]
+        + ask_layout["queue"] + ask_layout["popup"] + ask_layout["transcript"]
+        + 3 + tui.ASK_CARD_H,
+      20)
+
+if failures == 0
+| println("ALL PASS")
+| error("tui tests failed: " +& failures)

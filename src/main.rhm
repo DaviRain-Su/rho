@@ -54,6 +54,7 @@ import:
   "tools/core.rhm" open
   "ext/api.rhm" open
   "ext/loader.rhm" as loader
+  "ext/mcp.rhm" as mcp
   "ui/repl.rhm" open
   "ui/tui.rhm" as tui
 
@@ -295,6 +296,8 @@ fun system_prompt() :: String:
     +& context_section()
     +& skills.xml_section(discover_skills())
 
+registry.state["build_system_prompt"] := system_prompt
+
 // ---- tool filters ----
 // pi defaults: read/bash/edit/write on; grep/find/ls opt-in via --tools
 def optin_tools :: List = ["grep", "find", "ls"]
@@ -306,7 +309,7 @@ fun apply_tool_filters():
   | opts.get("no_builtin_tools", #false):
       let builtin_tools = ["read_file", "write_file", "edit_file",
                            "bash", "grep", "find", "ls",
-                           "agent", "reload_extensions"]
+                           "reload_extensions"]
       let allow = opts.get("tools", #false)
       registry.set_tool_filter(~allow: allow,
                                ~deny: builtin_tools ++ opts.get("exclude_tools", []))
@@ -341,6 +344,9 @@ fun do_reload(notify = #true):
                                               packages.package_extension_dirs()
                                                 ++ opts.get("extensions", []),
                                             ~include_project: project_trusted)
+  mcp.reload(registry,
+             ~notify: fun (s): api.notify(s),
+             ~include_project: project_trusted)
   when notify
   | api.notify("extensions: " +& ok +& " loaded, " +& failed +& " failed")
 
@@ -408,6 +414,84 @@ registry.register_command(
                           apply_settings()
                           apply_tool_filters()
                           api.notify(key +& " = " +& settings_value_str(key)))
+
+fun set_permission_mode(mode :: String):
+  settings.set_global("permission_mode", mode)
+  apply_settings()
+  api.notify("permission_mode = " +& mode)
+
+fun permission_cmd(args :: String):
+  let a = args.trim().foldcase()
+  cond
+  | a == "":
+      api.notify("permission_mode = " +& permission_mode(config)
+                   +& "  (allow = run tools, ask = prompt for write/bash)")
+  | a == "allow" || a == "ask":
+      set_permission_mode(a)
+  | ~else:
+      api.notify("usage: /permission [allow|ask]")
+
+registry.register_command(
+  ~name: "permission",
+  ~description: "tool permission prompt: /permission [allow|ask]",
+  ~handler: permission_cmd)
+registry.register_command(
+  ~name: "allow",
+  ~description: "run tools without prompting (alias of /permission allow)",
+  ~handler: fun (_args): set_permission_mode("allow"))
+registry.register_command(
+  ~name: "ask",
+  ~description: "prompt before write/bash tools (alias of /permission ask)",
+  ~handler: fun (_args): set_permission_mode("ask"))
+
+fun steps_cmd(args :: String):
+  let a = args.trim()
+  cond
+  | a == "":
+      api.notify("max_steps = " +& step_limit(config)
+                   +& "  (default " +& MAX_STEPS +& ", cap " +& MAX_STEPS_CAP +& ")")
+  | ~else:
+      match String.maybe_to_int(a)
+      | n :: Int:
+          cond
+          | n < 1 || n > MAX_STEPS_CAP:
+              api.notify("max_steps expects 1.." +& MAX_STEPS_CAP)
+          | ~else:
+              settings.set_global("max_steps", n)
+              apply_settings()
+              api.notify("max_steps = " +& n)
+      | ~else:
+          api.notify("usage: /steps [n]")
+
+registry.register_command(
+  ~name: "steps",
+  ~description: "agent step limit: /steps [n] (default 200)",
+  ~handler: steps_cmd)
+
+fun mcp_cmd(args :: String):
+  let a = args.trim().foldcase()
+  cond
+  | a == "reload":
+      mcp.reload(registry,
+                 ~notify: fun (s): api.notify(s),
+                 ~include_project: project_trusted)
+      api.notify("mcp reloaded")
+  | a == "stop":
+      mcp.disconnect_all()
+      api.notify("mcp stopped")
+  | a == "" || a == "list":
+      match mcp.status()
+      | []: api.notify("no MCP servers (add ~/.rho/mcp.json)")
+      | rows:
+          for (row in rows):
+            api.notify("  " +& row[0] +& "  " +& row[1] +& " tools")
+  | ~else:
+      api.notify("usage: /mcp [list|reload|stop]")
+
+registry.register_command(
+  ~name: "mcp",
+  ~description: "MCP servers: /mcp [list|reload|stop]",
+  ~handler: mcp_cmd)
 
 registry.register_command(
   ~name: "help", ~description: "list commands and tools",
@@ -1171,58 +1255,6 @@ fun prepare_turn():
 
 // Also expose reload as a tool so the agent can activate its own extensions.
 registry.register_tool(
-  ~name: "agent",
-  ~description: "Delegate a focused subtask to a nested agent with its own session. Use for isolated research, a series of commands, or a draft change. The sub-agent cannot spawn further agents. Returns its final text answer.",
-  ~schema: { "type": "object",
-             "properties": {
-               "prompt": { "type": "string", "description": "The task for the sub-agent" },
-               "label": { "type": "string", "description": "Short name shown in the transcript" },
-               "tools": { "type": "string",
-                          "description": "Optional comma-separated tool allowlist, e.g. read_file,grep,bash" }
-             },
-             "required": ["prompt"] },
-  ~fn: fun (args):
-         let prompt = to_string(args.get("prompt", ""))
-         let label = to_string(args.get("label", "subagent"))
-         let tools:
-           match args.get("tools", #false)
-           | s :: String:
-               for List (x in s.split(",")):
-                 skip_when x.trim() == ""
-                 x.trim()
-           | l :: List: (for List (x in l): to_string(x))
-           | ~else: #false
-         if prompt == ""
-         | "error: prompt is required"
-         | try:
-             registry.state["subagent_label"] := label
-             api.notify("sub-agent " +& label +& " started")
-             let r = subagent.run_subagent(
-               ~config: config,
-               ~parent: registry,
-               ~prompt: prompt,
-               ~system_prompt: system_prompt(),
-               ~label: label,
-               ~tools: tools,
-               ~on_text: fun (s): call_turn1("on_sub_text", "on_text", s),
-               ~on_thinking: fun (s): call_turn1("on_sub_think", "on_thinking", s),
-               ~on_tool: fun (name, args):
-                           call_turn2("on_sub_tool", "on_tool", name, args),
-               ~on_tool_result: fun (name, r):
-                                  call_turn2("on_sub_result", "on_tool_result", name, r))
-             api.notify("sub-agent " +& label +& " done")
-             r
-             ~catch e :: Exn.Fail:
-               "error: " +& e.message)
-
-api.register_renderer(
-  ~tool: "agent",
-  ~fn: fun (phase, name, data):
-         if phase == "call" && data is_a Map
-         | "\u25CF agent " +& to_string(data.get("label", "subagent"))
-         | #false)
-
-registry.register_tool(
   ~name: "reload_extensions",
   ~description: "Hot-reload agent extensions from the extension directories. Call after writing or editing an extension file to activate it.",
   ~schema: { "type": "object", "properties": {}, "required": [] },
@@ -1304,19 +1336,6 @@ fun set_turn_ui(~on_text: on_text,
   registry.state["on_sub_think"] := on_sub_think
   registry.state["on_sub_tool"] := on_sub_tool
   registry.state["on_sub_result"] := on_sub_result
-
-fun turn_cb(key :: String):
-  registry.state.get(key, #false)
-
-fun call_turn1(key :: String, fallback :: String, a):
-  let f = turn_cb(key)
-  let f = if f | f | turn_cb(fallback)
-  when f | f(a)
-
-fun call_turn2(key :: String, fallback :: String, a, b):
-  let f = turn_cb(key)
-  let f = if f | f | turn_cb(fallback)
-  when f | f(a, b)
 
 fun handle_input(input :: String):
   prepare_turn()
@@ -1492,6 +1511,7 @@ fun tui_footer() :: String:
   let t = usage_totals()
   " " +& cwd() +& "  \u2502 " +& config.provider +& "/" +& config.model
     +& (if config.thinking | " \u00B7 think:" +& config.thinking | "")
+    +& (if permission_mode(config) == "ask" | " \u00B7 ask" | "")
     +& "  \u2502 tok " +& t["input"] +& "/" +& t["output"]
     +& " $" +& round2(t["cost"])
     +& (if session.name == "" | "" | "  \u2502 " +& session.name)
@@ -1713,6 +1733,7 @@ registry.register_command(
                                  +& "Ctrl-T show/hide chain of thought \u00B7 Shift-Tab or /thinking cycle thinking level\n"
                                  +& "Ctrl-K kill to EOL \u00B7 Ctrl-W kill word \u00B7 Ctrl-Y yank \u00B7 Alt-Y yank-pop \u00B7 Ctrl-U kill line\n"
                                  +& "Ctrl-P cycle scoped models/providers \u00B7 Ctrl-L redraw \u00B7 Ctrl-D quit\n"
+                                 +& "permission card: 1/y/Enter allow \u00B7 2/n/Esc deny \u00B7 click [1]/[2]\n"
                                  +& "!cmd run shell \u00B7 !!cmd run shell + add to context \u00B7 /follow queue follow-up\n"
                                  +& "remap: ~/.rho/keybindings.json (external_editor, copy_last, toggle_tool_output, toggle_thinking, cycle_thinking, queue_followup, kill_line, yank, kill_word, yank_pop)\n"))
 
@@ -1797,6 +1818,20 @@ fun tui_arg_complete(cmd :: String, prefix :: String):
             each c in choices
             skip_when !to_string(c).foldcase().starts_with(vp)
             [key +& " " +& c, to_string(c), ""]
+  | cmd == "permission":
+      let lp = prefix.foldcase()
+      for List:
+        each m in ["allow", "ask"]
+        skip_when !m.starts_with(lp)
+        [m, m, (if m == "ask"
+                | "prompt before write/bash tools"
+                | "run tools without prompting")]
+  | cmd == "mcp":
+      let lp = prefix.foldcase()
+      for List:
+        each m in ["list", "reload", "stop"]
+        skip_when !m.starts_with(lp)
+        [m, m, ""]
   | ~else: #false
 
 // extension message renderers (register_message_renderer): first hit wins
@@ -1828,6 +1863,7 @@ fun run_tui_mode():
                  | ~else: #void)
   let tui_mode = opts.get("tui_mode", config.settings.get("tui_mode", "tui"))
   tui.run_tui(~theme: load_theme(),
+              ~theme_loader: fun (): load_theme(),
               ~tui_mode: tui_mode,
               ~banner: banner +& "TUI: type / for the command menu, /hotkeys for keys\n",
               ~handle_command: handle_command,
@@ -1846,7 +1882,50 @@ fun run_tui_mode():
                                  getenv("VISUAL") || getenv("EDITOR") || "",
               ~last_assistant: last_assistant_text,
               ~keybind: fun (action, default):
-                          settings.keybinding(action, to_string(default)))
+                          settings.keybinding(action, to_string(default)),
+              ~shortcuts: fun (): registry.state.get("shortcuts", #false),
+              ~markdown_transformers: fun (): registry.state.get("markdown_transformers", []),
+              ~clicks: fun (): registry.state.get("clicks", #false),
+              ~pending_ask: pending_ask_state,
+              ~bind_ask: bind_ask_state)
+
+fun install_repl_ask():
+  def mutable ask_sema = #false
+  def mutable ask_answer = "deny"
+  def mutable ask_waiting = #false
+  fun wait_ask():
+    ask_sema := rkt.#{make-semaphore}(0)
+    ask_answer := "deny"
+    ask_waiting := #true
+    let ask = registry.state.get("pending_ask", {})
+    let name:
+      cond
+      | ask is_a Map: to_string(ask.get("toolName", "tool"))
+      | ~else: "tool"
+    out.write_string("allow " +& name +& " [y/N] ")
+    out.flush()
+    rkt.#{semaphore-wait}(ask_sema)
+    ask_answer
+  fun reply_ask(d :: String):
+    when ask_waiting
+    | ask_waiting := #false
+      ask_answer := d
+      match ask_sema
+      | #false: #void
+      | sema: rkt.#{semaphore-post}(sema)
+  registry.state["ask_reply"] := wait_ask
+  registry.state["answer_ask"] := reply_ask
+
+fun pending_ask_state():
+  registry.state.get("pending_ask", #false)
+
+fun bind_ask_state(w):
+  registry.state["ask_reply"] := w
+
+fun reply_ask_state(d):
+  match registry.state.get("answer_ask", #false)
+  | fn :: Function: fn(d)
+  | ~else: #void
 
 fun stdin_is_tty():
   rkt.#{terminal-port?}(rkt.#{current-input-port}())
@@ -2208,8 +2287,10 @@ module main:
   putenv("RHO_CODING_AGENT", "true")
   when !opts.get("offline", #false) && settings.get("offline", #false) == #false
   | modelsdev.refresh_async()
+    #void
   when !opts.get("offline", #false) && settings.get("offline", #false) == #false
   | refresh_codex_models()
+    #void
   cond
   | opts.get("export", #false) is_a String:
       run_export_mode()
@@ -2227,8 +2308,11 @@ module main:
   | ~else:
       init_trust()
       apply_tool_filters()
-      when !opts.get("no_extensions", #false)
+      if !opts.get("no_extensions", #false)
       | do_reload(#false)
+      | mcp.reload(registry,
+                   ~notify: fun (s): #void,
+                   ~include_project: project_trusted)
       let tui_mode = opts.get("tui_mode", config.settings.get("tui_mode", "tui"))
       cond
       | rpc_mode: run_rpc()
@@ -2238,6 +2322,11 @@ module main:
       | tui_mode == "fullscreen" && stdin_is_tty():
           run_tui_mode()
       | ~else:
+          install_repl_ask()
           run_repl(~banner: banner,
                    ~handle_command: handle_command,
-                   ~handle_input: handle_input)
+                   ~handle_input: handle_input,
+                   ~pending_ask: pending_ask_state,
+                   ~answer_ask: reply_ask_state)
+      registry.emit("session_shutdown", {})
+      mcp.disconnect_all()

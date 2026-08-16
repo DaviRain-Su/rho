@@ -1,0 +1,39 @@
+#lang rhombus
+
+// /verify <cmd> — Grok-style Stop hook. When set, agent_end runs the
+// command; a non-zero exit feeds the output back and continues the turn
+// (capped by the kernel at MAX_STOP_CONTINUATIONS).
+
+import:
+  "../../kernel/crypto.rkt" as crypto
+
+export:
+  init
+
+fun run_cmd(cmd :: String):
+  crypto.#{run-argv}("sh", ["-c", cmd])
+
+fun init(rho):
+  rho.register_command(
+    ~name: "verify",
+    ~description: "run a command after each turn; keep going if it fails",
+    ~handler: fun (args :: String):
+                let cmd = args.trim()
+                cond
+                | cmd == "" || cmd == "off":
+                    rho.state["verify_cmd"] := #false
+                    rho.notify("verify off")
+                | ~else:
+                    rho.state["verify_cmd"] := cmd
+                    rho.notify("verify: " +& cmd))
+  rho.on("agent_end",
+         fun (ev :: Map):
+           match rho.state.get("verify_cmd", #false)
+           | cmd :: String:
+               let values(code, text) = run_cmd(cmd)
+               if code == 0
+               | #false
+               | { "block": #true,
+                   "reason": "verify failed (exit " +& code +& "):\n"
+                               +& to_string(text).trim() }
+           | ~else: #false)

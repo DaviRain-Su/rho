@@ -74,7 +74,7 @@ def known_keys :: Map:
     "auto_retry": ["retry failed provider requests", "bool"],
     "max_retries": ["max auto-retry attempts (default 3)", "int"],
     "max_agent_depth": ["nested sub-agent depth (default 1)", "int"],
-    "max_steps": ["agent loop step limit (default 40)", "int"],
+    "max_steps": ["agent loop step limit (default 200, max 2000)", "int"],
     "http_proxy": ["HTTP proxy URL", "string"],
     "https_proxy": ["HTTPS proxy URL", "string"],
     "offline": ["disable all startup network operations", "bool"],
@@ -85,4 +85,5 @@ def known_keys :: Map:
     "compact_on_branch": ["summarize branch on tree navigation", "bool"],
     "branch_summary_tokens": ["token budget for branch summaries (default 16384)", "int"],
     "branch_summary_skip": ["skip branch summary prompt", "string"],
-    "transport": ["API transport", ["sse", "websocket", "auto"]] }
+    "transport": ["API transport", ["sse", "websocket", "auto"]],
+    "permission_mode": ["tool permission prompt", ["allow", "ask"]] }

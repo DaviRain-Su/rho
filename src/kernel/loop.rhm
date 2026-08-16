@@ -16,8 +16,95 @@ import:
 export:
   run_turn
   call_provider
+  stop_reason
+  MAX_STOP_CONTINUATIONS
+  safe_tool
+  should_ask
+  request_ask
+  permission_mode
+  SAFE_TOOLS
+  step_limit
+  step_limit_message
+  MAX_STEPS
+  MAX_STEPS_CAP
 
-def MAX_STEPS = 40
+def SAFE_TOOLS = ["read_file", "grep", "find", "ls"]
+
+fun safe_tool(name :: String) :: Boolean:
+  SAFE_TOOLS.contains(name)
+
+fun permission_mode(config) :: String:
+  let m = to_string(config.settings.get("permission_mode", "allow"))
+  if m == "ask" | "ask" | "allow"
+
+// Extension tool_call may force a prompt with {"ask": #true}.
+// Mode "ask" prompts for every non-read tool.
+fun should_ask(mode :: String, name :: String, verdict) :: Boolean:
+  cond
+  | verdict is_a Map && verdict.get("ask", #false): #true
+  | mode == "ask" && !safe_tool(name): #true
+  | ~else: #false
+
+fun request_ask(registry, data :: Map) :: String:
+  registry.state["pending_ask"] := data
+  registry.emit("ask", data)
+  let raw = try:
+              match registry.state.get("ask_reply", #false)
+              | fn :: Function: to_string(fn())
+              | ~else: "allow"
+              ~catch _: "deny"
+  registry.state["pending_ask"] := #false
+  let d = raw.foldcase().trim()
+  if d == "allow" || d == "y" || d == "yes" | "allow" | "deny"
+
+fun execute_tool(registry, name :: String, args :: Map) :: String:
+  let tool = registry.find_tool(name)
+  cond
+  | !tool: "error: unknown tool: " +& name
+  | ~else:
+      try:
+        to_string(tool.fn(args))
+        ~catch e :: Exn.Fail:
+          "error: " +& e.message
+
+def MAX_STEPS = 200
+def MAX_STEPS_CAP = 2000
+def MAX_STOP_CONTINUATIONS = 8
+
+fun step_limit(config) :: Int:
+  let raw = config.settings.get("max_steps", MAX_STEPS)
+  let n:
+    cond
+    | raw is_a Int: raw
+    | ~else:
+        match String.maybe_to_int(to_string(raw).trim())
+        | i :: Int: i
+        | ~else: MAX_STEPS
+  cond
+  | n < 1: MAX_STEPS
+  | n > MAX_STEPS_CAP: MAX_STEPS_CAP
+  | ~else: n
+
+fun step_limit_message(limit :: Int) :: String:
+  "reached " +& limit +& " steps; send a message to continue, or /steps N"
+
+fun announce_step_limit(n :: Int, limit :: Int, registry, session, on_text):
+  let msg = step_limit_message(limit)
+  on_text("\n[" +& msg +& "]\n")
+  registry.emit("turn_limit", { "step": n, "limit": limit })
+  session.append_message(assistant_message("[" +& msg +& "]", []))
+  #void
+
+// agent_end handlers may return {"block": #true, "reason": "..."} to keep
+// the agent working (Grok-style Stop hook). Cap so a failing verify cannot
+// loop forever.
+fun stop_reason(verdict, continuations :: Int):
+  cond
+  | continuations >= MAX_STOP_CONTINUATIONS: #false
+  | verdict is_a Map && verdict.get("block", #false):
+      let r = to_string(verdict.get("reason", "stop hook blocked"))
+      if r == "" | "stop hook blocked" | r
+  | ~else: #false
 
 fun call_provider(config, messages, tools, on_text,
                   ~on_thinking: on_thinking = fun (s): #void,
@@ -128,7 +215,10 @@ fun run_turn(~config: config,
              ~on_tool: on_tool = fun (name, args): #void,
              ~on_tool_result: on_tool_result = fun (name, r): #void,
              ~on_steer: on_steer = fun (s): #void,
-             ~images: images :: List = []):
+             ~images: images :: List = [],
+             ~from_stop: from_stop = #false):
+  when !from_stop
+  | registry.state["stop_continuations"] := 0
   // "input" may rewrite the user's text before it enters the session
   let input:
     match registry.emit("input", { "text": input })
@@ -144,10 +234,7 @@ fun run_turn(~config: config,
   registry.emit("before_agent_start", { "input": input })
   registry.emit("agent_start", { "input": input })
   recur step(n = 0):
-    let limit = config.settings.get("max_steps", MAX_STEPS)
-    let limit = if limit is_a Int && limit > 0 | limit | MAX_STEPS
-    when n >= limit
-    | error("agent loop exceeded " +& limit +& " steps")
+    let limit = step_limit(config)
     registry.emit("turn_start", { "step": n })
     let injected:
       match registry.emit("before_request", { "step": n })
@@ -204,15 +291,17 @@ fun run_turn(~config: config,
         cond
         | verdict is_a Map && verdict.get("block", #false):
             "blocked: " +& verdict.get("reason", "blocked by extension")
+        | should_ask(permission_mode(config), name, verdict):
+            let reason = (if verdict is_a Map | to_string(verdict.get("reason", "")) | "")
+            let decision = request_ask(registry,
+                                       { "toolName": name,
+                                         "input": args,
+                                         "reason": reason })
+            if decision == "deny"
+            | "blocked: user denied " +& name
+            | execute_tool(registry, name, args)
         | ~else:
-            let tool = registry.find_tool(name)
-            cond
-            | !tool: "error: unknown tool: " +& name
-            | ~else:
-                try:
-                  to_string(tool.fn(args))
-                  ~catch e :: Exn.Fail:
-                    "error: " +& e.message
+            execute_tool(registry, name, args)
       registry.emit("tool_execution_end", { "toolName": name, "result": result })
       registry.emit("tool_result", { "toolName": name, "result": result })
       on_tool_result(name, result)
@@ -232,7 +321,43 @@ fun run_turn(~config: config,
                                 "tool_count": tool_calls.length() })
     let steered = drain_steering(session, registry, on_steer)
     when tool_calls != [] || steered
-    | step(n + 1)
-  registry.emit("agent_end", {})
+    | if n + 1 >= limit
+      | announce_step_limit(n + 1, limit, registry, session, on_text)
+      | step(n + 1)
+  let n = registry.state.get("stop_continuations", 0)
+  let n = if n is_a Int | n | 0
+  let verdict = registry.emit("agent_end",
+                              { "continuations": n,
+                                "stop_hook_active": n > 0 })
   registry.emit("agent_settled", {})
+  match stop_reason(verdict, n)
+  | reason :: String:
+      registry.state["stop_continuations"] := n + 1
+      run_turn(~config: config,
+               ~registry: registry,
+               ~session: session,
+               ~system_prompt: system_prompt,
+               ~input: reason,
+               ~on_text: on_text,
+               ~on_thinking: on_thinking,
+               ~on_tool: on_tool,
+               ~on_tool_result: on_tool_result,
+               ~on_steer: on_steer,
+               ~from_stop: #true)
+  | ~else:
+      // drain extension-queued follow-ups (send_message ~deliver_as: "followUp")
+      match registry.state.get("followup_queue", [])
+      | []: #void
+      | [first, & rest]:
+          registry.state["followup_queue"] := rest
+          run_turn(~config: config,
+                   ~registry: registry,
+                   ~session: session,
+                   ~system_prompt: system_prompt,
+                   ~input: first,
+                   ~on_text: on_text,
+                   ~on_thinking: on_thinking,
+                   ~on_tool: on_tool,
+                   ~on_tool_result: on_tool_result,
+                   ~on_steer: on_steer)
   #void

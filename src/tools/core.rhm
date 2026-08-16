@@ -20,6 +20,7 @@ export:
   set_stream_handler
   image_media_type
   encode_image
+  apply_bash_hook
 
 def MAX_LINES = 2000
 def MAX_BYTES = 50 * 1024
@@ -262,8 +263,20 @@ fun bash_command(args :: Map) :: String:
       String.join((for List (x in cmd): to_string(x)), " ")
   | ~else: ""
 
-fun tool_bash(args :: Map):
-  let cmd = bash_command(args)
+fun apply_bash_hook(registry, cmd :: String) :: String:
+  match registry.state.get("bash_spawn_hook", #false)
+  | fn :: Function:
+      try:
+        let r = fn({ "command": cmd })
+        cond
+        | r is_a String: r
+        | r is_a Map: to_string(r.get("command", cmd))
+        | ~else: cmd
+        ~catch _: cmd
+  | ~else: cmd
+
+fun tool_bash(args :: Map, registry):
+  let cmd = apply_bash_hook(registry, bash_command(args))
   cond
   | cmd == "": "error: bash called with empty command (missing arguments)"
   | ~else:
@@ -404,7 +417,7 @@ fun install_core_tools(registry):
                  "timeout": { "type": "integer", "description": "Timeout in seconds (default 120)" }
                },
                "required": ["command"] },
-    ~fn: tool_bash)
+    ~fn: fun (args): tool_bash(args, registry))
   registry.register_tool(
     ~name: "grep",
     ~description: "Search file contents for a regex pattern. Returns matching lines with file:line prefixes.",

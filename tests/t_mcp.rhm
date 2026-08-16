@@ -1,0 +1,55 @@
+#lang rhombus
+
+import:
+  lib("racket/base.rkt") as rkt
+  "../src/ext/mcp.rkt" as wire
+  "../src/ext/mcp.rhm" as mcp
+  "../src/kernel/registry.rhm" open
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+check("safe_id keeps alnum", mcp.safe_id("echo") == "echo")
+check("safe_id rewrites", mcp.safe_id("my-server.v2") == "my_server_v2")
+check("tool id", mcp.tool_id("fs", "read_file") == "mcp_fs_read_file")
+
+def wrapped = mcp.parse_servers({ "mcpServers": { "a": { "command": "x" } } })
+check("parse wrapped", wrapped.has_key("a"))
+def flat = mcp.parse_servers({ "a": { "command": "x" } })
+check("parse flat", flat.has_key("a"))
+
+def body = "{\"ok\":true}"
+def framed = wire.#{frame-encode}(body)
+def pin = rkt.#{open-input-bytes}(framed)
+def got = to_string(wire.#{frame-read}(pin, #false))
+check("frame roundtrip", got == body)
+
+def echo:
+  cond
+  | filesystem.file_exists("tests/mcp_echo.rkt"): "tests/mcp_echo.rkt"
+  | filesystem.file_exists("mcp_echo.rkt"): "mcp_echo.rkt"
+  | ~else: ""
+
+check("echo fixture present", echo != "")
+
+when echo != ""
+| def notes = Port.Output.open_string()
+  def reg = make_registry()
+  mcp.connect_map(reg,
+                  { "echo": { "command": "racket", "args": [echo] } },
+                  ~notify: fun (s): notes.write_string(s +& "\n"))
+  check("status lists echo",
+        mcp.status().length() == 1 && mcp.status()[0][0] == "echo")
+  check("tool registered", reg.find_tool("mcp_echo_echo") && #true)
+  let out = to_string(reg.find_tool("mcp_echo_echo").fn({ "text": "pong" }))
+  check("tool call", out.contains("pong"))
+  mcp.disconnect_all()
+  check("disconnected", mcp.status() == [])
+
+if failures == 0
+| println("t_mcp OK")
+| error("mcp tests failed: " +& failures)

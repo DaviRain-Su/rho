@@ -1,0 +1,199 @@
+#lang rhombus
+
+import:
+  lib("racket/file.rkt") as rktfile
+  "../src/kernel/registry.rhm" open
+  "../src/kernel/session.rhm" open
+  "../src/kernel/loop.rhm" as loop
+  "../src/ext/api.rhm" open
+  "../src/ext/loader.rhm" as loader
+  "../src/kernel/reload.rkt" as reload
+  "../src/tools/core.rhm" as core
+  "../src/ext/bundled/sandbox.rhm" as sandbox
+
+def mutable failures = 0
+fun check(label :: String, ok):
+  if ok
+  | println("ok   " +& label)
+  | println("FAIL " +& label)
+    failures := failures + 1
+
+def bundled = loader.bundled_extensions_dir()
+check("bundled dir exists", filesystem.directory_exists(bundled))
+check("guards shipped", filesystem.file_exists(bundled +& "/guards.rhm"))
+check("audit shipped", filesystem.file_exists(bundled +& "/audit.rhm"))
+check("memory shipped", filesystem.file_exists(bundled +& "/memory.rhm"))
+check("doctor shipped", filesystem.file_exists(bundled +& "/doctor.rhm"))
+check("usage shipped", filesystem.file_exists(bundled +& "/usage.rhm"))
+check("verify shipped", filesystem.file_exists(bundled +& "/verify.rhm"))
+check("agent shipped", filesystem.file_exists(bundled +& "/agent.rhm"))
+check("dashboard shipped", filesystem.file_exists(bundled +& "/dashboard.rhm"))
+check("sandbox shipped", filesystem.file_exists(bundled +& "/sandbox.rhm"))
+
+def found = loader.discover_extensions(~include_project: #false)
+check("discover includes guards",
+      found.contains(bundled +& "/guards.rhm"))
+
+def tmp = to_string(rktfile.#{make-temporary-file}("rho-bundled-~a", #'directory))
+def notes = Port.Output.open_string()
+def reg = make_registry()
+def sess = start_session(~cwd: tmp, ~no_session: #true)
+def api = PiAPI(reg, fun (): notes, fun (): sess, [])
+
+fun load_one(name :: String):
+  let path = bundled +& "/" +& name
+  reload.rerequire_path(path)
+  let init = reload.get_export(path, "init")
+  reg.current_source := path
+  init(api)
+  reg.current_source := "builtin"
+
+load_one("guards.rhm")
+check("block rm -rf /",
+      reg.emit("tool_call",
+               { "toolName": "bash",
+                 "input": { "command": "rm -rf /" } }).get("block", #false))
+check("block grep -r",
+      reg.emit("tool_call",
+               { "toolName": "bash",
+                 "input": { "command": "grep -rn foo src" } }).get("block", #false))
+check("allow ls | grep",
+      reg.emit("tool_call",
+               { "toolName": "bash",
+                 "input": { "command": "ls -R | grep foo" } }) == #false)
+check("allow grep -e -r",
+      reg.emit("tool_call",
+               { "toolName": "bash",
+                 "input": { "command": "grep -e -r file" } }) == #false)
+check("allow echo",
+      reg.emit("tool_call",
+               { "toolName": "bash",
+                 "input": { "command": "echo hi" } }) == #false)
+
+load_one("audit.rhm")
+reg.state["audit_dir"] := tmp +& "/logs"
+reg.emit("agent_start", { "input": "hello" })
+reg.emit("tool_execution_start",
+         { "toolName": "bash", "input": { "command": "echo x" } })
+reg.emit("agent_end", {})
+check("session log",
+      filesystem.file_exists(tmp +& "/logs/session.log")
+        && filesystem.read_string(tmp +& "/logs/session.log").contains("start"))
+check("tools log",
+      filesystem.file_exists(tmp +& "/logs/tools.log")
+        && filesystem.read_string(tmp +& "/logs/tools.log").contains("bash"))
+
+load_one("memory.rhm")
+reg.state["memory_path"] := tmp +& "/MEMORY.md"
+reg.find_command("remember").handler("staging uses eu-west")
+check("remember wrote",
+      filesystem.read_string(tmp +& "/MEMORY.md").contains("eu-west"))
+def injected = reg.emit("before_request", { "step": 0 })
+check("memory injected",
+      injected is_a Map
+        && to_string(injected["messages"][0]["content"]).contains("eu-west"))
+check("memory skip later step",
+      reg.emit("before_request", { "step": 1 }) == #false)
+
+load_one("doctor.rhm")
+check("doctor registered", reg.find_command("doctor") && #true)
+reg.find_command("doctor").handler("")
+check("doctor notified", notes.get_string().to_string().contains("HOME"))
+
+load_one("usage.rhm")
+sess.append_message({ "role": "user", "content": "hello there" })
+check("context registered", reg.find_command("context") && #true)
+reg.find_command("context").handler("")
+check("context notified", notes.get_string().to_string().contains("estimated tokens"))
+
+check("stop reason",
+      loop.stop_reason({ "block": #true, "reason": "tests failed" }, 0)
+        == "tests failed")
+check("stop ignores empty verdict", loop.stop_reason(#false, 0) == #false)
+check("stop cap",
+      loop.stop_reason({ "block": #true, "reason": "x" },
+                       loop.MAX_STOP_CONTINUATIONS)
+        == #false)
+
+class StepCfg(settings :: Map)
+check("step default 200", loop.step_limit(StepCfg({})) == 200)
+check("step custom", loop.step_limit(StepCfg({ "max_steps": 80 })) == 80)
+check("step clamp high",
+      loop.step_limit(StepCfg({ "max_steps": 99999 })) == loop.MAX_STEPS_CAP)
+check("step reject zero",
+      loop.step_limit(StepCfg({ "max_steps": 0 })) == loop.MAX_STEPS)
+check("step parse string",
+      loop.step_limit(StepCfg({ "max_steps": "120" })) == 120)
+check("step limit message",
+      loop.step_limit_message(200).contains("/steps"))
+
+check("safe read_file", loop.safe_tool("read_file"))
+check("unsafe bash", !loop.safe_tool("bash"))
+check("ask mode prompts bash", loop.should_ask("ask", "bash", #false))
+check("ask mode skips read", !loop.should_ask("ask", "read_file", #false))
+check("allow mode skips bash", !loop.should_ask("allow", "bash", #false))
+check("verdict ask forces prompt",
+      loop.should_ask("allow", "read_file", { "ask": #true }))
+class FakeCfg(settings :: Map)
+check("permission default allow",
+      loop.permission_mode(FakeCfg({})) == "allow")
+check("permission ask setting",
+      loop.permission_mode(FakeCfg({ "permission_mode": "ask" })) == "ask")
+
+def ask_reg = make_registry()
+check("request_ask default allow",
+      loop.request_ask(ask_reg, { "toolName": "bash" }) == "allow")
+check("pending_ask cleared after default",
+      ask_reg.state.get("pending_ask", #true) == #false)
+fun deny_ask():
+  "deny"
+ask_reg.state["ask_reply"] := deny_ask
+check("request_ask deny reply",
+      loop.request_ask(ask_reg, { "toolName": "bash" }) == "deny")
+fun yes_ask():
+  "Y"
+ask_reg.state["ask_reply"] := yes_ask
+check("request_ask y means allow",
+      loop.request_ask(ask_reg, { "toolName": "write_file" }) == "allow")
+
+load_one("verify.rhm")
+reg.state["verify_cmd"] := "exit 7"
+def blocked = reg.emit("agent_end", { "continuations": 0 })
+check("verify blocks on failure",
+      blocked is_a Map && blocked.get("block", #false)
+        && to_string(blocked.get("reason", "")).contains("exit 7"))
+reg.state["verify_cmd"] := "true"
+check("verify allows success",
+      reg.emit("agent_end", { "continuations": 0 }) == #false)
+reg.find_command("verify").handler("off")
+check("verify off", reg.state.get("verify_cmd", #true) == #false)
+
+load_one("agent.rhm")
+check("agent tool", reg.find_tool("agent") && #true)
+check("agent empty prompt",
+      to_string(reg.find_tool("agent").fn({})).contains("prompt is required"))
+check("agent no config",
+      to_string(reg.find_tool("agent").fn({ "prompt": "hi" })).contains("no live config"))
+
+load_one("dashboard.rhm")
+check("dashboard command", reg.find_command("dashboard") && #true)
+reg.find_command("dashboard").handler("")
+check("dashboard snapshot",
+      notes.get_string().to_string().contains("permission:"))
+
+load_one("sandbox.rhm")
+check("sandbox command", reg.find_command("sandbox") && #true)
+check("sandbox default off", reg.state.get("sandbox_on", #true) == #false)
+check("sandbox hook off", core.apply_bash_hook(reg, "echo hi") == "echo hi")
+reg.find_command("sandbox").handler("on")
+check("sandbox on", reg.state.get("sandbox_on", #false))
+def wrapped = core.apply_bash_hook(reg, "echo hi")
+check("sandbox wrap or passthrough",
+      wrapped != "echo hi" || sandbox.wrap_command("echo hi") == "echo hi")
+check("sh_quote", sandbox.sh_quote("it's") == "'it'\\''s'")
+reg.find_command("sandbox").handler("off")
+check("sandbox off again", core.apply_bash_hook(reg, "echo hi") == "echo hi")
+
+if failures == 0
+| println("t_bundled OK")
+| error("bundled tests failed: " +& failures)

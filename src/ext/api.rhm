@@ -48,6 +48,12 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
             ui_hooks :: MutableMap = MutableMap(),
             get_config = fun (): #false):
 
+  method current_config():
+    get_config()
+
+  method set_bash_spawn_hook(fn):
+    registry.state["bash_spawn_hook"] := fn
+
   method register_tool(~name: name :: String,
                        ~description: description :: String,
                        ~schema: schema :: Map,
@@ -148,9 +154,11 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
     | h: h(s)
 
   method notify(msg :: String):
-    let out = get_out()
-    out.write_string("\u001B[36m[rho]\u001B[0m " +& msg +& "\n")
-    out.flush()
+    match get_out()
+    | #false: #void
+    | out:
+        out.write_string("\u001B[36m[rho]\u001B[0m " +& msg +& "\n")
+        out.flush()
 
   // Set the current model in the live config.
   method set_model(model :: String):
@@ -199,6 +207,18 @@ class PiAPI(registry, get_out, get_session, extra_flags :: List,
           registry.state["shortcuts"] := mm
           mm
     m[key] := { "description": description, "fn": fn }
+
+  // Register a TUI click handler. The TUI looks up hits by id
+  // ("footer", or any id an extension's renderer advertised).
+  method register_click(~id: id :: String, ~fn: fn):
+    let m:
+      match registry.state.get("clicks", #false)
+      | mm :: MutableMap: mm
+      | ~else:
+          let mm = MutableMap()
+          registry.state["clicks"] := mm
+          mm
+    m[id] := fn
 
   // Register a markdown transformer; TUI applies them in order.
   method register_markdown_transformer(~fn: fn):

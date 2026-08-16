@@ -1,0 +1,43 @@
+#lang rhombus
+
+// /doctor — environment checklist (auth, HOME, git, gh).
+
+import:
+  lib("racket/base.rkt") as rkt
+  "../../kernel/config.rhm" as config
+
+export:
+  init
+
+fun has_exe(name :: String) :: Boolean:
+  rkt.#{find-executable-path}(name) != #false
+
+fun line(ok, label :: String, detail :: String) :: String:
+  (if ok | "ok   " | "FAIL ") +& label +& (if detail == "" | "" | "  " +& detail)
+
+fun init(rho):
+  rho.register_command(
+    ~name: "doctor",
+    ~description: "check HOME, credentials, and local tools",
+    ~handler: fun (_args):
+                let home = try:
+                             config.home()
+                             ~catch _: ""
+                let cfg = config.config_dir()
+                let auth = config.auth_list()
+                let tools = rho.get_all_tools()
+                let rows = [line(home != "", "HOME", home),
+                            line(filesystem.directory_exists(cfg)
+                                   || home != "",
+                                 "config dir", cfg),
+                            line(auth != [], "auth.json",
+                                 if auth == []
+                                 | "empty (rho /login or set an API key)"
+                                 | String.join(auth, ", ")),
+                            line(has_exe("git"), "git",
+                                 if has_exe("git") | "on PATH" | "not found"),
+                            line(has_exe("gh"), "gh",
+                                 if has_exe("gh") | "on PATH" | "optional, needed for /share"),
+                            line(tools != [], "tools",
+                                 to_string(tools.length()) +& " registered")]
+                rho.notify(String.join(rows, "\n")))

@@ -1,0 +1,64 @@
+#lang rhombus
+
+// Cross-session notes. /remember appends a line; before_request injects
+// the file into the first step of each turn.
+
+import:
+  "../../kernel/config.rhm" as config
+
+export:
+  init
+
+fun memory_path(rho) :: String:
+  match rho.state.get("memory_path", #false)
+  | s :: String: s
+  | ~else:
+      let proj = ".rho/MEMORY.md"
+      if filesystem.file_exists(proj) | proj | config.config_dir() +& "/MEMORY.md"
+
+fun parent_dir(path :: String) :: String:
+  let parts = path.split("/")
+  if parts.length() <= 1
+  | ""
+  | String.join((for List (i in 0 .. parts.length() - 1): to_string(parts[i])), "/")
+
+fun read_memory(rho) :: String:
+  let path = memory_path(rho)
+  if filesystem.file_exists(path) | filesystem.read_string(path).trim() | ""
+
+fun existing_text(path :: String) :: String:
+  if filesystem.file_exists(path) | filesystem.read_string(path) | ""
+
+fun with_trailing_nl(s :: String) :: String:
+  if s == "" || s.ends_with("\n") | s | s +& "\n"
+
+fun save_note(rho, note :: String):
+  let path = memory_path(rho)
+  let dir = parent_dir(path)
+  when dir != "" && !filesystem.directory_exists(dir)
+  | filesystem.make_directory(dir, ~parents: #true)
+  filesystem.write_string(path,
+                          with_trailing_nl(existing_text(path)) +& "- " +& note +& "\n",
+                          ~exists: #'truncate)
+  rho.notify("remembered in " +& path)
+
+fun init(rho):
+  rho.register_command(
+    ~name: "remember",
+    ~description: "save a note to MEMORY.md for later turns",
+    ~handler: fun (args :: String):
+                let note = args.trim()
+                if note == ""
+                | rho.notify("usage: /remember <note>")
+                | save_note(rho, note))
+  rho.on("before_request",
+         fun (ev :: Map):
+           cond
+           | ev.get("step", 0) != 0: #false
+           | ~else:
+               let text = read_memory(rho)
+               if text == ""
+               | #false
+               | { "messages":
+                     [{ "role": "user",
+                        "content": "[memory]\n" +& text }] })

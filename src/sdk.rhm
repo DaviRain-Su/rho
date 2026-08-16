@@ -15,7 +15,6 @@ import:
   "kernel/skills.rhm" as skills
   "kernel/settings.rhm" as settings
   "kernel/trust.rhm" as trust
-  "kernel/subagent.rhm" as subagent
   "ai/models.rhm" as models
   "ai/modelsdev.rhm" as modelsdev
   "tools/core.rhm" open
@@ -72,6 +71,13 @@ fun create_agent_session(~provider: provider :: String = "kimi",
   | loader.load_extensions(reg, api_obj, ~notify: fun (s): #void)
   let default_sp = "You are rho, a coding agent written in Rhombus, running in a terminal.\nWorking directory: " +& real_cwd +& "\nUse the available tools to read, write, and edit files and to run shell commands.\nBe concise. Prefer tools over guessing."
   let sp = if system_prompt == "" | default_sp | system_prompt
+  fun child_prompt():
+    sp
+  reg.state["build_system_prompt"] := child_prompt
+  reg.state["on_sub_text"] := on_text
+  reg.state["on_sub_think"] := on_thinking
+  reg.state["on_sub_tool"] := on_tool
+  reg.state["on_sub_result"] := on_tool_result
   AgentSession(cfg, reg, sess, api_obj, sp, real_cwd,
                on_text, on_thinking, on_tool, on_tool_result, on_done, on_error,
                rkt.#{make-custodian}())
